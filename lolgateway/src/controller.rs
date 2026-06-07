@@ -55,6 +55,7 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteRequestMirror",
     "HTTPRouteRequestMultipleMirrors",
     "HTTPRouteRequestPercentageMirror",
+    "HTTPRouteBackendProtocolWebSocket",
 ];
 
 /// The address we advertise in Gateway.status.addresses — where our proxy listens,
