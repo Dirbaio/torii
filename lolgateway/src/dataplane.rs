@@ -29,6 +29,8 @@ pub struct RequestCtx {
     filters: Filters,
     /// Rewritten request path (from a URL-rewrite filter), if any.
     rewrite_path: Option<String>,
+    /// Request timeout for the matched route (applied to the upstream peer).
+    request_timeout: Option<std::time::Duration>,
 }
 
 impl GatewayProxy {
@@ -87,9 +89,10 @@ impl ProxyHttp for GatewayProxy {
             return Ok(true);
         }
 
-        // Stash filters + any path rewrite for the later phases.
+        // Stash filters + any path rewrite + timeout for the later phases.
         ctx.filters = entry.filters.clone();
         ctx.rewrite_path = entry.rewrite_path(&path);
+        ctx.request_timeout = entry.request_timeout;
 
         match entry.pick_endpoint(next_rng()) {
             Some(ep) => {
@@ -159,7 +162,43 @@ impl ProxyHttp for GatewayProxy {
             .as_ref()
             .expect("upstream_peer reached without a chosen backend");
         // Plain HTTP upstream: no TLS, empty SNI.
-        Ok(Box::new(HttpPeer::new((ep.ip, ep.port), false, String::new())))
+        let mut peer = HttpPeer::new((ep.ip, ep.port), false, String::new());
+        // Apply the route's request timeout to the upstream read (response) wait.
+        if let Some(t) = ctx.request_timeout {
+            peer.options.read_timeout = Some(t);
+            peer.options.total_connection_timeout = Some(t);
+        }
+        Ok(Box::new(peer))
+    }
+
+    /// Map upstream timeouts to HTTP 504 (Gateway Timeout) per Gateway API;
+    /// otherwise fall back to the default 502/5xx mapping.
+    async fn fail_to_proxy(
+        &self,
+        session: &mut Session,
+        e: &pingora_core::Error,
+        _ctx: &mut Self::CTX,
+    ) -> pingora_proxy::FailToProxy
+    where
+        Self::CTX: Send + Sync,
+    {
+        use pingora_core::{ErrorSource, ErrorType};
+        let code = match e.etype() {
+            ErrorType::ReadTimedout | ErrorType::ConnectTimedout | ErrorType::WriteTimedout => 504,
+            ErrorType::HTTPStatus(c) => *c,
+            _ => match e.esource() {
+                ErrorSource::Upstream => 502,
+                ErrorSource::Downstream => 0, // connection already dead
+                _ => 500,
+            },
+        };
+        if code > 0 && session.response_written().is_none() {
+            let _ = session.respond_error(code).await;
+        }
+        pingora_proxy::FailToProxy {
+            error_code: code,
+            can_reuse_downstream: false,
+        }
     }
 }
 
