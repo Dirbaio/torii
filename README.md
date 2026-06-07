@@ -31,9 +31,24 @@ Architecture: a level-triggered kube controller publishes a routing snapshot via
 `ArcSwap<RouteTable>`; a Pingora `ProxyHttp` data plane reads it lock-free per request.
 See the three modules in [lolgateway/src/](lolgateway/src/).
 
-Not yet implemented: request mirror, timeouts/retries, backend protocol (h2c/websocket),
-TLS termination (HTTPS listeners). These are declared as separate conformance features and
-are simply not advertised yet.
+### Scope
+
+The goal is to pass **all conformance tests in the `GATEWAY-HTTP` and `GATEWAY-TLS`
+profiles** (Gateway, HTTPRoute, TLSRoute-via-Gateway, ReferenceGrant, BackendTLSPolicy,
+and their extended features).
+
+**Out of scope** (these profiles are not targeted and their tests are expected to be
+skipped — lolgateway does not advertise their features):
+
+- `GATEWAY-GRPC` — GRPCRoute
+- `GATEWAY-TCP` — TCPRoute
+- `GATEWAY-UDP` — UDPRoute
+- `MESH-HTTP` / `MESH-GRPC` — service mesh (GAMMA): routes that attach to a `Service`
+  and are enforced by per-pod sidecars, a fundamentally different architecture from this
+  edge gateway.
+
+Work in progress toward full GATEWAY-HTTP/TLS: request mirror, timeouts/retries, backend
+protocol (h2c/websocket), and TLS termination (HTTPS listeners + BackendTLSPolicy).
 
 ## Prerequisites
 
