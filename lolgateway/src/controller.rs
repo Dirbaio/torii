@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Namespace, Service};
+use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::{Patch, PatchParams};
@@ -66,6 +66,7 @@ struct Stores {
     endpoint_slices: Store<EndpointSlice>,
     reference_grants: Store<ReferenceGrant>,
     namespaces: Store<Namespace>,
+    secrets: Store<Secret>,
 }
 
 /// Run the control plane forever: start watchers, and on any change recompute.
@@ -81,6 +82,7 @@ pub async fn run(
     let eps_api: Api<EndpointSlice> = Api::all(client.clone());
     let rg_api: Api<ReferenceGrant> = Api::all(client.clone());
     let ns_api: Api<Namespace> = Api::all(client.clone());
+    let sec_api: Api<Secret> = Api::all(client.clone());
 
     // reflector stores + writers, fed by watchers.
     let (gc_store, gc_w) = reflector::store();
@@ -90,6 +92,7 @@ pub async fn run(
     let (eps_store, eps_w) = reflector::store();
     let (rg_store, rg_w) = reflector::store();
     let (ns_store, ns_w) = reflector::store();
+    let (sec_store, sec_w) = reflector::store();
 
     let stores = Arc::new(Stores {
         gateway_classes: gc_store.clone(),
@@ -99,6 +102,7 @@ pub async fn run(
         endpoint_slices: eps_store.clone(),
         reference_grants: rg_store.clone(),
         namespaces: ns_store.clone(),
+        secrets: sec_store.clone(),
     });
 
     // A change signal: every watcher event pokes this channel; a single consumer
@@ -134,6 +138,7 @@ pub async fn run(
     spawn_watch!(eps_api.clone(), eps_w, "EndpointSlice");
     spawn_watch!(rg_api.clone(), rg_w, "ReferenceGrant");
     spawn_watch!(ns_api.clone(), ns_w, "Namespace");
+    spawn_watch!(sec_api.clone(), sec_w, "Secret");
 
     // Wait for the caches to populate before the first reconcile.
     let ready = stores.clone();
@@ -145,6 +150,7 @@ pub async fn run(
         let _ = ready.endpoint_slices.wait_until_ready().await;
         let _ = ready.reference_grants.wait_until_ready().await;
         let _ = ready.namespaces.wait_until_ready().await;
+        let _ = ready.secrets.wait_until_ready().await;
     });
 
     tracing::info!(controller = CONTROLLER_NAME, "control plane started");
@@ -256,30 +262,45 @@ impl ReconcileCtx {
             .spec
             .listeners
             .iter()
-            .map(|l| GatewayStatusListeners {
-                name: l.name.clone(),
-                attached_routes: *attached.get(&l.name).unwrap_or(&0),
-                supported_kinds: Some(vec![GatewayStatusListenersSupportedKinds {
-                    group: Some("gateway.networking.k8s.io".into()),
-                    kind: "HTTPRoute".into(),
-                }]),
-                conditions: vec![
-                    condition("Accepted", "True", "Accepted", gen),
-                    condition("Programmed", "True", "Programmed", gen),
-                    condition("ResolvedRefs", "True", "ResolvedRefs", gen),
-                ],
+            .map(|l| {
+                self.listener_status(l, gen, *attached.get(&l.name).unwrap_or(&0))
             })
             .collect();
+
+        // Derive Gateway-level conditions from listener state.
+        let listener_accepted = |l: &GatewayStatusListeners| {
+            l.conditions
+                .iter()
+                .any(|c| c.type_ == "Accepted" && c.status == "True")
+        };
+        let any_accepted = listeners.iter().any(listener_accepted);
+        let all_accepted = listeners.iter().all(listener_accepted);
+        let all_programmed = listeners.iter().all(|l| {
+            l.conditions
+                .iter()
+                .any(|c| c.type_ == "Programmed" && c.status == "True")
+        });
+
+        // Accepted: True if ≥1 listener is accepted; reason ListenersNotValid when
+        // any listener is invalid (per the conformance spec), else Accepted.
+        let accepted = if any_accepted {
+            let reason = if all_accepted { "Accepted" } else { "ListenersNotValid" };
+            condition("Accepted", "True", reason, gen)
+        } else {
+            condition("Accepted", "False", "ListenersNotValid", gen)
+        };
+        let programmed = if all_programmed && any_accepted {
+            condition("Programmed", "True", "Programmed", gen)
+        } else {
+            condition("Programmed", "False", "Invalid", gen)
+        };
 
         let status = GatewayStatus {
             addresses: Some(vec![GatewayStatusAddresses {
                 r#type: Some("IPAddress".into()),
                 value: self.config.advertise_address.clone(),
             }]),
-            conditions: Some(vec![
-                condition("Accepted", "True", "Accepted", gen),
-                condition("Programmed", "True", "Programmed", gen),
-            ]),
+            conditions: Some(vec![accepted, programmed]),
             listeners: Some(listeners),
             attached_listener_sets: None,
         };
@@ -287,6 +308,118 @@ impl ReconcileCtx {
         let api: Api<Gateway> = Api::namespaced(self.client.clone(), &ns);
         self.patch_status(&api, &gw.name_any(), serde_json::json!({ "status": status }))
             .await
+    }
+
+    /// Compute the status for one listener: Accepted/Programmed/ResolvedRefs
+    /// conditions and the resolved supportedKinds.
+    fn listener_status(
+        &self,
+        l: &gateway_api::apis::standard::gateways::GatewayListeners,
+        gen: i64,
+        attached_routes: i32,
+    ) -> GatewayStatusListeners {
+        // Which route kinds are valid for this listener's protocol.
+        let protocol_kinds: &[&str] = match l.protocol.as_str() {
+            "HTTP" | "HTTPS" => &["HTTPRoute"],
+            "TLS" => &["TLSRoute"],
+            _ => &[],
+        };
+
+        // Reconcile requested allowedRoutes.kinds against the protocol's valid set.
+        // Any requested kind not valid → ResolvedRefs=False, InvalidRouteKinds, and
+        // it is dropped from supportedKinds.
+        let mut invalid_kind = false;
+        let supported: Vec<&str> = match l.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref()) {
+            Some(requested) => requested
+                .iter()
+                .filter_map(|k| {
+                    match protocol_kinds.iter().find(|p| **p == k.kind) {
+                        Some(p) => Some(*p),
+                        None => {
+                            invalid_kind = true;
+                            None
+                        }
+                    }
+                })
+                .collect(),
+            None => protocol_kinds.to_vec(),
+        };
+
+        let supported_kinds: Vec<GatewayStatusListenersSupportedKinds> = supported
+            .iter()
+            .map(|k| GatewayStatusListenersSupportedKinds {
+                group: Some("gateway.networking.k8s.io".into()),
+                kind: k.to_string(),
+            })
+            .collect();
+
+        // Is the listener's protocol one we support?
+        let protocol_supported = matches!(l.protocol.as_str(), "HTTP" | "HTTPS" | "TLS");
+
+        // For HTTPS/TLS listeners, the certificate ref(s) must resolve.
+        let tls_ok = self.listener_tls_resolves(l);
+
+        let accepted = if !protocol_supported {
+            condition("Accepted", "False", "UnsupportedProtocol", gen)
+        } else {
+            condition("Accepted", "True", "Accepted", gen)
+        };
+
+        let resolved = if invalid_kind {
+            condition("ResolvedRefs", "False", "InvalidRouteKinds", gen)
+        } else if !tls_ok {
+            condition("ResolvedRefs", "False", "InvalidCertificateRef", gen)
+        } else {
+            condition("ResolvedRefs", "True", "ResolvedRefs", gen)
+        };
+
+        // Programmed requires the listener to be acceptable and refs resolved.
+        let programmed = if protocol_supported && tls_ok && !invalid_kind {
+            condition("Programmed", "True", "Programmed", gen)
+        } else {
+            condition("Programmed", "False", "Invalid", gen)
+        };
+
+        GatewayStatusListeners {
+            name: l.name.clone(),
+            attached_routes,
+            supported_kinds: Some(supported_kinds),
+            conditions: vec![accepted, programmed, resolved],
+        }
+    }
+
+    /// Whether an HTTPS/TLS listener's certificate references resolve to existing
+    /// Secrets. Non-TLS listeners trivially resolve. (Full TLS termination lands
+    /// in the TLS chunk; for now we only check the Secret exists.)
+    fn listener_tls_resolves(
+        &self,
+        l: &gateway_api::apis::standard::gateways::GatewayListeners,
+    ) -> bool {
+        if !matches!(l.protocol.as_str(), "HTTPS" | "TLS") {
+            return true;
+        }
+        let Some(tls) = l.tls.as_ref() else {
+            return false; // HTTPS/TLS listener with no tls config can't be programmed
+        };
+        use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
+        let refs = tls.certificate_refs.clone().unwrap_or_default();
+        if refs.is_empty() {
+            // Passthrough TLS needs no cert; terminate (default) needs one.
+            return matches!(tls.mode, Some(Mode::Passthrough));
+        }
+        // Every referenced Secret must exist (in the listener's namespace by default).
+        refs.iter().all(|r| {
+            let ns = r.namespace.clone();
+            self.secret_exists(ns.as_deref(), &r.name)
+        })
+    }
+
+    /// Does a Secret exist? `ns` defaults to any namespace match by name if None
+    /// is awkward; callers pass the gateway namespace via the ref when set.
+    fn secret_exists(&self, ns: Option<&str>, name: &str) -> bool {
+        self.stores.secrets.state().into_iter().any(|s| {
+            s.name_any() == name && ns.map(|n| s.namespace().as_deref() == Some(n)).unwrap_or(true)
+        })
     }
 
     /// How many routes are actually attached to each listener of this gateway,
