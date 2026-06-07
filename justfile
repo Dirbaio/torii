@@ -22,10 +22,10 @@ test:
 check:
     cargo run -- check
 
-# Run the controller + proxy (proxy on :80, advertises 127.0.0.1).
+# Run the controller + proxy (binds the conformance listener ports, advertises 127.0.0.1).
 # Requires: `sudo sysctl net.ipv4.ip_unprivileged_port_start=80` once per boot.
 run:
-    cargo run -- run --bind 0.0.0.0:80 --advertise 127.0.0.1
+    cargo run -- run --bind-ip 0.0.0.0 --ports 80,443,8080,8090 --advertise 127.0.0.1
 
 # Create the local kind cluster and make Pod/Service CIDRs host-routable.
 cluster-up:

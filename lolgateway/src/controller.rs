@@ -43,7 +43,13 @@ pub const CONTROLLER_NAME: &str = "lolgateway.dev/controller";
 /// Features we report in GatewayClass.status.supportedFeatures. The conformance
 /// suite uses this to decide which tests apply when running a whole profile
 /// (without an explicit --supported-features flag). Grow this as features land.
-const SUPPORTED_FEATURES: &[&str] = &["Gateway", "HTTPRoute", "ReferenceGrant"];
+const SUPPORTED_FEATURES: &[&str] = &[
+    "Gateway",
+    "GatewayPort8080",
+    "HTTPRoute",
+    "ReferenceGrant",
+    "HTTPRouteParentRefPort",
+];
 
 /// The address we advertise in Gateway.status.addresses — where our proxy listens,
 /// reachable by the conformance suite running on the host.

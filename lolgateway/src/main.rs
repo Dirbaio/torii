@@ -34,10 +34,19 @@ enum Command {
 
 #[derive(clap::Args, Debug)]
 struct RunArgs {
-    /// Address the data-plane proxy binds to (host:port). The port should match
-    /// the Gateway listener port the conformance suite connects to.
-    #[arg(long, env = "LOLGATEWAY_BIND", default_value = "0.0.0.0:80")]
-    bind: String,
+    /// IP the data-plane proxy binds to.
+    #[arg(long, env = "LOLGATEWAY_BIND_IP", default_value = "0.0.0.0")]
+    bind_ip: String,
+
+    /// Listener ports to bind. The proxy routes per-port using the local socket
+    /// port, so this should cover all Gateway listener ports in use.
+    #[arg(
+        long,
+        env = "LOLGATEWAY_PORTS",
+        value_delimiter = ',',
+        default_value = "80,443,8080,8090"
+    )]
+    ports: Vec<u16>,
 
     /// IP advertised in Gateway.status.addresses — must be reachable by the
     /// conformance suite. Defaults to the loopback address.
@@ -72,14 +81,11 @@ async fn run(args: RunArgs) -> Result<()> {
 
     // Data plane on its own thread — run_forever() blocks and calls process::exit.
     let dp_routes = shared.clone();
-    let bind = args.bind.clone();
-    let listen_port: u16 = bind
-        .rsplit_once(':')
-        .and_then(|(_, p)| p.parse().ok())
-        .context("--bind must be host:port")?;
+    let bind_ip = args.bind_ip.clone();
+    let ports = args.ports.clone();
     std::thread::Builder::new()
         .name("dataplane".into())
-        .spawn(move || dataplane::run(dp_routes, &bind, listen_port))
+        .spawn(move || dataplane::run(dp_routes, &bind_ip, &ports))
         .context("failed to spawn data-plane thread")?;
 
     // Control plane on this runtime.

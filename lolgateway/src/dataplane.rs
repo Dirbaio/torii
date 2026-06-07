@@ -19,9 +19,6 @@ use crate::route_table::{Endpoint, Filters, HeaderMods, SharedRouteTable};
 /// The proxy. Holds the shared routing snapshot handle.
 pub struct GatewayProxy {
     routes: SharedRouteTable,
-    /// The Gateway listener port routes are matched against. (Single-listener for
-    /// now; multi-listener/port will key off the accepting socket later.)
-    listen_port: u16,
 }
 
 /// Per-request state carried between the proxy phases.
@@ -35,8 +32,8 @@ pub struct RequestCtx {
 }
 
 impl GatewayProxy {
-    pub fn new(routes: SharedRouteTable, listen_port: u16) -> Self {
-        GatewayProxy { routes, listen_port }
+    pub fn new(routes: SharedRouteTable) -> Self {
+        GatewayProxy { routes }
     }
 }
 
@@ -64,8 +61,13 @@ impl ProxyHttp for GatewayProxy {
             .to_string();
         let headers = req.headers.clone();
 
-        // The listener port is the local port the connection landed on.
-        let port = self.listen_port;
+        // The listener port is the local (server) port the connection landed on,
+        // so multi-listener Gateways route correctly per port.
+        let port = session
+            .server_addr()
+            .and_then(|a| a.as_inet())
+            .map(|a| a.port())
+            .unwrap_or(0);
 
         let table = self.routes.load();
         let Some(entry) = table.match_request(port, &host, &path, &method, &headers, &query) else {
@@ -252,16 +254,18 @@ fn strip_port(host: &str) -> &str {
 ///
 /// This blocks forever (Pingora calls `std::process::exit` on shutdown), so call
 /// it from a dedicated thread.
-pub fn run(routes: SharedRouteTable, bind_addr: &str, listen_port: u16) -> ! {
+pub fn run(routes: SharedRouteTable, bind_ip: &str, ports: &[u16]) -> ! {
     // Pass None so Pingora doesn't parse our process argv as its own options.
     let mut server = Server::new(None).expect("failed to create pingora server");
     server.bootstrap();
 
-    let mut proxy =
-        http_proxy_service(&server.configuration, GatewayProxy::new(routes, listen_port));
-    proxy.add_tcp(bind_addr);
+    let mut proxy = http_proxy_service(&server.configuration, GatewayProxy::new(routes));
+    // Bind every listener port; the proxy routes per-port via server_addr().
+    for port in ports {
+        proxy.add_tcp(&format!("{bind_ip}:{port}"));
+    }
     server.add_service(proxy);
 
-    tracing::info!(bind = bind_addr, listen_port, "data plane listening");
+    tracing::info!(bind_ip, ?ports, "data plane listening");
     server.run_forever();
 }
