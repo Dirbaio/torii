@@ -45,7 +45,13 @@ pub struct RouteTable {
 }
 
 impl RouteTable {
-    /// Find the first matching entry for a request on the given listener port.
+    /// Find the matching entry for a request on the given listener port.
+    ///
+    /// Listener isolation: when multiple listeners share a port with different
+    /// hostnames, the request is served only by routes on the *most specific*
+    /// listener whose hostname matches the request Host. So we first find the best
+    /// matching listener-hostname among all entries on the port, then match routes
+    /// only on listeners with that hostname.
     pub fn match_request(
         &self,
         port: u16,
@@ -55,8 +61,21 @@ impl RouteTable {
         headers: &http::HeaderMap,
         query: &str,
     ) -> Option<&RouteEntry> {
+        // Best (most-specific) listener hostname on this port that matches the host.
+        let best = self
+            .entries
+            .iter()
+            .filter(|e| e.listener_port == port && e.listener_hostname_matches(host))
+            .map(|e| listener_specificity(e.listener_hostname.as_deref()))
+            .max();
+        let Some(best) = best else { return None };
+
+        // Among entries on the winning listener tier, return the first full match.
         self.entries.iter().find(|e| {
-            e.listener_port == port && e.matches(host, path, method, headers, query)
+            e.listener_port == port
+                && listener_specificity(e.listener_hostname.as_deref()) == best
+                && e.listener_hostname_matches(host)
+                && e.matches(host, path, method, headers, query)
         })
     }
 
@@ -72,6 +91,10 @@ impl RouteTable {
 pub struct RouteEntry {
     /// Listener port this entry is attached to.
     pub listener_port: u16,
+    /// The attached listener's hostname (None = no hostname / match any). Used for
+    /// listener isolation: a request is served by the most-specific matching
+    /// listener only.
+    pub listener_hostname: Option<String>,
     /// Hostnames from the HTTPRoute. Empty = match any.
     pub hostnames: Vec<String>,
     /// The request match criteria.
@@ -238,6 +261,14 @@ impl RouteEntry {
         self.hostnames.iter().any(|h| hostname_matches(h, host))
     }
 
+    /// Does this entry's listener hostname match the request host? (None = any.)
+    fn listener_hostname_matches(&self, host: &str) -> bool {
+        match &self.listener_hostname {
+            None => true,
+            Some(lh) => hostname_matches(lh, host),
+        }
+    }
+
     /// Compare two entries: returns Less if `self` has HIGHER precedence (should
     /// come first). Follows the Gateway API precedence rules.
     fn precedence_cmp(&self, other: &Self) -> Ordering {
@@ -363,6 +394,17 @@ impl RouteMatch {
     }
 }
 
+/// Specificity of a listener hostname, for listener isolation. Higher = more
+/// specific: an exact hostname beats a wildcard beats no-hostname; among
+/// non-empty, more labels = more specific.
+fn listener_specificity(hostname: Option<&str>) -> (u8, usize) {
+    match hostname {
+        None => (0, 0),
+        Some(h) if h.starts_with("*.") => (1, h.matches('.').count()),
+        Some(h) => (2, h.matches('.').count()),
+    }
+}
+
 /// Gateway API prefix semantics: `/foo` matches `/foo` and `/foo/bar` but not
 /// `/foobar`. The prefix `/` matches everything. Matching is on path *elements*.
 fn path_prefix_matches(prefix: &str, path: &str) -> bool {
@@ -414,6 +456,7 @@ mod tests {
     fn entry(path: PathMatch, headers: usize) -> RouteEntry {
         RouteEntry {
             listener_port: 80,
+            listener_hostname: None,
             hostnames: vec![],
             r#match: RouteMatch {
                 path: Some(path),
@@ -467,6 +510,7 @@ mod tests {
         };
         let e = RouteEntry {
             listener_port: 80,
+            listener_hostname: None,
             hostnames: vec![],
             r#match: RouteMatch::default(),
             backends: vec![

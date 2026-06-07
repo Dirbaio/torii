@@ -46,6 +46,7 @@ pub const CONTROLLER_NAME: &str = "lolgateway.dev/controller";
 const SUPPORTED_FEATURES: &[&str] = &[
     "Gateway",
     "GatewayPort8080",
+    "GatewayHTTPListenerIsolation",
     "HTTPRoute",
     "ReferenceGrant",
     "HTTPRouteParentRefPort",
@@ -557,6 +558,7 @@ impl ReconcileCtx {
                             effective_hostnames(&hostnames, l.hostname.as_deref());
                         table.entries.push(RouteEntry {
                             listener_port: l.port as u16,
+                            listener_hostname: l.hostname.clone(),
                             hostnames: effective_hosts,
                             r#match: rm.clone(),
                             backends: backends.clone(),
