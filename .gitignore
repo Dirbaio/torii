@@ -1,0 +1,15 @@
+/target
+/.cargo-home
+# Local dev cluster credentials — contains client cert/key, never commit.
+/kubeconfig
+# Vendored upstream references (own git checkouts, depended on by path).
+# Obtain them per README; not tracked in this repo.
+/pingora
+/gateway-api
+**/*.rs.bk
+*.pdb
+.DS_Store
+# Local harness / editor / sandbox artifacts (environment-specific, not project).
+/.claude
+/.vscode
+/sandbox-claude.sh
