@@ -205,6 +205,16 @@ pub struct Filters {
     pub response_headers: HeaderMods,
     pub redirect: Option<Redirect>,
     pub url_rewrite: Option<UrlRewrite>,
+    /// RequestMirror targets: a copy of the request is sent fire-and-forget to one
+    /// endpoint of each, with the given sampling percent (0..=100).
+    pub mirrors: Vec<Mirror>,
+}
+
+/// A request-mirror target (resolved backend endpoints + sampling percent).
+#[derive(Debug, Clone)]
+pub struct Mirror {
+    pub endpoints: Vec<Endpoint>,
+    pub percent: u8,
 }
 
 #[derive(Debug, Clone)]
