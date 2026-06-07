@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = ["lolgateway"]
+# pingora/ and gateway-api/ are vendored references with their own workspaces.
+# Exclude them so cargo doesn't try to absorb pingora's crates (and resolve their
+# `workspace = true` deps against our root manifest).
+exclude = ["pingora", "gateway-api"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.84"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+# Kubernetes client + controller-runtime. Pin kube and k8s-openapi together.
+kube = { version = "3.1", default-features = false, features = [
+    "client",
+    "runtime",
+    "derive",
+    "rustls-tls",
+] }
+# Exactly ONE k8s_openapi version feature may be enabled across the whole graph,
+# and it must be set by the final binary crate only. We set it here on the binary.
+k8s-openapi = { version = "0.27", default-features = false }
+# Gateway API CRD types (v1.5.1). Pin exactly: 0.21 has HTTPRoute (double-P) as the
+# root type; nested/status types are HttpRoute*. Depends on kube 3.1 + k8s-openapi 0.27.
+gateway-api = "=0.21.0"
+
+# Pingora data plane (path deps on the vendored source).
+pingora-core = { path = "pingora/pingora-core" }
+pingora-proxy = { path = "pingora/pingora-proxy" }
+pingora-http = { path = "pingora/pingora-http" }
+
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+clap = { version = "4", features = ["derive", "env"] }
+# kube's `rustls-tls` leaves the crypto backend to the app; we pick `ring` and
+# install it as the process default before building any client.
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+anyhow = "1"
+async-trait = "0.1"
+arc-swap = "1"
+http = "1"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
