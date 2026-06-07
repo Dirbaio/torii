@@ -103,6 +103,9 @@ pub struct RouteEntry {
     pub backends: Vec<Backend>,
     /// Filters applied to matching requests/responses.
     pub filters: Filters,
+    /// Request timeout from the rule's `timeouts.request` (None = no timeout,
+    /// also used for an explicit "0s" which disables it).
+    pub request_timeout: Option<std::time::Duration>,
 
     // --- precedence tiebreakers (Gateway API spec order) ---
     /// Route creationTimestamp as unix seconds (older wins).
@@ -471,6 +474,7 @@ mod tests {
             },
             backends: vec![],
             filters: Filters::default(),
+            request_timeout: None,
             route_creation: 0,
             route_key: "ns/n".into(),
             rule_order: 0,
@@ -519,6 +523,7 @@ mod tests {
                 Backend { weight: 0, endpoints: vec![ip(3)] },
             ],
             filters: Filters::default(),
+            request_timeout: None,
             route_creation: 0,
             route_key: "ns/n".into(),
             rule_order: 0,

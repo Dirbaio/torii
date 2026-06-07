@@ -50,6 +50,8 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRoute",
     "ReferenceGrant",
     "HTTPRouteParentRefPort",
+    "HTTPRouteRequestTimeout",
+    "HTTPRouteBackendTimeout",
 ];
 
 /// The address we advertise in Gateway.status.addresses — where our proxy listens,
@@ -533,8 +535,20 @@ impl ReconcileCtx {
                     }
                 }
 
-                // Parse this rule's filters once.
+                // Parse this rule's filters and timeouts once. Honor both
+                // `request` (overall) and `backendRequest` (per-attempt); with no
+                // retries they coincide, so use the smaller non-zero value. "0s"
+                // disables that timeout.
                 let filters = filters_from(&rule.filters.clone().unwrap_or_default());
+                let request_timeout = rule.timeouts.as_ref().and_then(|t| {
+                    let parse = |s: &Option<String>| {
+                        s.as_ref().and_then(|v| parse_go_duration(v)).filter(|d| !d.is_zero())
+                    };
+                    [parse(&t.request), parse(&t.backend_request)]
+                        .into_iter()
+                        .flatten()
+                        .min()
+                });
 
                 // Each `match` in the rule is an independent OR alternative. A rule
                 // with no matches defaults to a single match-all (PathPrefix "/").
@@ -563,6 +577,7 @@ impl ReconcileCtx {
                             r#match: rm.clone(),
                             backends: backends.clone(),
                             filters: filters.clone(),
+                            request_timeout,
                             route_creation,
                             route_key: route_key.clone(),
                             rule_order,
@@ -957,6 +972,29 @@ fn hostname_intersection(a: &str, b: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Parse a Gateway API / Go-style duration (e.g. "500ms", "1s", "2m", "0s") into
+/// a [`Duration`]. Supports h/m/s/ms/us/ns units; returns None on parse failure.
+fn parse_go_duration(s: &str) -> Option<Duration> {
+    let s = s.trim();
+    if s == "0" {
+        return Some(Duration::ZERO);
+    }
+    // Split into a number and a unit suffix.
+    let unit_start = s.find(|c: char| c.is_alphabetic())?;
+    let (num, unit) = s.split_at(unit_start);
+    let value: f64 = num.parse().ok()?;
+    let nanos = match unit {
+        "ns" => value,
+        "us" | "µs" => value * 1e3,
+        "ms" => value * 1e6,
+        "s" => value * 1e9,
+        "m" => value * 60.0 * 1e9,
+        "h" => value * 3600.0 * 1e9,
+        _ => return None,
+    };
+    Some(Duration::from_nanos(nanos as u64))
 }
 
 /// Parse a rule's filters into our pre-digested [`Filters`] form.
