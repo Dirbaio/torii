@@ -52,6 +52,9 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteParentRefPort",
     "HTTPRouteRequestTimeout",
     "HTTPRouteBackendTimeout",
+    "HTTPRouteRequestMirror",
+    "HTTPRouteRequestMultipleMirrors",
+    "HTTPRouteRequestPercentageMirror",
 ];
 
 /// The address we advertise in Gateway.status.addresses — where our proxy listens,
@@ -535,6 +538,12 @@ impl ReconcileCtx {
                     }
                 }
 
+                // Resolve any RequestMirror filter targets to endpoints.
+                let mirrors = self.resolve_mirrors(
+                    &rule.filters.clone().unwrap_or_default(),
+                    &route_ns,
+                );
+
                 // Parse this rule's filters and timeouts once. Honor both
                 // `request` (overall) and `backendRequest` (per-attempt); with no
                 // retries they coincide, so use the smaller non-zero value. "0s"
@@ -549,6 +558,7 @@ impl ReconcileCtx {
                         .flatten()
                         .min()
                 });
+                let filters = Filters { mirrors, ..filters };
 
                 // Each `match` in the rule is an independent OR alternative. A rule
                 // with no matches defaults to a single match-all (PathPrefix "/").
@@ -751,6 +761,36 @@ impl ReconcileCtx {
                 });
                 from_ok && to_ok
             })
+    }
+
+    /// Resolve RequestMirror filter backend refs into [`Mirror`] targets.
+    fn resolve_mirrors(
+        &self,
+        filters: &[gateway_api::apis::standard::httproutes::HttpRouteRulesFilters],
+        route_ns: &str,
+    ) -> Vec<crate::route_table::Mirror> {
+        let mut out = Vec::new();
+        for f in filters {
+            let Some(m) = &f.request_mirror else { continue };
+            let b = &m.backend_ref;
+            let bns = b.namespace.clone().unwrap_or_else(|| route_ns.to_string());
+            let port = b.port.unwrap_or(0) as u16;
+            // Sampling: percent (0..=100), or fraction numerator/denominator.
+            let percent = if let Some(p) = m.percent {
+                p.clamp(0, 100) as u8
+            } else if let Some(fr) = &m.fraction {
+                let denom = fr.denominator.unwrap_or(100).max(1);
+                ((fr.numerator as i64 * 100 / denom as i64).clamp(0, 100)) as u8
+            } else {
+                100
+            };
+            if let Some(endpoints) = self.resolve_endpoints(&bns, &b.name, port) {
+                if !endpoints.is_empty() {
+                    out.push(crate::route_table::Mirror { endpoints, percent });
+                }
+            }
+        }
+        out
     }
 
     /// Resolve a Service's backing pod endpoints, mapping the Service port to the
