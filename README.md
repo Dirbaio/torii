@@ -47,8 +47,12 @@ skipped — lolgateway does not advertise their features):
   and are enforced by per-pod sidecars, a fundamentally different architecture from this
   edge gateway.
 
-Work in progress toward full GATEWAY-HTTP/TLS: request mirror, timeouts/retries, backend
-protocol (h2c/websocket), and TLS termination (HTTPS listeners + BackendTLSPolicy).
+Note: **HTTPRoute `retry`** is an *experimental-channel* feature in Gateway API v1.5
+(absent from the standard CRDs), so the retry tests are not part of the standard
+GATEWAY-HTTP profile and are out of scope here.
+
+Work in progress toward full GATEWAY-HTTP/TLS: backend protocol (h2c/websocket), and
+TLS termination (HTTPS listeners + BackendTLSPolicy).
 
 ## Prerequisites
 
