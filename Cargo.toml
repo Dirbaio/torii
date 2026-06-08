@@ -26,9 +26,12 @@ k8s-openapi = { version = "0.27", default-features = false }
 # root type; nested/status types are HttpRoute*. Depends on kube 3.1 + k8s-openapi 0.27.
 gateway-api = "=0.21.0"
 
-# Pingora data plane (path deps on the vendored source).
-pingora-core = { path = "pingora/pingora-core" }
-pingora-proxy = { path = "pingora/pingora-proxy" }
+# Pingora data plane (path deps on the vendored source). We enable the `openssl`
+# TLS backend (system OpenSSL) rather than rustls, because TLS termination with
+# per-SNI certificate selection requires the OpenSSL/BoringSSL certificate
+# callback (rustls in Pingora has no such hook).
+pingora-core = { path = "pingora/pingora-core", features = ["openssl"] }
+pingora-proxy = { path = "pingora/pingora-proxy", features = ["openssl"] }
 pingora-http = { path = "pingora/pingora-http" }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
