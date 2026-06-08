@@ -8,6 +8,7 @@ use clap::{Parser, Subcommand};
 use k8s_openapi::api::core::v1::Namespace;
 use kube::{api::ListParams, Api, Client};
 
+mod cert_store;
 mod controller;
 mod dataplane;
 mod route_table;
@@ -38,15 +39,23 @@ struct RunArgs {
     #[arg(long, env = "LOLGATEWAY_BIND_IP", default_value = "0.0.0.0")]
     bind_ip: String,
 
-    /// Listener ports to bind. The proxy routes per-port using the local socket
-    /// port, so this should cover all Gateway listener ports in use.
+    /// Plain-HTTP listener ports. The proxy routes per-port via the local socket.
     #[arg(
         long,
-        env = "LOLGATEWAY_PORTS",
+        env = "LOLGATEWAY_HTTP_PORTS",
         value_delimiter = ',',
-        default_value = "80,443,8080,8090"
+        default_value = "80,8080,8090"
     )]
-    ports: Vec<u16>,
+    http_ports: Vec<u16>,
+
+    /// HTTPS listener ports (TLS terminated, cert selected by SNI).
+    #[arg(
+        long,
+        env = "LOLGATEWAY_TLS_PORTS",
+        value_delimiter = ',',
+        default_value = "443"
+    )]
+    tls_ports: Vec<u16>,
 
     /// IP advertised in Gateway.status.addresses — must be reachable by the
     /// conformance suite. Defaults to the loopback address.
@@ -78,21 +87,24 @@ async fn run(args: RunArgs) -> Result<()> {
         .context("failed to build Kubernetes client")?;
 
     let shared = route_table::SharedRouteTable::new();
+    let certs = cert_store::SharedCertStore::new();
 
     // Data plane on its own thread — run_forever() blocks and calls process::exit.
     let dp_routes = shared.clone();
+    let dp_certs = certs.clone();
     let bind_ip = args.bind_ip.clone();
-    let ports = args.ports.clone();
+    let http_ports = args.http_ports.clone();
+    let tls_ports = args.tls_ports.clone();
     std::thread::Builder::new()
         .name("dataplane".into())
-        .spawn(move || dataplane::run(dp_routes, &bind_ip, &ports))
+        .spawn(move || dataplane::run(dp_routes, dp_certs, &bind_ip, &http_ports, &tls_ports))
         .context("failed to spawn data-plane thread")?;
 
     // Control plane on this runtime.
     let config = controller::ControllerConfig {
         advertise_address: args.advertise,
     };
-    controller::run(client, shared, config).await
+    controller::run(client, shared, certs, config).await
 }
 
 fn init_tracing(filter: &str) {

@@ -14,6 +14,7 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
 use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
 
+use crate::cert_store::SharedCertStore;
 use crate::route_table::{Endpoint, Filters, HeaderMods, SharedRouteTable};
 
 /// The proxy. Holds the shared routing snapshot handle.
@@ -453,22 +454,70 @@ fn strip_port(host: &str) -> &str {
     host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
 }
 
-/// Run the Pingora proxy server, listening on `bind_addr` (e.g. "127.0.0.1:80").
+/// A Pingora TLS accept callback that selects a server certificate by SNI from
+/// the shared [`SharedCertStore`], loading the PEM cert+key in-memory per
+/// handshake. This is what makes per-listener / per-SNI HTTPS termination work.
+struct SniCertCallback {
+    certs: SharedCertStore,
+}
+
+#[async_trait]
+impl pingora_core::listeners::TlsAccept for SniCertCallback {
+    async fn certificate_callback(&self, ssl: &mut pingora_core::tls::ssl::SslRef) {
+        use pingora_core::tls::ext;
+        let sni = ssl
+            .servername(pingora_core::tls::ssl::NameType::HOST_NAME)
+            .map(|s| s.to_string());
+        let store = self.certs.load();
+        let Some(ck) = store.select(sni.as_deref()) else {
+            // No cert available; leave the default (handshake will fail cleanly).
+            return;
+        };
+        let (Ok(cert), Ok(key)) = (
+            pingora_core::tls::x509::X509::from_pem(&ck.cert_pem),
+            pingora_core::tls::pkey::PKey::private_key_from_pem(&ck.key_pem),
+        ) else {
+            return;
+        };
+        let _ = ext::ssl_use_certificate(ssl, &cert);
+        let _ = ext::ssl_use_private_key(ssl, &key);
+    }
+}
+
+/// Run the Pingora proxy server: `http_ports` get plain-TCP listeners, `tls_ports`
+/// get HTTPS listeners that terminate TLS using SNI-selected certs from `certs`.
 ///
 /// This blocks forever (Pingora calls `std::process::exit` on shutdown), so call
 /// it from a dedicated thread.
-pub fn run(routes: SharedRouteTable, bind_ip: &str, ports: &[u16]) -> ! {
+pub fn run(
+    routes: SharedRouteTable,
+    certs: SharedCertStore,
+    bind_ip: &str,
+    http_ports: &[u16],
+    tls_ports: &[u16],
+) -> ! {
+    use pingora_core::listeners::tls::TlsSettings;
+
     // Pass None so Pingora doesn't parse our process argv as its own options.
     let mut server = Server::new(None).expect("failed to create pingora server");
     server.bootstrap();
 
     let mut proxy = http_proxy_service(&server.configuration, GatewayProxy::new(routes));
-    // Bind every listener port; the proxy routes per-port via server_addr().
-    for port in ports {
+
+    // Plain HTTP listeners. The proxy routes per-port via server_addr().
+    for port in http_ports {
         proxy.add_tcp(&format!("{bind_ip}:{port}"));
+    }
+    // HTTPS listeners: terminate TLS, selecting the cert by SNI per handshake.
+    for port in tls_ports {
+        let cb: pingora_core::listeners::TlsAcceptCallbacks =
+            Box::new(SniCertCallback { certs: certs.clone() });
+        let settings = TlsSettings::with_callbacks(cb).expect("failed to build TLS settings");
+        proxy
+            .add_tls_with_settings(&format!("{bind_ip}:{port}"), None, settings);
     }
     server.add_service(proxy);
 
-    tracing::info!(bind_ip, ?ports, "data plane listening");
+    tracing::info!(bind_ip, ?http_ports, ?tls_ports, "data plane listening");
     server.run_forever();
 }
