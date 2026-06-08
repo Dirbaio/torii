@@ -1176,8 +1176,16 @@ impl ReconcileCtx {
         K::DynamicType: Default,
     {
         let pp = PatchParams::default();
-        api.patch_status(name, &pp, &Patch::Merge(&status)).await?;
-        Ok(())
+        match api.patch_status(name, &pp, &Patch::Merge(&status)).await {
+            Ok(_) => Ok(()),
+            // The object was deleted between our cache snapshot and this write —
+            // there's nothing to update. Don't abort the whole reconcile pass.
+            Err(kube::Error::Api(ae)) if ae.code == 404 => {
+                tracing::debug!(name, "status target gone (404), skipping");
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
