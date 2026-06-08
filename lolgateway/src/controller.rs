@@ -193,8 +193,12 @@ pub async fn run(
     // Reconcile loop: debounce bursts of events, then recompute everything.
     loop {
         // Wait for at least one event (or periodic resync every 10s).
-        let _ = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
-        // Coalesce a short burst.
+        // Wait for an event, or resync periodically. The short resync interval is
+        // a safety net: it heals any convergence we might miss if a watched
+        // object's cache update lands in a narrow window around a reconcile.
+        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        // Coalesce a short burst, then drain so events that arrive *after* this
+        // point (e.g. during the reconcile) trigger a fresh pass next iteration.
         tokio::time::sleep(Duration::from_millis(100)).await;
         while rx.try_recv().is_ok() {}
 
