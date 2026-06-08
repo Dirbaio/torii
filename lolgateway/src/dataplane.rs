@@ -114,7 +114,7 @@ impl ProxyHttp for GatewayProxy {
 
         // A RequestRedirect filter produces an early 3xx response — no upstream.
         if let Some(redirect) = &entry.filters.redirect {
-            let location = build_redirect_location(redirect, entry, &host, &path);
+            let location = build_redirect_location(redirect, entry, &host, &path, port);
             let mut resp = ResponseHeader::build(redirect.status_code, None)?;
             resp.insert_header("Location", location)?;
             resp.insert_header("Content-Length", "0")?;
@@ -134,14 +134,14 @@ impl ProxyHttp for GatewayProxy {
             }
         }
 
-        // Stash filters + any path rewrite + timeout for the later phases.
-        ctx.filters = entry.filters.clone();
-        ctx.rewrite_path = entry.rewrite_path(&path);
         ctx.request_timeout = entry.request_timeout;
 
         match entry.pick_endpoint(next_rng()) {
-            Some(ep) => {
+            Some((ep, backend)) => {
                 tracing::debug!(%host, %path, %method, ip = %ep.ip, port = ep.port, "matched route");
+                // Rule-level filters plus the chosen backend's per-backendRef filters.
+                ctx.filters = entry.filters.merged_with(&backend.filters);
+                ctx.rewrite_path = entry.rewrite_path(&path);
                 ctx.upstream = Some(ep.clone());
                 Ok(false) // continue to upstream_peer
             }
@@ -412,11 +412,17 @@ fn apply_header_mods(mods: &HeaderMods, target: &mut impl HeaderTarget) {
 
 /// Build the `Location` header value for a RequestRedirect filter, defaulting
 /// each component to the incoming request's value.
+///
+/// Port inference (Gateway API): use the explicit redirect port if set; otherwise,
+/// if the redirect scheme is set, omit the port (the client infers the scheme's
+/// default); otherwise reuse the listener port the request arrived on. The port
+/// is also omitted when it equals the scheme's default (80/http, 443/https).
 fn build_redirect_location(
     redirect: &crate::route_table::Redirect,
     entry: &crate::route_table::RouteEntry,
     req_host: &str,
     req_path: &str,
+    listener_port: u16,
 ) -> String {
     let scheme = redirect.scheme.as_deref().unwrap_or("http");
     let host = redirect.hostname.as_deref().unwrap_or(req_host);
@@ -424,10 +430,23 @@ fn build_redirect_location(
         Some(rw) => entry.apply_path_rewrite(rw, req_path),
         None => req_path.to_string(),
     };
-    match redirect.port {
+
+    let port: Option<u16> = match redirect.port {
+        Some(p) => Some(p),
+        None if redirect.scheme.is_some() => None, // infer from scheme → omit
+        None => Some(listener_port),               // reuse the listener port
+    };
+    // Omit the port if it's the scheme's default.
+    let port = port.filter(|p| !is_default_port(scheme, *p));
+
+    match port {
         Some(p) => format!("{scheme}://{host}:{p}{path}"),
         None => format!("{scheme}://{host}{path}"),
     }
+}
+
+fn is_default_port(scheme: &str, port: u16) -> bool {
+    matches!((scheme, port), ("http", 80) | ("https", 443))
 }
 
 fn strip_port(host: &str) -> &str {

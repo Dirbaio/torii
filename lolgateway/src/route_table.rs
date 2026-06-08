@@ -155,6 +155,9 @@ pub struct QueryMatch {
 pub struct Backend {
     pub weight: u32,
     pub endpoints: Vec<Endpoint>,
+    /// Per-backendRef filters (applied only when this backend is selected, in
+    /// addition to the rule-level filters).
+    pub filters: Filters,
 }
 
 /// Header set/add/remove operations (shared by request & response modifiers).
@@ -212,6 +215,32 @@ pub struct Filters {
     pub cors: Option<Cors>,
 }
 
+impl Filters {
+    /// Merge per-backend filters on top of rule-level filters. Header mods are
+    /// concatenated; redirect/url_rewrite/cors from the backend override if set;
+    /// mirrors are combined.
+    pub fn merged_with(&self, backend: &Filters) -> Filters {
+        let mut out = self.clone();
+        out.request_headers.set.extend(backend.request_headers.set.clone());
+        out.request_headers.add.extend(backend.request_headers.add.clone());
+        out.request_headers.remove.extend(backend.request_headers.remove.clone());
+        out.response_headers.set.extend(backend.response_headers.set.clone());
+        out.response_headers.add.extend(backend.response_headers.add.clone());
+        out.response_headers.remove.extend(backend.response_headers.remove.clone());
+        if backend.redirect.is_some() {
+            out.redirect = backend.redirect.clone();
+        }
+        if backend.url_rewrite.is_some() {
+            out.url_rewrite = backend.url_rewrite.clone();
+        }
+        if backend.cors.is_some() {
+            out.cors = backend.cors.clone();
+        }
+        out.mirrors.extend(backend.mirrors.clone());
+        out
+    }
+}
+
 /// CORS filter configuration (mirrors HTTPCORSFilter).
 #[derive(Debug, Clone, Default)]
 pub struct Cors {
@@ -265,7 +294,7 @@ impl RouteEntry {
     /// Gateway API semantics: a backend with weight 0 receives no traffic; the
     /// probability of a backend is `weight / sum(weights)`. We pick a backend by
     /// weight, then an endpoint within it uniformly (round-robin via the rng).
-    pub fn pick_endpoint(&self, rng: u64) -> Option<&Endpoint> {
+    pub fn pick_endpoint(&self, rng: u64) -> Option<(&Endpoint, &Backend)> {
         let total: u64 = self.backends.iter().map(|b| b.weight as u64).sum();
         let backend = if total == 0 {
             // All weights zero (or single unweighted) → first backend with endpoints.
@@ -289,7 +318,7 @@ impl RouteEntry {
             return None;
         }
         let idx = (rng as usize) % backend.endpoints.len();
-        backend.endpoints.get(idx)
+        backend.endpoints.get(idx).map(|ep| (ep, backend))
     }
 
     fn matches_host(&self, host: &str) -> bool {
@@ -579,9 +608,9 @@ mod tests {
             hostnames: vec![],
             r#match: RouteMatch::default(),
             backends: vec![
-                Backend { weight: 70, endpoints: vec![ip(1)] },
-                Backend { weight: 30, endpoints: vec![ip(2)] },
-                Backend { weight: 0, endpoints: vec![ip(3)] },
+                Backend { weight: 70, endpoints: vec![ip(1)], filters: Filters::default() },
+                Backend { weight: 30, endpoints: vec![ip(2)], filters: Filters::default() },
+                Backend { weight: 0, endpoints: vec![ip(3)], filters: Filters::default() },
             ],
             filters: Filters::default(),
             request_timeout: None,
@@ -594,7 +623,7 @@ mod tests {
         for r in 0..10_000u64 {
             // Spread the rng across the weight space deterministically.
             let pick = r.wrapping_mul(2654435761) % 100;
-            let ep = e.pick_endpoint(pick).unwrap();
+            let (ep, _) = e.pick_endpoint(pick).unwrap();
             match ep.ip {
                 std::net::IpAddr::V4(v) if v.octets()[3] == 1 => counts[0] += 1,
                 std::net::IpAddr::V4(v) if v.octets()[3] == 2 => counts[1] += 1,
