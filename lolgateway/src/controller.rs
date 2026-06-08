@@ -493,8 +493,10 @@ impl ReconcileCtx {
             if ref_ns != gw_ns && !self.secret_ref_permitted(&gw_ns, &ref_ns, &r.name) {
                 return Some("RefNotPermitted");
             }
-            if !self.secret_exists(Some(&ref_ns), &r.name) {
-                return Some("InvalidCertificateRef");
+            // The Secret must exist AND contain a valid tls.crt + tls.key.
+            match self.load_tls_secret(&ref_ns, &r.name) {
+                Some(ck) if cert_key_is_valid(&ck) => {}
+                _ => return Some("InvalidCertificateRef"),
             }
         }
         None
@@ -1129,6 +1131,13 @@ fn hostname_intersection(a: &str, b: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Validate that a cert/key pair parses as PEM (used to reject malformed cert
+/// Secrets → InvalidCertificateRef). Uses the same OpenSSL backend as the proxy.
+fn cert_key_is_valid(ck: &CertKey) -> bool {
+    pingora_core::tls::x509::X509::from_pem(&ck.cert_pem).is_ok()
+        && pingora_core::tls::pkey::PKey::private_key_from_pem(&ck.key_pem).is_ok()
 }
 
 /// Parse a Gateway API / Go-style duration (e.g. "500ms", "1s", "2m", "0s") into
