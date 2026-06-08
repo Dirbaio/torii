@@ -20,6 +20,9 @@ use crate::route_table::{Endpoint, Filters, HeaderMods, SharedRouteTable};
 /// The proxy. Holds the shared routing snapshot handle.
 pub struct GatewayProxy {
     routes: SharedRouteTable,
+    /// Ports that terminate TLS (HTTPS listeners). Used so redirects from an
+    /// HTTPS listener default their scheme to `https`.
+    tls_ports: Vec<u16>,
 }
 
 /// Per-request state carried between the proxy phases.
@@ -37,8 +40,8 @@ pub struct RequestCtx {
 }
 
 impl GatewayProxy {
-    pub fn new(routes: SharedRouteTable) -> Self {
-        GatewayProxy { routes }
+    pub fn new(routes: SharedRouteTable, tls_ports: Vec<u16>) -> Self {
+        GatewayProxy { routes, tls_ports }
     }
 }
 
@@ -115,7 +118,8 @@ impl ProxyHttp for GatewayProxy {
 
         // A RequestRedirect filter produces an early 3xx response — no upstream.
         if let Some(redirect) = &entry.filters.redirect {
-            let location = build_redirect_location(redirect, entry, &host, &path, port);
+            let is_tls = self.tls_ports.contains(&port);
+            let location = build_redirect_location(redirect, entry, &host, &path, port, is_tls);
             let mut resp = ResponseHeader::build(redirect.status_code, None)?;
             resp.insert_header("Location", location)?;
             resp.insert_header("Content-Length", "0")?;
@@ -424,8 +428,11 @@ fn build_redirect_location(
     req_host: &str,
     req_path: &str,
     listener_port: u16,
+    inbound_is_tls: bool,
 ) -> String {
-    let scheme = redirect.scheme.as_deref().unwrap_or("http");
+    // Default scheme to the inbound listener's scheme (https for a TLS listener).
+    let default_scheme = if inbound_is_tls { "https" } else { "http" };
+    let scheme = redirect.scheme.as_deref().unwrap_or(default_scheme);
     let host = redirect.hostname.as_deref().unwrap_or(req_host);
     let path = match &redirect.path {
         Some(rw) => entry.apply_path_rewrite(rw, req_path),
@@ -502,7 +509,10 @@ pub fn run(
     let mut server = Server::new(None).expect("failed to create pingora server");
     server.bootstrap();
 
-    let mut proxy = http_proxy_service(&server.configuration, GatewayProxy::new(routes));
+    let mut proxy = http_proxy_service(
+        &server.configuration,
+        GatewayProxy::new(routes, tls_ports.to_vec()),
+    );
 
     // Plain HTTP listeners. The proxy routes per-port via server_addr().
     for port in http_ports {
