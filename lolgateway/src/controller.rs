@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{Namespace, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
 use kube::api::{Patch, PatchParams};
@@ -31,6 +31,10 @@ use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
 use gateway_api::apis::standard::referencegrants::ReferenceGrant;
+use gateway_api::apis::standard::backendtlspolicies::{
+    BackendTLSPolicy, BackendTlsPolicyStatus, BackendTlsPolicyStatusAncestors,
+    BackendTlsPolicyStatusAncestorsAncestorRef,
+};
 
 use crate::cert_store::{CertKey, CertStore, SharedCertStore};
 use crate::route_table::{
@@ -76,6 +80,8 @@ struct Stores {
     reference_grants: Store<ReferenceGrant>,
     namespaces: Store<Namespace>,
     secrets: Store<Secret>,
+    config_maps: Store<ConfigMap>,
+    backend_tls_policies: Store<BackendTLSPolicy>,
 }
 
 /// Run the control plane forever: start watchers, and on any change recompute.
@@ -93,6 +99,8 @@ pub async fn run(
     let rg_api: Api<ReferenceGrant> = Api::all(client.clone());
     let ns_api: Api<Namespace> = Api::all(client.clone());
     let sec_api: Api<Secret> = Api::all(client.clone());
+    let cm_api: Api<ConfigMap> = Api::all(client.clone());
+    let btp_api: Api<BackendTLSPolicy> = Api::all(client.clone());
 
     // reflector stores + writers, fed by watchers.
     let (gc_store, gc_w) = reflector::store();
@@ -103,6 +111,8 @@ pub async fn run(
     let (rg_store, rg_w) = reflector::store();
     let (ns_store, ns_w) = reflector::store();
     let (sec_store, sec_w) = reflector::store();
+    let (cm_store, cm_w) = reflector::store();
+    let (btp_store, btp_w) = reflector::store();
 
     let stores = Arc::new(Stores {
         gateway_classes: gc_store.clone(),
@@ -113,6 +123,8 @@ pub async fn run(
         reference_grants: rg_store.clone(),
         namespaces: ns_store.clone(),
         secrets: sec_store.clone(),
+        config_maps: cm_store.clone(),
+        backend_tls_policies: btp_store.clone(),
     });
 
     // A change signal: every watcher event pokes this channel; a single consumer
@@ -149,6 +161,8 @@ pub async fn run(
     spawn_watch!(rg_api.clone(), rg_w, "ReferenceGrant");
     spawn_watch!(ns_api.clone(), ns_w, "Namespace");
     spawn_watch!(sec_api.clone(), sec_w, "Secret");
+    spawn_watch!(cm_api.clone(), cm_w, "ConfigMap");
+    spawn_watch!(btp_api.clone(), btp_w, "BackendTLSPolicy");
 
     // Wait for the caches to populate before the first reconcile.
     let ready = stores.clone();
@@ -161,6 +175,8 @@ pub async fn run(
         let _ = ready.reference_grants.wait_until_ready().await;
         let _ = ready.namespaces.wait_until_ready().await;
         let _ = ready.secrets.wait_until_ready().await;
+        let _ = ready.config_maps.wait_until_ready().await;
+        let _ = ready.backend_tls_policies.wait_until_ready().await;
     });
 
     tracing::info!(controller = CONTROLLER_NAME, "control plane started");
@@ -242,6 +258,10 @@ impl ReconcileCtx {
         // 4. Build the TLS cert store from owned Gateways' HTTPS listeners.
         let cert_store = self.build_cert_store(&gateways);
         self.certs.store(cert_store);
+
+        // 4b. Set BackendTLSPolicy status (ancestors = Gateways routing to the
+        //     target Service).
+        self.reconcile_backend_tls_policies(&gateways, &routes).await?;
 
         // 5. Sort by Gateway API precedence, then publish the data-plane snapshot.
         route_table.sort();
@@ -633,7 +653,15 @@ impl ReconcileCtx {
                         // Service exists (ResolvedRefs=True) — even with zero ready
                         // endpoints, the ref is resolved; an empty backend yields a
                         // 503 at traffic time, not BackendNotFound.
-                        Some(endpoints) => {
+                        Some(mut endpoints) => {
+                            // Apply a matching BackendTLSPolicy (re-encrypt to backend).
+                            if let Some(tls) =
+                                self.backend_tls_for(&bns, &backend_ref.name, svc_port)
+                            {
+                                for ep in &mut endpoints {
+                                    ep.tls = Some(tls.clone());
+                                }
+                            }
                             backends.push(Backend {
                                 weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
                                 endpoints,
@@ -877,6 +905,156 @@ impl ReconcileCtx {
             })
     }
 
+    /// Set status on every BackendTLSPolicy: one ancestor per Gateway that has a
+    /// route to the policy's target Service, with Accepted + ResolvedRefs.
+    async fn reconcile_backend_tls_policies(
+        &self,
+        gateways: &[Arc<Gateway>],
+        routes: &[Arc<HTTPRoute>],
+    ) -> Result<()> {
+        for policy in self.stores.backend_tls_policies.state() {
+            let gen = policy.meta().generation.unwrap_or(0);
+            let pol_ns = policy.namespace().unwrap_or_default();
+
+            // Validate CA refs → ResolvedRefs reason. The CA ConfigMap must exist,
+            // be a core ConfigMap, and contain a parseable ca.crt PEM.
+            let v = &policy.spec.validation;
+            let refs_ok = match &v.ca_certificate_refs {
+                None => v.well_known_ca_certificates.is_some(),
+                Some(refs) => refs.iter().all(|r| {
+                    r.group.is_empty()
+                        && r.kind == "ConfigMap"
+                        && self
+                            .load_configmap_ca(&pol_ns, &r.name)
+                            .map(|pem| ca_pem_is_valid(&pem))
+                            .unwrap_or(false)
+                }),
+            };
+            let (resolved, accepted) = if refs_ok {
+                (
+                    condition("ResolvedRefs", "True", "ResolvedRefs", gen),
+                    condition("Accepted", "True", "Accepted", gen),
+                )
+            } else {
+                (
+                    condition("ResolvedRefs", "False", "InvalidCACertificateRef", gen),
+                    condition("Accepted", "False", "NoValidCACertificate", gen),
+                )
+            };
+
+            // Ancestors: Gateways that a route targeting this Service attaches to.
+            let target_svcs: Vec<String> = policy
+                .spec
+                .target_refs
+                .iter()
+                .filter(|t| t.group.is_empty() && t.kind == "Service")
+                .map(|t| t.name.clone())
+                .collect();
+            let mut ancestors: Vec<BackendTlsPolicyStatusAncestors> = Vec::new();
+            for gw in gateways {
+                let gw_ns = gw.namespace().unwrap_or_default();
+                let routes_to_gw_target = routes.iter().any(|r| {
+                    let r_ns = r.namespace().unwrap_or_default();
+                    r.spec.parent_refs.clone().unwrap_or_default().iter().any(|p| {
+                        p.name == gw.name_any()
+                            && p.namespace.as_deref().unwrap_or(&r_ns) == gw_ns
+                    }) && r.spec.rules.clone().unwrap_or_default().iter().any(|rule| {
+                        rule.backend_refs.clone().unwrap_or_default().iter().any(|b| {
+                            target_svcs.contains(&b.name)
+                                && b.namespace.as_deref().unwrap_or(&r_ns) == pol_ns
+                        })
+                    })
+                });
+                if routes_to_gw_target {
+                    ancestors.push(BackendTlsPolicyStatusAncestors {
+                        ancestor_ref: BackendTlsPolicyStatusAncestorsAncestorRef {
+                            group: Some("gateway.networking.k8s.io".into()),
+                            kind: Some("Gateway".into()),
+                            name: gw.name_any(),
+                            namespace: Some(gw_ns),
+                            port: None,
+                            section_name: None,
+                        },
+                        controller_name: CONTROLLER_NAME.to_string(),
+                        conditions: vec![accepted.clone(), resolved.clone()],
+                    });
+                }
+            }
+            if ancestors.is_empty() {
+                continue; // no ancestor → don't claim status
+            }
+            let status = BackendTlsPolicyStatus { ancestors };
+            let api: Api<BackendTLSPolicy> = Api::namespaced(self.client.clone(), &pol_ns);
+            self.patch_status(&api, &policy.name_any(), serde_json::json!({ "status": status }))
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Find the effective BackendTLSPolicy for a Service port and resolve it to
+    /// an [`UpstreamTls`] (SNI hostname + CA bundle). Returns None if no valid
+    /// policy targets the Service. On conflict, the oldest/alphabetically-first
+    /// policy wins.
+    fn backend_tls_for(
+        &self,
+        svc_ns: &str,
+        svc_name: &str,
+        _svc_port: u16,
+    ) -> Option<crate::route_table::UpstreamTls> {
+        let mut matching: Vec<Arc<BackendTLSPolicy>> = self
+            .stores
+            .backend_tls_policies
+            .state()
+            .into_iter()
+            .filter(|p| {
+                p.namespace().as_deref() == Some(svc_ns)
+                    && p.spec.target_refs.iter().any(|t| {
+                        t.group.is_empty() && t.kind == "Service" && t.name == svc_name
+                    })
+            })
+            .collect();
+        // Conflict resolution: oldest creationTimestamp, then name.
+        matching.sort_by_key(|p| {
+            (
+                p.meta().creation_timestamp.as_ref().map(|t| t.0.as_second()).unwrap_or(0),
+                p.name_any(),
+            )
+        });
+        let policy = matching.into_iter().next()?;
+        let v = &policy.spec.validation;
+        // Resolve the CA bundle. wellKnownCACertificates=System → empty (use roots).
+        let ca_pem = if let Some(refs) = &v.ca_certificate_refs {
+            let mut pem = Vec::new();
+            for r in refs {
+                if !r.group.is_empty() || r.kind != "ConfigMap" {
+                    return None; // InvalidKind → no valid CA
+                }
+                let bytes = self.load_configmap_ca(svc_ns, &r.name)?;
+                if !ca_pem_is_valid(&bytes) {
+                    return None; // invalid CA → no usable upstream TLS
+                }
+                pem.extend_from_slice(&bytes);
+                pem.push(b'\n');
+            }
+            pem
+        } else {
+            Vec::new() // System CAs
+        };
+        Some(crate::route_table::UpstreamTls {
+            hostname: v.hostname.clone(),
+            ca_pem,
+        })
+    }
+
+    /// Read a CA bundle (ca.crt) from a ConfigMap.
+    fn load_configmap_ca(&self, ns: &str, name: &str) -> Option<Vec<u8>> {
+        let cm = self.stores.config_maps.state().into_iter().find(|c| {
+            c.name_any() == name && c.namespace().as_deref() == Some(ns)
+        })?;
+        let ca = cm.data.as_ref()?.get("ca.crt")?;
+        Some(ca.clone().into_bytes())
+    }
+
     /// Resolve RequestMirror filter backend refs into [`Mirror`] targets.
     fn resolve_mirrors(
         &self,
@@ -986,6 +1164,7 @@ impl ReconcileCtx {
                         endpoints.push(Endpoint {
                             ip,
                             port: port as u16,
+                            tls: None, // set later if a BackendTLSPolicy targets this Service
                         });
                     }
                 }
@@ -1131,6 +1310,13 @@ fn hostname_intersection(a: &str, b: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Validate that a CA bundle PEM contains at least one parseable certificate.
+fn ca_pem_is_valid(pem: &[u8]) -> bool {
+    pingora_core::tls::x509::X509::stack_from_pem(pem)
+        .map(|s| !s.is_empty())
+        .unwrap_or(false)
 }
 
 /// Validate that a cert/key pair parses as PEM (used to reject malformed cert
