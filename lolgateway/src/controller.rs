@@ -549,13 +549,6 @@ impl ReconcileCtx {
             })
     }
 
-    /// Does a Secret exist? `ns` defaults to any namespace match by name if None
-    /// is awkward; callers pass the gateway namespace via the ref when set.
-    fn secret_exists(&self, ns: Option<&str>, name: &str) -> bool {
-        self.stores.secrets.state().into_iter().any(|s| {
-            s.name_any() == name && ns.map(|n| s.namespace().as_deref() == Some(n)).unwrap_or(true)
-        })
-    }
 
     /// How many routes are actually attached to each listener of this gateway,
     /// using the same attachment rules as reconcile (sectionName, allowedRoutes,
