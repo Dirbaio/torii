@@ -32,6 +32,7 @@ use gateway_api::apis::standard::httproutes::{
 };
 use gateway_api::apis::standard::referencegrants::ReferenceGrant;
 
+use crate::cert_store::{CertKey, CertStore, SharedCertStore};
 use crate::route_table::{
     Backend, Endpoint, Filters, HeaderMatch, HeaderMods, HeaderValueMatch, PathMatch, PathRewrite,
     QueryMatch, Redirect, RouteEntry, RouteMatch, RouteTable, SharedRouteTable, UrlRewrite,
@@ -81,6 +82,7 @@ struct Stores {
 pub async fn run(
     client: Client,
     shared: SharedRouteTable,
+    certs: SharedCertStore,
     config: ControllerConfig,
 ) -> Result<()> {
     let gc_api: Api<GatewayClass> = Api::all(client.clone());
@@ -167,6 +169,7 @@ pub async fn run(
         client,
         gc_api,
         shared,
+        certs,
         config,
         stores,
     };
@@ -191,6 +194,7 @@ struct ReconcileCtx {
     // APIs built inline per object.
     gc_api: Api<GatewayClass>,
     shared: SharedRouteTable,
+    certs: SharedCertStore,
     config: ControllerConfig,
     stores: Arc<Stores>,
 }
@@ -235,11 +239,61 @@ impl ReconcileCtx {
                 .await?;
         }
 
-        // 4. Sort by Gateway API precedence, then publish the data-plane snapshot.
+        // 4. Build the TLS cert store from owned Gateways' HTTPS listeners.
+        let cert_store = self.build_cert_store(&gateways);
+        self.certs.store(cert_store);
+
+        // 5. Sort by Gateway API precedence, then publish the data-plane snapshot.
         route_table.sort();
         tracing::debug!(entries = route_table.entries.len(), "publishing route table");
         self.shared.store(route_table);
         Ok(())
+    }
+
+    /// Build the SNI→cert store from every owned Gateway's HTTPS/TLS-terminate
+    /// listeners whose certificate Secret resolves.
+    fn build_cert_store(&self, gateways: &[Arc<Gateway>]) -> CertStore {
+        use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
+        let mut store = CertStore::default();
+        for gw in gateways {
+            let gw_ns = gw.namespace().unwrap_or_default();
+            for l in &gw.spec.listeners {
+                if l.protocol != "HTTPS" {
+                    continue;
+                }
+                let Some(tls) = l.tls.as_ref() else { continue };
+                if matches!(tls.mode, Some(Mode::Passthrough)) {
+                    continue;
+                }
+                for r in tls.certificate_refs.clone().unwrap_or_default() {
+                    let ref_ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
+                    // Only load a cert that's actually permitted + present.
+                    if ref_ns != gw_ns && !self.secret_ref_permitted(&gw_ns, &ref_ns, &r.name) {
+                        continue;
+                    }
+                    if let Some(ck) = self.load_tls_secret(&ref_ns, &r.name) {
+                        // Key by the listener hostname; "" is the default cert.
+                        let host = l.hostname.clone().unwrap_or_default();
+                        store.insert(host, ck);
+                    }
+                }
+            }
+        }
+        store
+    }
+
+    /// Load a kubernetes.io/tls Secret's cert+key (tls.crt / tls.key) as PEM.
+    fn load_tls_secret(&self, ns: &str, name: &str) -> Option<CertKey> {
+        let secret = self.stores.secrets.state().into_iter().find(|s| {
+            s.name_any() == name && s.namespace().as_deref() == Some(ns)
+        })?;
+        let data = secret.data.as_ref()?;
+        let cert = data.get("tls.crt")?;
+        let key = data.get("tls.key")?;
+        Some(CertKey {
+            cert_pem: cert.0.clone(),
+            key_pem: key.0.clone(),
+        })
     }
 
     async fn set_gatewayclass_accepted(&self, gc: &GatewayClass) -> Result<()> {
@@ -625,10 +679,12 @@ impl ReconcileCtx {
                     matches.iter().map(route_match_from).collect()
                 };
 
-                // Contribute one RouteEntry per (match × attached HTTP listener).
+                // Contribute one RouteEntry per (match × attached HTTP(S) listener).
+                // HTTPS listeners terminate TLS then route HTTP, so they carry
+                // HTTPRoute entries too (keyed by the listener port, e.g. 443).
                 for (match_order, rm) in route_matches.into_iter().enumerate() {
                     for l in &attached_listeners {
-                        if l.protocol != "HTTP" {
+                        if l.protocol != "HTTP" && l.protocol != "HTTPS" {
                             continue;
                         }
                         // Effective hostnames = intersection of route hostnames and
