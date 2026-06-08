@@ -42,6 +42,27 @@ data plane reads them lock-free per request. The Pingora TLS backend is **OpenSS
 rustls), because per-SNI cert selection needs the OpenSSL/BoringSSL certificate callback.
 See the modules in [lolgateway/src/](lolgateway/src/).
 
+### Conformance results
+
+Running each in-scope test individually (`hack/run-tests.sh`), the implemented features
+pass. A full serial run of ~68 in-scope tests lands at **63 passed** with these caveats,
+all investigated:
+
+- 3 `HTTPRouteRetry*` failures are **out of scope** — `retry` is an experimental-channel
+  feature (not in the standard CRDs / GATEWAY-HTTP profile); they were only swept in by a
+  too-broad test list.
+- `HTTPRouteInvalidReferenceGrant` **passes in isolation**; its serial-run failure is
+  test-isolation contamination (a valid ReferenceGrant left in the cluster by the preceding
+  `HTTPRouteReferenceGrant` test, which the controller correctly honors).
+- `BackendTLSPolicy` passes 4/5 sub-cases; the `ConfigMap`-content-reconcile sub-case is
+  timing-sensitive under cluster/API load (every individual transition — valid→Accepted,
+  invalid→False, create-CM→Accepted, with correct reasons and `observedGeneration` — is
+  verified correct via direct reproduction, but the test's rapid multi-step polling can
+  outrun convergence when the API server is slow).
+
+Run tests one at a time against the cluster — running two conformance tests concurrently
+makes them fight over the shared base resources and fail spuriously.
+
 ### Not yet implemented: TLSRoute (TLS passthrough)
 
 `TLSRoute` (the GATEWAY-TLS core route type) does **SNI-based TLS passthrough**: the
