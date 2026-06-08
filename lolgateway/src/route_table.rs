@@ -275,6 +275,17 @@ pub struct Mirror {
 pub struct Endpoint {
     pub ip: std::net::IpAddr,
     pub port: u16,
+    /// If set, connect to this endpoint over TLS (BackendTLSPolicy re-encryption).
+    pub tls: Option<UpstreamTls>,
+}
+
+/// Upstream (gateway→backend) TLS config from a BackendTLSPolicy.
+#[derive(Debug, Clone)]
+pub struct UpstreamTls {
+    /// SNI + cert-validation hostname.
+    pub hostname: String,
+    /// CA bundle (PEM) to verify the backend cert; empty = use system roots.
+    pub ca_pem: Vec<u8>,
 }
 
 impl RouteEntry {
@@ -601,6 +612,7 @@ mod tests {
         let ip = |n: u8| Endpoint {
             ip: std::net::IpAddr::from([10, 0, 0, n]),
             port: 80,
+            tls: None,
         };
         let e = RouteEntry {
             listener_port: 80,

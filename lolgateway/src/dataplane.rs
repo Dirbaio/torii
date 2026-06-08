@@ -215,8 +215,23 @@ impl ProxyHttp for GatewayProxy {
             .upstream
             .as_ref()
             .expect("upstream_peer reached without a chosen backend");
-        // Plain HTTP upstream: no TLS, empty SNI.
-        let mut peer = HttpPeer::new((ep.ip, ep.port), false, String::new());
+
+        // BackendTLSPolicy: re-encrypt to the backend over TLS, verifying its cert
+        // against the policy CA with SNI = the policy hostname. Plain HTTP otherwise.
+        let mut peer = match &ep.tls {
+            Some(tls) => {
+                let mut p = HttpPeer::new((ep.ip, ep.port), true, tls.hostname.clone());
+                p.options.verify_cert = true;
+                p.options.verify_hostname = true;
+                if !tls.ca_pem.is_empty() {
+                    if let Ok(certs) = pingora_core::tls::x509::X509::stack_from_pem(&tls.ca_pem) {
+                        p.options.ca = Some(std::sync::Arc::new(certs.into_boxed_slice()));
+                    }
+                }
+                p
+            }
+            None => HttpPeer::new((ep.ip, ep.port), false, String::new()),
+        };
         // Apply the route's request timeout to the upstream read (response) wait.
         if let Some(t) = ctx.request_timeout {
             peer.options.read_timeout = Some(t);
