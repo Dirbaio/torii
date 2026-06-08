@@ -26,10 +26,40 @@ conformance profile. Implemented and verified against the upstream suite:
 - **Listener attachment** — `sectionName`/port selection, `allowedRoutes` namespaces
   (Same/All/Selector) and kinds, hostname intersection, with correct `Accepted` reasons
   (`NoMatchingParent`, `NotAllowedByListeners`, `NoMatchingListenerHostname`).
+- **Multi-port + extended HTTP** — per-port listeners (`HTTPRouteParentRefPort`,
+  `GatewayPort8080`), HTTP-listener isolation, request/backend timeouts (→504), request
+  mirror (single/multiple/percentage), CORS, WebSocket upgrade passthrough.
+- **TLS (GATEWAY-TLS, partial)** — HTTPS listener termination with **per-SNI certificate
+  selection** (certs loaded in-memory from `kubernetes.io/tls` Secrets, cross-namespace
+  via ReferenceGrant; OpenSSL `certificate_callback`), listener cert-ref status
+  (`InvalidCertificateRef`/`RefNotPermitted`, with PEM validation), and **BackendTLSPolicy**
+  upstream re-encryption (gateway→backend TLS with custom CA from a ConfigMap + SNI/hostname
+  verification).
 
 Architecture: a level-triggered kube controller publishes a routing snapshot via
-`ArcSwap<RouteTable>`; a Pingora `ProxyHttp` data plane reads it lock-free per request.
-See the three modules in [lolgateway/src/](lolgateway/src/).
+`ArcSwap<RouteTable>` (plus an `ArcSwap<CertStore>` for TLS certs); a Pingora `ProxyHttp`
+data plane reads them lock-free per request. The Pingora TLS backend is **OpenSSL** (not
+rustls), because per-SNI cert selection needs the OpenSSL/BoringSSL certificate callback.
+See the modules in [lolgateway/src/](lolgateway/src/).
+
+### Not yet implemented: TLSRoute (TLS passthrough)
+
+`TLSRoute` (the GATEWAY-TLS core route type) does **SNI-based TLS passthrough**: the
+gateway must route a raw TLS stream to a backend *by the ClientHello SNI, without
+decrypting it*. This is intentionally not implemented yet, because it needs a data path
+distinct from the HTTP proxy:
+
+- A **layer-4 stream listener** that peeks the TLS ClientHello, parses the SNI, matches it
+  against `TLSRoute.hostnames`, and forwards the raw bytes to the chosen backend (Pingora's
+  `ServerApp` trait + a manual ClientHello parse — there is no built-in SNI peek).
+- It **conflicts with HTTPS termination on the same port**: port 443 can be either a
+  TLS-terminating HTTP listener (for HTTPRoute) or a TLS-passthrough L4 listener (for
+  TLSRoute), not both on one socket. A full implementation would put a ClientHello-peeking
+  demux in front of port 443 that decides, per connection, whether to hand off to the
+  TLS-terminating HTTP service or to raw-forward.
+
+The control-plane status side (TLSRoute parent conditions, listener `TLS`/`Passthrough`
+handling) is straightforward; the L4 stream subsystem is the substantial piece.
 
 ### Scope
 
@@ -47,12 +77,14 @@ skipped — lolgateway does not advertise their features):
   and are enforced by per-pod sidecars, a fundamentally different architecture from this
   edge gateway.
 
-Note: **HTTPRoute `retry`** is an *experimental-channel* feature in Gateway API v1.5
-(absent from the standard CRDs), so the retry tests are not part of the standard
-GATEWAY-HTTP profile and are out of scope here.
+Notes on a few out-of-scope / unimplemented items:
 
-Work in progress toward full GATEWAY-HTTP/TLS: backend protocol (h2c/websocket), and
-TLS termination (HTTPS listeners + BackendTLSPolicy).
+- **HTTPRoute `retry`** is an *experimental-channel* feature in Gateway API v1.5 (absent
+  from the standard CRDs), so the retry tests are not part of the standard GATEWAY-HTTP
+  profile.
+- **TLSRoute** (TLS passthrough) is designed but not implemented — see above.
+- **`HTTPRouteBackendProtocolH2C`** (cleartext HTTP/2 to the backend) is not implemented;
+  it is not part of the GATEWAY-HTTP profile's required feature set.
 
 ## Prerequisites
 
@@ -165,11 +197,12 @@ runtime) and the Pingora proxy (on a dedicated thread).
 
 ```bash
 export KUBECONFIG=$PWD/kubeconfig
-cargo run -- run --bind 0.0.0.0:80 --advertise 127.0.0.1
+cargo run -- run --bind-ip 0.0.0.0 --http-ports 80,8080,8090 --tls-ports 443 --advertise 127.0.0.1
 ```
 
-- `--bind` is where the proxy listens. It must match the Gateway listener port the
-  conformance suite connects to (port **80** for the first tests).
+- `--http-ports` are plain-HTTP listener ports; `--tls-ports` are HTTPS listeners that
+  terminate TLS, selecting the server cert by SNI. The proxy routes per-port using the
+  local socket port, so these should cover all Gateway listener ports in use.
 - `--advertise` is the IP published in `Gateway.status.addresses`. The suite reads this
   + the listener port to know where to send traffic, so it must be reachable from where
   you run `go test` (the host). `127.0.0.1` works because the suite runs on the host.
