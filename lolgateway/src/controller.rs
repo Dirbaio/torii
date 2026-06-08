@@ -271,7 +271,7 @@ impl ReconcileCtx {
             .listeners
             .iter()
             .map(|l| {
-                self.listener_status(l, gen, *attached.get(&l.name).unwrap_or(&0))
+                self.listener_status(l, gw, gen, *attached.get(&l.name).unwrap_or(&0))
             })
             .collect();
 
@@ -323,6 +323,7 @@ impl ReconcileCtx {
     fn listener_status(
         &self,
         l: &gateway_api::apis::standard::gateways::GatewayListeners,
+        gw: &Gateway,
         gen: i64,
         attached_routes: i32,
     ) -> GatewayStatusListeners {
@@ -364,8 +365,10 @@ impl ReconcileCtx {
         // Is the listener's protocol one we support?
         let protocol_supported = matches!(l.protocol.as_str(), "HTTP" | "HTTPS" | "TLS");
 
-        // For HTTPS/TLS listeners, the certificate ref(s) must resolve.
-        let tls_ok = self.listener_tls_resolves(l);
+        // For HTTPS/TLS listeners, the certificate ref(s) must resolve (and any
+        // cross-namespace ref must be permitted by a ReferenceGrant).
+        let tls_failure = self.listener_tls_failure(l, gw);
+        let tls_ok = tls_failure.is_none();
 
         let accepted = if !protocol_supported {
             condition("Accepted", "False", "UnsupportedProtocol", gen)
@@ -373,10 +376,11 @@ impl ReconcileCtx {
             condition("Accepted", "True", "Accepted", gen)
         };
 
+        // ResolvedRefs failure precedence: InvalidRouteKinds, then TLS ref issue.
         let resolved = if invalid_kind {
             condition("ResolvedRefs", "False", "InvalidRouteKinds", gen)
-        } else if !tls_ok {
-            condition("ResolvedRefs", "False", "InvalidCertificateRef", gen)
+        } else if let Some(reason) = tls_failure {
+            condition("ResolvedRefs", "False", reason, gen)
         } else {
             condition("ResolvedRefs", "True", "ResolvedRefs", gen)
         };
@@ -396,30 +400,73 @@ impl ReconcileCtx {
         }
     }
 
-    /// Whether an HTTPS/TLS listener's certificate references resolve to existing
-    /// Secrets. Non-TLS listeners trivially resolve. (Full TLS termination lands
-    /// in the TLS chunk; for now we only check the Secret exists.)
-    fn listener_tls_resolves(
+    /// Check an HTTPS/TLS listener's certificate references. Returns None if they
+    /// resolve, or the ResolvedRefs failure reason:
+    /// - `RefNotPermitted`: cross-namespace cert Secret without a ReferenceGrant.
+    /// - `InvalidCertificateRef`: missing Secret, non-Secret kind, or no cert at all.
+    fn listener_tls_failure(
         &self,
         l: &gateway_api::apis::standard::gateways::GatewayListeners,
-    ) -> bool {
+        gw: &Gateway,
+    ) -> Option<&'static str> {
         if !matches!(l.protocol.as_str(), "HTTPS" | "TLS") {
-            return true;
+            return None;
         }
-        let Some(tls) = l.tls.as_ref() else {
-            return false; // HTTPS/TLS listener with no tls config can't be programmed
-        };
         use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
+        // HTTPS/TLS listener with no tls block can't resolve a cert.
+        let Some(tls) = l.tls.as_ref() else {
+            return Some("InvalidCertificateRef");
+        };
         let refs = tls.certificate_refs.clone().unwrap_or_default();
         if refs.is_empty() {
-            // Passthrough TLS needs no cert; terminate (default) needs one.
-            return matches!(tls.mode, Some(Mode::Passthrough));
+            return if matches!(tls.mode, Some(Mode::Passthrough)) {
+                None // passthrough needs no cert
+            } else {
+                Some("InvalidCertificateRef")
+            };
         }
-        // Every referenced Secret must exist (in the listener's namespace by default).
-        refs.iter().all(|r| {
-            let ns = r.namespace.clone();
-            self.secret_exists(ns.as_deref(), &r.name)
-        })
+        let gw_ns = gw.namespace().unwrap_or_default();
+        for r in &refs {
+            // Only core Secrets are valid cert refs.
+            let group = r.group.clone().unwrap_or_default();
+            let kind = r.kind.clone().unwrap_or_else(|| "Secret".into());
+            if !group.is_empty() || kind != "Secret" {
+                return Some("InvalidCertificateRef");
+            }
+            let ref_ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
+            // Cross-namespace cert Secret requires a permitting ReferenceGrant
+            // (from Gateway in gw_ns → to Secret in ref_ns).
+            if ref_ns != gw_ns && !self.secret_ref_permitted(&gw_ns, &ref_ns, &r.name) {
+                return Some("RefNotPermitted");
+            }
+            if !self.secret_exists(Some(&ref_ns), &r.name) {
+                return Some("InvalidCertificateRef");
+            }
+        }
+        None
+    }
+
+    /// Is a cross-namespace cert Secret ref (Gateway in `from_ns` → Secret
+    /// `name` in `to_ns`) permitted by a ReferenceGrant in the Secret namespace?
+    fn secret_ref_permitted(&self, from_ns: &str, to_ns: &str, secret_name: &str) -> bool {
+        self.stores
+            .reference_grants
+            .state()
+            .into_iter()
+            .filter(|rg| rg.namespace().unwrap_or_default() == to_ns)
+            .any(|rg| {
+                let from_ok = rg.spec.from.iter().any(|f| {
+                    f.group == "gateway.networking.k8s.io"
+                        && f.kind == "Gateway"
+                        && f.namespace == from_ns
+                });
+                let to_ok = rg.spec.to.iter().any(|t| {
+                    t.group.is_empty()
+                        && t.kind == "Secret"
+                        && t.name.as_deref().map(|n| n == secret_name).unwrap_or(true)
+                });
+                from_ok && to_ok
+            })
     }
 
     /// Does a Secret exist? `ns` defaults to any namespace match by name if None
@@ -527,14 +574,21 @@ impl ReconcileCtx {
                     }
 
                     match self.resolve_endpoints(&bns, &backend_ref.name, svc_port) {
-                        Some(endpoints) if !endpoints.is_empty() => {
+                        // Service exists (ResolvedRefs=True) — even with zero ready
+                        // endpoints, the ref is resolved; an empty backend yields a
+                        // 503 at traffic time, not BackendNotFound.
+                        Some(endpoints) => {
                             backends.push(Backend {
                                 weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
                                 endpoints,
+                                filters: backend_filters_from(
+                                    &backend_ref.filters.clone().unwrap_or_default(),
+                                ),
                             });
                         }
-                        _ => {
-                            // Don't downgrade a RefNotPermitted to BackendNotFound.
+                        // Service does not exist → BackendNotFound (don't downgrade
+                        // a more specific failure like RefNotPermitted).
+                        None => {
                             refs_failure.get_or_insert("BackendNotFound");
                         }
                     }
@@ -831,6 +885,11 @@ impl ReconcileCtx {
             if slice.namespace().unwrap_or_default() != ns {
                 continue;
             }
+            // Only IPv4 endpoints are routable in our (IPv4) dev/cluster network;
+            // skip IPv6/FQDN slices to avoid dialing unreachable addresses.
+            if slice.address_type != "IPv4" {
+                continue;
+            }
             let owner_svc = slice
                 .labels()
                 .get("kubernetes.io/service-name")
@@ -1110,6 +1169,36 @@ fn filters_from(
                     ),
                 }),
             });
+        }
+    }
+    out
+}
+
+/// Parse per-backendRef filters into [`Filters`]. Covers the header modifiers
+/// (the conformant per-backend filter case); redirect/rewrite/mirror/cors on a
+/// backendRef are uncommon and not needed by the current tests.
+fn backend_filters_from(
+    filters: &[gateway_api::apis::standard::httproutes::HttpRouteRulesBackendRefsFilters],
+) -> Filters {
+    let mut out = Filters::default();
+    for f in filters {
+        if let Some(m) = &f.request_header_modifier {
+            out.request_headers = header_mods(
+                m.set.as_deref(),
+                m.add.as_deref(),
+                m.remove.as_deref(),
+                |s| (s.name.clone(), s.value.clone()),
+                |a| (a.name.clone(), a.value.clone()),
+            );
+        }
+        if let Some(m) = &f.response_header_modifier {
+            out.response_headers = header_mods(
+                m.set.as_deref(),
+                m.add.as_deref(),
+                m.remove.as_deref(),
+                |s| (s.name.clone(), s.value.clone()),
+                |a| (a.name.clone(), a.value.clone()),
+            );
         }
     }
     out
