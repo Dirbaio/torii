@@ -50,10 +50,6 @@ impl CertStore {
             .get("")
             .or_else(|| if self.by_host.len() == 1 { self.by_host.values().next() } else { None })
     }
-
-    pub fn is_empty(&self) -> bool {
-        self.by_host.is_empty()
-    }
 }
 
 /// Lock-free, atomically-swappable handle to the current [`CertStore`].
