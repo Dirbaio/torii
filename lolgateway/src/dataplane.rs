@@ -31,6 +31,8 @@ pub struct RequestCtx {
     rewrite_path: Option<String>,
     /// Request timeout for the matched route (applied to the upstream peer).
     request_timeout: Option<std::time::Duration>,
+    /// If set, the request's allowed Origin — add CORS headers to the response.
+    cors_origin: Option<String>,
 }
 
 impl GatewayProxy {
@@ -77,6 +79,38 @@ impl ProxyHttp for GatewayProxy {
             session.respond_error(404).await?;
             return Ok(true);
         };
+
+        // CORS: handle preflight here; for actual requests, stash to add headers
+        // to the response later.
+        if let Some(cors) = &entry.filters.cors {
+            let origin = headers
+                .get("origin")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            let allowed = !origin.is_empty() && cors.allows_origin(origin);
+            if method.eq_ignore_ascii_case("OPTIONS") && headers.contains_key("access-control-request-method") {
+                // Preflight: respond directly. Echo the requested method/headers
+                // when the filter allows "*".
+                let req_method = headers
+                    .get("access-control-request-method")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let req_headers = headers
+                    .get("access-control-request-headers")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                let mut resp = ResponseHeader::build(204, None)?;
+                if allowed {
+                    write_cors_preflight(&mut resp, cors, origin, req_method, req_headers);
+                }
+                resp.insert_header("Content-Length", "0")?;
+                session.write_response_header(Box::new(resp), true).await?;
+                return Ok(true);
+            }
+            if allowed {
+                ctx.cors_origin = Some(origin.to_string());
+            }
+        }
 
         // A RequestRedirect filter produces an early 3xx response — no upstream.
         if let Some(redirect) = &entry.filters.redirect {
@@ -159,6 +193,10 @@ impl ProxyHttp for GatewayProxy {
         Self::CTX: Send + Sync,
     {
         apply_header_mods(&ctx.filters.response_headers, upstream_response);
+        // Add CORS response headers for an allowed cross-origin actual request.
+        if let (Some(cors), Some(origin)) = (&ctx.filters.cors, &ctx.cors_origin) {
+            write_cors_headers(upstream_response, cors, origin);
+        }
         Ok(())
     }
 
@@ -210,6 +248,50 @@ impl ProxyHttp for GatewayProxy {
             error_code: code,
             can_reuse_downstream: false,
         }
+    }
+}
+
+/// Write CORS headers for an allowed *actual* (non-preflight) request.
+fn write_cors_headers(resp: &mut ResponseHeader, cors: &crate::route_table::Cors, origin: &str) {
+    // Echo the specific origin (required when credentials are allowed).
+    let _ = resp.insert_header("Access-Control-Allow-Origin", origin);
+    if cors.allow_credentials {
+        let _ = resp.insert_header("Access-Control-Allow-Credentials", "true");
+    }
+    if !cors.expose_headers.is_empty() {
+        let _ = resp.insert_header("Access-Control-Expose-Headers", cors.expose_headers.join(", "));
+    }
+}
+
+/// Write CORS headers for an allowed preflight request. A `*` in allow-methods or
+/// allow-headers is expanded by echoing the request's requested method/headers.
+fn write_cors_preflight(
+    resp: &mut ResponseHeader,
+    cors: &crate::route_table::Cors,
+    origin: &str,
+    req_method: &str,
+    req_headers: &str,
+) {
+    write_cors_headers(resp, cors, origin);
+    let methods = expand_wildcard(&cors.allow_methods, req_method);
+    if !methods.is_empty() {
+        let _ = resp.insert_header("Access-Control-Allow-Methods", methods);
+    }
+    let hdrs = expand_wildcard(&cors.allow_headers, req_headers);
+    if !hdrs.is_empty() {
+        let _ = resp.insert_header("Access-Control-Allow-Headers", hdrs);
+    }
+    if let Some(age) = cors.max_age {
+        let _ = resp.insert_header("Access-Control-Max-Age", age.to_string());
+    }
+}
+
+/// Join a CORS allow-list, expanding a sole `*` to the requested value.
+fn expand_wildcard(allow: &[String], requested: &str) -> String {
+    if allow.iter().any(|v| v == "*") {
+        requested.to_string()
+    } else {
+        allow.join(", ")
     }
 }
 

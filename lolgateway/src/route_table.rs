@@ -208,6 +208,31 @@ pub struct Filters {
     /// RequestMirror targets: a copy of the request is sent fire-and-forget to one
     /// endpoint of each, with the given sampling percent (0..=100).
     pub mirrors: Vec<Mirror>,
+    /// CORS filter config, if present.
+    pub cors: Option<Cors>,
+}
+
+/// CORS filter configuration (mirrors HTTPCORSFilter).
+#[derive(Debug, Clone, Default)]
+pub struct Cors {
+    pub allow_origins: Vec<String>,
+    pub allow_methods: Vec<String>,
+    pub allow_headers: Vec<String>,
+    pub expose_headers: Vec<String>,
+    pub allow_credentials: bool,
+    pub max_age: Option<i32>,
+}
+
+impl Cors {
+    /// Does this CORS config allow the given Origin? Supports `*` (any), exact
+    /// match, and a wildcard host like `https://*.bar.com`.
+    pub fn allows_origin(&self, origin: &str) -> bool {
+        self.allow_origins.iter().any(|o| {
+            o == "*"
+                || o.eq_ignore_ascii_case(origin)
+                || cors_origin_wildcard_matches(o, origin)
+        })
+    }
 }
 
 /// A request-mirror target (resolved backend endpoints + sampling percent).
@@ -404,6 +429,32 @@ impl RouteMatch {
         self.query_params
             .iter()
             .all(|qm| pairs.iter().any(|(k, v)| *k == qm.name && *v == qm.value))
+    }
+}
+
+/// Match a CORS origin pattern with a `*.` host wildcard (e.g. `https://*.bar.com`
+/// matches `https://www.bar.com` and `https://a.b.bar.com`) against an origin.
+fn cors_origin_wildcard_matches(pattern: &str, origin: &str) -> bool {
+    // Split scheme:// from host for both.
+    let (p_scheme, p_host) = match pattern.split_once("://") {
+        Some(x) => x,
+        None => return false,
+    };
+    let (o_scheme, o_host) = match origin.split_once("://") {
+        Some(x) => x,
+        None => return false,
+    };
+    if !p_scheme.eq_ignore_ascii_case(o_scheme) {
+        return false;
+    }
+    if let Some(suffix) = p_host.strip_prefix("*.") {
+        // `www.bar.com` ends with `.bar.com` and has a non-empty label before it.
+        o_host
+            .strip_suffix(suffix)
+            .map(|pre| pre.ends_with('.') && pre.len() > 1)
+            .unwrap_or(false)
+    } else {
+        p_host.eq_ignore_ascii_case(o_host)
     }
 }
 

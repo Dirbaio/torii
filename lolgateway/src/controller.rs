@@ -56,6 +56,7 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteRequestMultipleMirrors",
     "HTTPRouteRequestPercentageMirror",
     "HTTPRouteBackendProtocolWebSocket",
+    "HTTPRouteCORS",
 ];
 
 /// The address we advertise in Gateway.status.addresses — where our proxy listens,
@@ -1085,6 +1086,16 @@ fn filters_from(
                         p.replace_prefix_match.clone().unwrap_or_default(),
                     ),
                 }),
+            });
+        }
+        if let Some(c) = &f.cors {
+            out.cors = Some(crate::route_table::Cors {
+                allow_origins: c.allow_origins.clone().unwrap_or_default(),
+                allow_methods: c.allow_methods.clone().unwrap_or_default(),
+                allow_headers: c.allow_headers.clone().unwrap_or_default(),
+                expose_headers: c.expose_headers.clone().unwrap_or_default(),
+                allow_credentials: c.allow_credentials.unwrap_or(false),
+                max_age: c.max_age,
             });
         }
         if let Some(rw) = &f.url_rewrite {
