@@ -247,11 +247,24 @@ pub struct Mirror {
 pub struct Endpoint {
     pub ip: std::net::IpAddr,
     pub port: u16,
-    /// If set, connect to this endpoint over TLS (BackendTLSPolicy re-encryption).
-    pub tls: Option<UpstreamTls>,
+    /// How to connect to this endpoint, per any BackendTLSPolicy targeting it.
+    pub tls: BackendTls,
 }
 
-/// Upstream (gateway→backend) TLS config from a BackendTLSPolicy.
+/// Backend connection mode, decided by BackendTLSPolicy (or its absence).
+#[derive(Debug, Clone, Default)]
+pub enum BackendTls {
+    /// No BackendTLSPolicy applies → plain HTTP to the backend.
+    #[default]
+    Plaintext,
+    /// A valid BackendTLSPolicy applies → re-encrypt (TLS) to the backend.
+    ReEncrypt(UpstreamTls),
+    /// A BackendTLSPolicy targets this Service but is invalid (bad CA / wrong
+    /// kind) → the request must fail (5xx); we must NOT fall back to plaintext.
+    Invalid,
+}
+
+/// Upstream (gateway→backend) TLS config from a valid BackendTLSPolicy.
 #[derive(Debug, Clone)]
 pub struct UpstreamTls {
     /// SNI + cert-validation hostname.
@@ -584,7 +597,7 @@ mod tests {
         let ip = |n: u8| Endpoint {
             ip: std::net::IpAddr::from([10, 0, 0, n]),
             port: 80,
-            tls: None,
+            tls: BackendTls::default(),
         };
         let e = RouteEntry {
             listener_port: 80,
