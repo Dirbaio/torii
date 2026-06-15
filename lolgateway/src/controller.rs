@@ -91,94 +91,59 @@ pub async fn run(
     data_plane: DataPlane,
     config: ControllerConfig,
 ) -> Result<()> {
-    let gc_api: Api<GatewayClass> = Api::all(client.clone());
-    let gw_api: Api<Gateway> = Api::all(client.clone());
-    let rt_api: Api<HTTPRoute> = Api::all(client.clone());
-    let svc_api: Api<Service> = Api::all(client.clone());
-    let eps_api: Api<EndpointSlice> = Api::all(client.clone());
-    let rg_api: Api<ReferenceGrant> = Api::all(client.clone());
-    let ns_api: Api<Namespace> = Api::all(client.clone());
-    let sec_api: Api<Secret> = Api::all(client.clone());
-    let cm_api: Api<ConfigMap> = Api::all(client.clone());
-    let btp_api: Api<BackendTLSPolicy> = Api::all(client.clone());
-
-    // reflector stores + writers, fed by watchers.
-    let (gc_store, gc_w) = reflector::store();
-    let (gw_store, gw_w) = reflector::store();
-    let (rt_store, rt_w) = reflector::store();
-    let (svc_store, svc_w) = reflector::store();
-    let (eps_store, eps_w) = reflector::store();
-    let (rg_store, rg_w) = reflector::store();
-    let (ns_store, ns_w) = reflector::store();
-    let (sec_store, sec_w) = reflector::store();
-    let (cm_store, cm_w) = reflector::store();
-    let (btp_store, btp_w) = reflector::store();
-
-    let stores = Arc::new(Stores {
-        gateway_classes: gc_store.clone(),
-        gateways: gw_store.clone(),
-        routes: rt_store.clone(),
-        services: svc_store.clone(),
-        endpoint_slices: eps_store.clone(),
-        reference_grants: rg_store.clone(),
-        namespaces: ns_store.clone(),
-        secrets: sec_store.clone(),
-        config_maps: cm_store.clone(),
-        backend_tls_policies: btp_store.clone(),
-    });
-
     // A change signal: every watcher event pokes this channel; a single consumer
     // debounces and runs a full reconcile.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
 
-    macro_rules! spawn_watch {
-        ($api:expr, $writer:expr, $kind:literal) => {{
+    // For each watched resource: create a reflector store, spawn a watcher that
+    // feeds it and pokes `tx` on every event, and yield the store. One macro
+    // expansion per resource keeps the wiring in one place. The `ready` future
+    // waits for every store's first list before the initial reconcile.
+    let mut ready: Vec<futures::future::BoxFuture<'static, ()>> = Vec::new();
+    macro_rules! watch {
+        ($ty:ty, $kind:literal) => {{
+            let (store, writer) = reflector::store::<$ty>();
+            let api: Api<$ty> = Api::all(client.clone());
             let tx = tx.clone();
-            let stream = watcher($api, Config::default())
-                .reflect($writer)
+            let stream = watcher(api, Config::default())
+                .reflect(writer)
                 .default_backoff()
                 .touched_objects();
             tokio::spawn(async move {
                 futures::pin_mut!(stream);
                 while let Some(ev) = stream.next().await {
                     match ev {
-                        Ok(_) => {
-                            // Non-blocking poke; a pending reconcile already covers us.
-                            let _ = tx.try_send(());
-                        }
+                        // Non-blocking poke; a pending reconcile already covers us.
+                        Ok(_) => { let _ = tx.try_send(()); }
                         Err(e) => tracing::warn!(kind = $kind, error = %e, "watch error"),
                     }
                 }
             });
+            let r = store.clone();
+            ready.push(Box::pin(async move { let _ = r.wait_until_ready().await; }));
+            store
         }};
     }
 
-    spawn_watch!(gc_api.clone(), gc_w, "GatewayClass");
-    spawn_watch!(gw_api.clone(), gw_w, "Gateway");
-    spawn_watch!(rt_api.clone(), rt_w, "HTTPRoute");
-    spawn_watch!(svc_api.clone(), svc_w, "Service");
-    spawn_watch!(eps_api.clone(), eps_w, "EndpointSlice");
-    spawn_watch!(rg_api.clone(), rg_w, "ReferenceGrant");
-    spawn_watch!(ns_api.clone(), ns_w, "Namespace");
-    spawn_watch!(sec_api.clone(), sec_w, "Secret");
-    spawn_watch!(cm_api.clone(), cm_w, "ConfigMap");
-    spawn_watch!(btp_api.clone(), btp_w, "BackendTLSPolicy");
-
-    // Wait for the caches to populate before the first reconcile.
-    let ready = stores.clone();
-    tokio::spawn(async move {
-        let _ = ready.gateway_classes.wait_until_ready().await;
-        let _ = ready.gateways.wait_until_ready().await;
-        let _ = ready.routes.wait_until_ready().await;
-        let _ = ready.services.wait_until_ready().await;
-        let _ = ready.endpoint_slices.wait_until_ready().await;
-        let _ = ready.reference_grants.wait_until_ready().await;
-        let _ = ready.namespaces.wait_until_ready().await;
-        let _ = ready.secrets.wait_until_ready().await;
-        let _ = ready.config_maps.wait_until_ready().await;
-        let _ = ready.backend_tls_policies.wait_until_ready().await;
+    let stores = Arc::new(Stores {
+        gateway_classes: watch!(GatewayClass, "GatewayClass"),
+        gateways: watch!(Gateway, "Gateway"),
+        routes: watch!(HTTPRoute, "HTTPRoute"),
+        services: watch!(Service, "Service"),
+        endpoint_slices: watch!(EndpointSlice, "EndpointSlice"),
+        reference_grants: watch!(ReferenceGrant, "ReferenceGrant"),
+        namespaces: watch!(Namespace, "Namespace"),
+        secrets: watch!(Secret, "Secret"),
+        config_maps: watch!(ConfigMap, "ConfigMap"),
+        backend_tls_policies: watch!(BackendTLSPolicy, "BackendTLSPolicy"),
     });
 
+    // Wait for all caches to populate before the first reconcile.
+    tokio::spawn(async move {
+        futures::future::join_all(ready).await;
+    });
+
+    let gc_api: Api<GatewayClass> = Api::all(client.clone());
     tracing::info!(controller = CONTROLLER_NAME, "control plane started");
 
     let ctx = ReconcileCtx {
@@ -423,9 +388,7 @@ impl ReconcileCtx {
 
     /// Load a kubernetes.io/tls Secret's cert+key (tls.crt / tls.key) as PEM.
     fn load_tls_secret(&self, ns: &str, name: &str) -> Option<CertKey> {
-        let secret = self.stores.secrets.state().into_iter().find(|s| {
-            s.name_any() == name && s.namespace().as_deref() == Some(ns)
-        })?;
+        let secret = find_in(&self.stores.secrets, ns, name)?;
         let data = secret.data.as_ref()?;
         let cert = data.get("tls.crt")?;
         let key = data.get("tls.key")?;
@@ -571,14 +534,16 @@ impl ReconcileCtx {
         let mut loaded: Option<(String, CertKey)> = None;
         for r in &refs {
             // Only core Secrets are valid cert refs.
-            let group = r.group.clone().unwrap_or_default();
-            let kind = r.kind.clone().unwrap_or_else(|| "Secret".into());
+            let group = r.group.as_deref().unwrap_or("");
+            let kind = r.kind.as_deref().unwrap_or("Secret");
             if !group.is_empty() || kind != "Secret" {
                 return (Some("InvalidCertificateRef"), None);
             }
             let ref_ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
             // Cross-namespace cert Secret requires a permitting ReferenceGrant.
-            if ref_ns != gw_ns && !self.secret_ref_permitted(&gw_ns, &ref_ns, &r.name) {
+            if ref_ns != gw_ns
+                && !self.ref_grant_permits(&gw_ns, "Gateway", &ref_ns, "Secret", &r.name)
+            {
                 return (Some("RefNotPermitted"), None);
             }
             // The Secret must exist AND contain a valid tls.crt + tls.key.
@@ -694,9 +659,20 @@ impl ReconcileCtx {
         }
     }
 
-    /// Is a cross-namespace cert Secret ref (Gateway in `from_ns` → Secret
-    /// `name` in `to_ns`) permitted by a ReferenceGrant in the Secret namespace?
-    fn secret_ref_permitted(&self, from_ns: &str, to_ns: &str, secret_name: &str) -> bool {
+    /// Is a cross-namespace reference permitted by a ReferenceGrant in the target
+    /// namespace? The grant must have a `from` entry matching the referrer
+    /// `{gateway.networking.k8s.io / from_kind, namespace: from_ns}` and a `to`
+    /// entry matching the target `{core / to_kind}`, optionally restricted by
+    /// `to_name`. Used for both cert Secret refs (Gateway→Secret) and backendRefs
+    /// (HTTPRoute→Service).
+    fn ref_grant_permits(
+        &self,
+        from_ns: &str,
+        from_kind: &str,
+        to_ns: &str,
+        to_kind: &str,
+        to_name: &str,
+    ) -> bool {
         self.stores
             .reference_grants
             .state()
@@ -705,13 +681,13 @@ impl ReconcileCtx {
             .any(|rg| {
                 let from_ok = rg.spec.from.iter().any(|f| {
                     f.group == "gateway.networking.k8s.io"
-                        && f.kind == "Gateway"
+                        && f.kind == from_kind
                         && f.namespace == from_ns
                 });
                 let to_ok = rg.spec.to.iter().any(|t| {
                     t.group.is_empty()
-                        && t.kind == "Secret"
-                        && t.name.as_deref().map(|n| n == secret_name).unwrap_or(true)
+                        && t.kind == to_kind
+                        && t.name.as_deref().map(|n| n == to_name).unwrap_or(true)
                 });
                 from_ok && to_ok
             })
@@ -735,8 +711,7 @@ impl ReconcileCtx {
 
         let mut parents: Vec<HttpRouteStatusParents> = Vec::new();
 
-        let parent_refs = route.spec.parent_refs.clone().unwrap_or_default();
-        for pref in &parent_refs {
+        for pref in route.spec.parent_refs.iter().flatten() {
             // Find the parent Gateway among the usable ones we own.
             let parent_ns = pref.namespace.clone().unwrap_or_else(|| route_ns.clone());
             let Some(gw) = gateways
@@ -777,21 +752,21 @@ impl ReconcileCtx {
                 .map(|t| t.0.as_second())
                 .unwrap_or(0);
             let route_key = format!("{}/{}", route_ns, route.name_any());
-            let hostnames = route.spec.hostnames.clone().unwrap_or_default();
+            let hostnames: &[String] = route.spec.hostnames.as_deref().unwrap_or_default();
 
             // Resolve backends across all rules, tracking the most specific
             // ResolvedRefs failure reason (RefNotPermitted takes priority).
             let mut refs_failure: Option<&'static str> = None;
-            for (rule_order, rule) in route.spec.rules.clone().unwrap_or_default().iter().enumerate() {
+            for (rule_order, rule) in route.spec.rules.iter().flatten().enumerate() {
                 let mut backends = Vec::new();
-                for backend_ref in rule.backend_refs.clone().unwrap_or_default() {
+                for backend_ref in rule.backend_refs.iter().flatten() {
                     let svc_port = backend_ref.port.unwrap_or(0) as u16;
                     let bns = backend_ref.namespace.clone().unwrap_or_else(|| route_ns.clone());
 
                     // Only core Services are supported backends. Any other
                     // group/kind → ResolvedRefs=False, InvalidKind.
-                    let group = backend_ref.group.clone().unwrap_or_default();
-                    let kind = backend_ref.kind.clone().unwrap_or_else(|| "Service".into());
+                    let group = backend_ref.group.as_deref().unwrap_or("");
+                    let kind = backend_ref.kind.as_deref().unwrap_or("Service");
                     if !group.is_empty() || kind != "Service" {
                         refs_failure = Some("InvalidKind");
                         continue;
@@ -799,7 +774,13 @@ impl ReconcileCtx {
 
                     // Cross-namespace backendRefs require a permitting ReferenceGrant.
                     if bns != route_ns
-                        && !self.backend_ref_permitted(&route_ns, &bns, &backend_ref.name)
+                        && !self.ref_grant_permits(
+                            &route_ns,
+                            "HTTPRoute",
+                            &bns,
+                            "Service",
+                            &backend_ref.name,
+                        )
                     {
                         refs_failure = Some("RefNotPermitted");
                         continue; // no endpoints → 500 at the data plane
@@ -823,7 +804,7 @@ impl ReconcileCtx {
                                 weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
                                 endpoints,
                                 filters: backend_filters_from(
-                                    &backend_ref.filters.clone().unwrap_or_default(),
+                                    backend_ref.filters.as_deref().unwrap_or_default(),
                                 ),
                             });
                         }
@@ -836,16 +817,14 @@ impl ReconcileCtx {
                 }
 
                 // Resolve any RequestMirror filter targets to endpoints.
-                let mirrors = self.resolve_mirrors(
-                    &rule.filters.clone().unwrap_or_default(),
-                    &route_ns,
-                );
+                let rule_filters = rule.filters.as_deref().unwrap_or_default();
+                let mirrors = self.resolve_mirrors(rule_filters, &route_ns);
 
                 // Parse this rule's filters and timeouts once. Honor both
                 // `request` (overall) and `backendRequest` (per-attempt); with no
                 // retries they coincide, so use the smaller non-zero value. "0s"
                 // disables that timeout.
-                let filters = filters_from(&rule.filters.clone().unwrap_or_default());
+                let filters = filters_from(rule_filters);
                 let request_timeout = rule.timeouts.as_ref().and_then(|t| {
                     let parse = |s: &Option<String>| {
                         s.as_ref().and_then(|v| parse_go_duration(v)).filter(|d| !d.is_zero())
@@ -859,7 +838,7 @@ impl ReconcileCtx {
 
                 // Each `match` in the rule is an independent OR alternative. A rule
                 // with no matches defaults to a single match-all (PathPrefix "/").
-                let matches = rule.matches.clone().unwrap_or_default();
+                let matches = rule.matches.as_deref().unwrap_or_default();
                 let route_matches: Vec<RouteMatch> = if matches.is_empty() {
                     vec![RouteMatch::default()]
                 } else {
@@ -940,7 +919,7 @@ impl ReconcileCtx {
         pref: &gateway_api::apis::standard::httproutes::HttpRouteParentRefs,
     ) -> (Vec<gateway_api::apis::standard::gateways::GatewayListeners>, Option<&'static str>) {
         let route_ns = route.namespace().unwrap_or_default();
-        let route_hostnames = route.spec.hostnames.clone().unwrap_or_default();
+        let route_hostnames: &[String] = route.spec.hostnames.as_deref().unwrap_or_default();
 
         // First narrow by sectionName / port (a hard parentRef selector). If the
         // ref names a section/port that no listener has, that's NoMatchingParent.
@@ -1035,34 +1014,6 @@ impl ReconcileCtx {
                     .unwrap_or(false)
             }
         }
-    }
-
-    /// Is a cross-namespace backendRef (HTTPRoute in `from_ns` → Service `svc_name`
-    /// in `to_ns`) permitted by a ReferenceGrant in the backend namespace?
-    ///
-    /// The grant must have a `from` entry matching {group: gateway.networking.k8s.io,
-    /// kind: HTTPRoute, namespace: from_ns} and a `to` entry matching {group: "",
-    /// kind: Service} optionally restricted by name.
-    fn backend_ref_permitted(&self, from_ns: &str, to_ns: &str, svc_name: &str) -> bool {
-        self.stores
-            .reference_grants
-            .state()
-            .into_iter()
-            .filter(|rg| rg.namespace().unwrap_or_default() == to_ns)
-            .any(|rg| {
-                let from_ok = rg.spec.from.iter().any(|f| {
-                    f.group == "gateway.networking.k8s.io"
-                        && f.kind == "HTTPRoute"
-                        && f.namespace == from_ns
-                });
-                let to_ok = rg.spec.to.iter().any(|t| {
-                    // Service is core group (empty string).
-                    t.group.is_empty()
-                        && t.kind == "Service"
-                        && t.name.as_deref().map(|n| n == svc_name).unwrap_or(true)
-                });
-                from_ok && to_ok
-            })
     }
 
     /// STAGE 2a: validate every BackendTLSPolicy's CA ONCE, producing both:
@@ -1191,16 +1142,8 @@ impl ReconcileCtx {
             for gw in gateways {
                 let gw_ns = gw.namespace().unwrap_or_default();
                 let routes_to_gw_target = routes.iter().any(|r| {
-                    let r_ns = r.namespace().unwrap_or_default();
-                    r.spec.parent_refs.clone().unwrap_or_default().iter().any(|p| {
-                        p.name == gw.name_any()
-                            && p.namespace.as_deref().unwrap_or(&r_ns) == gw_ns
-                    }) && r.spec.rules.clone().unwrap_or_default().iter().any(|rule| {
-                        rule.backend_refs.clone().unwrap_or_default().iter().any(|b| {
-                            target_svcs.contains(&b.name)
-                                && b.namespace.as_deref().unwrap_or(&r_ns) == pol_ns
-                        })
-                    })
+                    route_has_parent(r, &gw.name_any(), &gw_ns)
+                        && route_targets_service_in(r, &target_svcs, &pol_ns)
                 });
                 if routes_to_gw_target {
                     ancestors.push(BackendTlsPolicyStatusAncestors {
@@ -1233,9 +1176,7 @@ impl ReconcileCtx {
 
     /// Read a CA bundle (ca.crt) from a ConfigMap.
     fn load_configmap_ca(&self, ns: &str, name: &str) -> Option<Vec<u8>> {
-        let cm = self.stores.config_maps.state().into_iter().find(|c| {
-            c.name_any() == name && c.namespace().as_deref() == Some(ns)
-        })?;
+        let cm = find_in(&self.stores.config_maps, ns, name)?;
         let ca = cm.data.as_ref()?.get("ca.crt")?;
         Some(ca.clone().into_bytes())
     }
@@ -1275,9 +1216,7 @@ impl ReconcileCtx {
     /// EndpointSlices.
     fn resolve_endpoints(&self, ns: &str, svc_name: &str, svc_port: u16) -> Option<Vec<Endpoint>> {
         // Find the Service to map svc_port -> targetPort name/number.
-        let svc = self.stores.services.state().into_iter().find(|s| {
-            s.name_any() == svc_name && s.namespace().unwrap_or_default() == ns
-        })?;
+        let svc = find_in(&self.stores.services, ns, svc_name)?;
 
         let port_spec = svc
             .spec
@@ -1542,6 +1481,21 @@ fn parse_go_duration(s: &str) -> Option<Duration> {
     Some(Duration::from_nanos(nanos as u64))
 }
 
+/// Build a [`PathRewrite`] from a redirect/url-rewrite path config. `is_full_path`
+/// selects ReplaceFullPath vs ReplacePrefixMatch; the two generated filter types
+/// share these field shapes, so both call sites funnel through here.
+fn path_rewrite(
+    is_full_path: bool,
+    replace_full: &Option<String>,
+    replace_prefix: &Option<String>,
+) -> PathRewrite {
+    if is_full_path {
+        PathRewrite::ReplaceFullPath(replace_full.clone().unwrap_or_default())
+    } else {
+        PathRewrite::ReplacePrefixMatch(replace_prefix.clone().unwrap_or_default())
+    }
+}
+
 /// Parse a rule's filters into our pre-digested [`Filters`] form.
 fn filters_from(
     filters: &[gateway_api::apis::standard::httproutes::HttpRouteRulesFilters],
@@ -1581,13 +1535,12 @@ fn filters_from(
                 hostname: r.hostname.clone(),
                 port: r.port.map(|p| p as u16),
                 status_code: r.status_code.map(|c| c as u16).unwrap_or(302),
-                path: r.path.as_ref().map(|p| match p.r#type {
-                    RPType::ReplaceFullPath => {
-                        PathRewrite::ReplaceFullPath(p.replace_full_path.clone().unwrap_or_default())
-                    }
-                    RPType::ReplacePrefixMatch => PathRewrite::ReplacePrefixMatch(
-                        p.replace_prefix_match.clone().unwrap_or_default(),
-                    ),
+                path: r.path.as_ref().map(|p| {
+                    path_rewrite(
+                        matches!(p.r#type, RPType::ReplaceFullPath),
+                        &p.replace_full_path,
+                        &p.replace_prefix_match,
+                    )
                 }),
             });
         }
@@ -1604,13 +1557,12 @@ fn filters_from(
         if let Some(rw) = &f.url_rewrite {
             out.url_rewrite = Some(UrlRewrite {
                 hostname: rw.hostname.clone(),
-                path: rw.path.as_ref().map(|p| match p.r#type {
-                    RWType::ReplaceFullPath => {
-                        PathRewrite::ReplaceFullPath(p.replace_full_path.clone().unwrap_or_default())
-                    }
-                    RWType::ReplacePrefixMatch => PathRewrite::ReplacePrefixMatch(
-                        p.replace_prefix_match.clone().unwrap_or_default(),
-                    ),
+                path: rw.path.as_ref().map(|p| {
+                    path_rewrite(
+                        matches!(p.r#type, RWType::ReplaceFullPath),
+                        &p.replace_full_path,
+                        &p.replace_prefix_match,
+                    )
                 }),
             });
         }
@@ -1677,6 +1629,43 @@ fn method_to_string(m: &gateway_api::apis::standard::httproutes::HttpRouteRulesM
         M::Patch => "PATCH",
     }
     .to_string()
+}
+
+/// Does an HTTPRoute have a parentRef pointing at the given Gateway (name + ns)?
+fn route_has_parent(route: &HTTPRoute, gw_name: &str, gw_ns: &str) -> bool {
+    let r_ns = route.namespace().unwrap_or_default();
+    route
+        .spec
+        .parent_refs
+        .iter()
+        .flatten()
+        .any(|p| p.name == gw_name && p.namespace.as_deref().unwrap_or(&r_ns) == gw_ns)
+}
+
+/// Does an HTTPRoute have a backendRef to one of `svc_names` in namespace `svc_ns`?
+fn route_targets_service_in(route: &HTTPRoute, svc_names: &[String], svc_ns: &str) -> bool {
+    let r_ns = route.namespace().unwrap_or_default();
+    route
+        .spec
+        .rules
+        .iter()
+        .flatten()
+        .flat_map(|rule| rule.backend_refs.iter().flatten())
+        .any(|b| svc_names.contains(&b.name) && b.namespace.as_deref().unwrap_or(&r_ns) == svc_ns)
+}
+
+/// Find a namespaced object by name in a reflector store. Centralizes the
+/// "scan store for name+namespace" lookup shared by the Secret/ConfigMap/Service
+/// resolvers.
+fn find_in<K>(store: &Store<K>, ns: &str, name: &str) -> Option<Arc<K>>
+where
+    K: Resource + Clone + 'static,
+    K::DynamicType: Eq + std::hash::Hash + Clone + Default,
+{
+    store
+        .state()
+        .into_iter()
+        .find(|o| o.name_any() == name && o.namespace().as_deref() == Some(ns))
 }
 
 /// Build a metav1 Condition with observedGeneration set.
