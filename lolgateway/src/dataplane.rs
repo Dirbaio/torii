@@ -486,6 +486,24 @@ fn strip_port(host: &str) -> &str {
     host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
 }
 
+/// Find `proto` in the client's wire-format ALPN list, returning a sub-slice of
+/// `client` (required: the ALPN-select callback's return must borrow from `client`).
+fn select_alpn<'a>(client: &'a [u8], proto: &[u8]) -> Option<&'a [u8]> {
+    let mut bytes = client;
+    while !bytes.is_empty() {
+        let len = bytes[0] as usize;
+        bytes = &bytes[1..];
+        if len > bytes.len() {
+            return None;
+        }
+        if &bytes[..len] == proto {
+            return Some(&bytes[..len]);
+        }
+        bytes = &bytes[len..];
+    }
+    None
+}
+
 /// A Pingora TLS accept callback that selects a server certificate by SNI from
 /// the current snapshot's cert store, loading the PEM cert+key in-memory per
 /// handshake. This is what makes per-listener / per-SNI HTTPS termination work.
@@ -496,24 +514,41 @@ struct SniCertCallback {
 #[async_trait]
 impl pingora_core::listeners::TlsAccept for SniCertCallback {
     async fn certificate_callback(&self, ssl: &mut pingora_core::tls::ssl::SslRef) {
-        use pingora_core::tls::ext;
         let sni = ssl
             .servername(pingora_core::tls::ssl::NameType::HOST_NAME)
-            .map(|s| s.to_string());
+            .map(|s| s.to_ascii_lowercase());
+
+        // ACME TLS-ALPN-01: if the client negotiated `acme-tls/1` and we have a
+        // pending challenge cert for this SNI, serve THAT (never a real cert).
+        // Gating on the negotiated ALPN ensures real clients never see it.
+        if ssl.selected_alpn_protocol() == Some(b"acme-tls/1") {
+            let challenges = self.data_plane.load_challenges();
+            if let Some(ck) = sni.as_deref().and_then(|h| challenges.get(h)) {
+                install_cert(ssl, ck);
+            }
+            return;
+        }
+
         let snapshot = self.data_plane.load();
         let Some(ck) = snapshot.certs.select(sni.as_deref()) else {
             // No cert available; leave the default (handshake will fail cleanly).
             return;
         };
-        let (Ok(cert), Ok(key)) = (
-            pingora_core::tls::x509::X509::from_pem(&ck.cert_pem),
-            pingora_core::tls::pkey::PKey::private_key_from_pem(&ck.key_pem),
-        ) else {
-            return;
-        };
-        let _ = ext::ssl_use_certificate(ssl, &cert);
-        let _ = ext::ssl_use_private_key(ssl, &key);
+        install_cert(ssl, ck);
     }
+}
+
+/// Install a PEM cert+key onto an in-progress TLS handshake.
+fn install_cert(ssl: &mut pingora_core::tls::ssl::SslRef, ck: &crate::cert_store::CertKey) {
+    use pingora_core::tls::ext;
+    let (Ok(cert), Ok(key)) = (
+        pingora_core::tls::x509::X509::from_pem(&ck.cert_pem),
+        pingora_core::tls::pkey::PKey::private_key_from_pem(&ck.key_pem),
+    ) else {
+        return;
+    };
+    let _ = ext::ssl_use_certificate(ssl, &cert);
+    let _ = ext::ssl_use_private_key(ssl, &key);
 }
 
 /// Run the Pingora proxy server: `http_ports` get plain-TCP listeners, `tls_ports`
@@ -547,7 +582,17 @@ pub fn run(
     for port in tls_ports {
         let cb: pingora_core::listeners::TlsAcceptCallbacks =
             Box::new(SniCertCallback { data_plane: data_plane.clone() });
-        let settings = TlsSettings::with_callbacks(cb).expect("failed to build TLS settings");
+        let mut settings = TlsSettings::with_callbacks(cb).expect("failed to build TLS settings");
+        // ALPN: accept the ACME `acme-tls/1` challenge protocol; for anything else
+        // decline (NOACK) — identical to pingora's default (no ALPN → client falls
+        // back to HTTP/1.1), so normal traffic is unaffected whether or not --acme.
+        settings.set_alpn_select_callback(|_ssl, client| {
+            use pingora_core::tls::ssl::AlpnError;
+            match select_alpn(client, b"acme-tls/1") {
+                Some(p) => Ok(p),
+                None => Err(AlpnError::NOACK),
+            }
+        });
         proxy
             .add_tls_with_settings(&format!("{bind_ip}:{port}"), None, settings);
     }
