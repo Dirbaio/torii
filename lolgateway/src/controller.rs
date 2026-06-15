@@ -50,19 +50,43 @@ pub const CONTROLLER_NAME: &str = "lolgateway.dev/controller";
 /// suite uses this to decide which tests apply when running a whole profile
 /// (without an explicit --supported-features flag). Grow this as features land.
 const SUPPORTED_FEATURES: &[&str] = &[
+    // Core.
     "Gateway",
-    "GatewayPort8080",
-    "GatewayHTTPListenerIsolation",
     "HTTPRoute",
     "ReferenceGrant",
-    "HTTPRouteParentRefPort",
-    "HTTPRouteRequestTimeout",
-    "HTTPRouteBackendTimeout",
+    // Gateway extended.
+    "GatewayPort8080",
+    "GatewayHTTPListenerIsolation",
+    // HTTPRoute matching.
+    "HTTPRouteMethodMatching",
+    "HTTPRouteQueryParamMatching",
+    "HTTPRouteNamedRouteRule",
+    // HTTPRoute header modification.
+    "HTTPRouteResponseHeaderModification",
+    "HTTPRouteBackendRequestHeaderModification",
+    // HTTPRoute redirect.
+    "HTTPRoutePortRedirect",
+    "HTTPRouteSchemeRedirect",
+    "HTTPRoutePathRedirect",
+    "HTTPRoute303RedirectStatusCode",
+    "HTTPRoute307RedirectStatusCode",
+    "HTTPRoute308RedirectStatusCode",
+    // HTTPRoute rewrite.
+    "HTTPRouteHostRewrite",
+    "HTTPRoutePathRewrite",
+    // HTTPRoute mirror.
     "HTTPRouteRequestMirror",
     "HTTPRouteRequestMultipleMirrors",
     "HTTPRouteRequestPercentageMirror",
+    // HTTPRoute timeout.
+    "HTTPRouteRequestTimeout",
+    "HTTPRouteBackendTimeout",
+    // HTTPRoute misc.
+    "HTTPRouteParentRefPort",
     "HTTPRouteBackendProtocolWebSocket",
     "HTTPRouteCORS",
+    // TLS.
+    "BackendTLSPolicy",
 ];
 
 /// The address we advertise in Gateway.status.addresses — where our proxy listens,
@@ -226,19 +250,46 @@ struct GatewayModel {
     listeners: Vec<ListenerOutcome>,
 }
 
-/// CA-validation outcome for one BackendTLSPolicy (status side). The usable
-/// artifact (UpstreamTls) lives in the [`UpstreamTlsMap`], keyed by target Service.
-struct PolicyOutcome {
-    /// Whether the CA validated. Drives both Accepted and ResolvedRefs (they move
-    /// together for BackendTLSPolicy: valid CA → both True, invalid → both False).
-    resolved: bool,
+/// The result of validating one BackendTLSPolicy's CA bundle. Distinguishes the
+/// two failure reasons the conformance suite checks.
+enum CaResult {
+    /// Valid CA PEM (empty = wellKnownCACertificates=System → system roots).
+    Valid(Vec<u8>),
+    /// A CACertificateRef has a non-ConfigMap group/kind → ResolvedRefs/InvalidKind.
+    InvalidKind,
+    /// Missing / wrong-key / unparseable CA, or no CA at all →
+    /// ResolvedRefs/InvalidCACertificateRef.
+    InvalidRef,
 }
 
-/// (service-namespace, service-name) → resolved upstream TLS. Built once from all
-/// policies (with the conflict tiebreak applied on insert) so route resolution and
-/// policy status agree on which policy wins.
+/// The status a BackendTLSPolicy should report (drives its Accepted + ResolvedRefs).
+enum PolicyStatus {
+    /// Accepted=True, ResolvedRefs=True.
+    Accepted,
+    /// Lost a conflict for a target it would otherwise win → Accepted=False/Conflicted
+    /// (refs are valid, so ResolvedRefs stays True).
+    Conflicted,
+    /// Accepted=False/NoValidCACertificate, ResolvedRefs=False/InvalidKind.
+    InvalidKind,
+    /// Accepted=False/NoValidCACertificate, ResolvedRefs=False/InvalidCACertificateRef.
+    InvalidCaRef,
+}
+
+/// Per-policy status outcome (status side). The usable artifact (re-encrypt or
+/// "invalid → 5xx") lives in the [`UpstreamTlsMap`], keyed by target Service.
+struct PolicyOutcome {
+    status: PolicyStatus,
+}
+
+/// (service-namespace, service-name, service-port) → backend TLS mode for the data
+/// plane. Keyed by Service PORT (not just Service) because a BackendTLSPolicy's
+/// `sectionName` targets one Service port — two policies on the same Service but
+/// different ports both apply, each to its own port. A policy with no sectionName
+/// covers every port of the Service. Built once (conflict tiebreak applied) so
+/// route resolution and policy status agree. Only `ReEncrypt`/`Invalid` are stored
+/// (no policy → absent → the route defaults the endpoint to Plaintext).
 type UpstreamTlsMap =
-    std::collections::HashMap<(String, String), crate::route_table::UpstreamTls>;
+    std::collections::HashMap<(String, String, u16), crate::route_table::BackendTls>;
 
 /// Which API kind a deferred status patch targets (for building the right `Api<K>`).
 enum PatchTarget {
@@ -791,13 +842,15 @@ impl ReconcileCtx {
                         // endpoints, the ref is resolved; an empty backend yields a
                         // 503 at traffic time, not BackendNotFound.
                         Some(mut endpoints) => {
-                            // Apply a matching BackendTLSPolicy (re-encrypt to backend),
-                            // looked up from the pre-built artifact map.
-                            if let Some(tls) =
-                                upstream_tls.get(&(bns.clone(), backend_ref.name.clone()))
-                            {
+                            // Apply any BackendTLSPolicy decision for this Service
+                            // PORT (re-encrypt, or invalid→must-5xx), from the map.
+                            if let Some(bt) = upstream_tls.get(&(
+                                bns.clone(),
+                                backend_ref.name.clone(),
+                                svc_port,
+                            )) {
                                 for ep in &mut endpoints {
-                                    ep.tls = Some(tls.clone());
+                                    ep.tls = bt.clone();
                                 }
                             }
                             backends.push(Backend {
@@ -1026,11 +1079,12 @@ impl ReconcileCtx {
     fn build_policy_artifacts(
         &self,
     ) -> (UpstreamTlsMap, BTreeMap<(String, String), PolicyOutcome>) {
+        use crate::route_table::BackendTls;
         let mut artifacts: UpstreamTlsMap = UpstreamTlsMap::new();
         let mut outcomes: BTreeMap<(String, String), PolicyOutcome> = BTreeMap::new();
 
-        // Sort policies by the conflict tiebreak so the FIRST one to claim a given
-        // (svc_ns, svc_name) in the artifact map is the winner.
+        // Sort by the conflict tiebreak (oldest creationTimestamp, then name) so the
+        // FIRST valid policy to claim a target wins; later ones are Conflicted.
         let mut policies = self.stores.backend_tls_policies.state();
         policies.sort_by_key(|p| {
             (
@@ -1039,64 +1093,152 @@ impl ReconcileCtx {
             )
         });
 
+        // Conflict winner per (svc_ns, svc_name, sectionName) — the key the spec
+        // conflicts on (two policies on the same Service but different/absent section
+        // names do NOT conflict). Maps to the winning policy's (ns, name).
+        let mut winners: std::collections::HashMap<(String, String, Option<String>), (String, String)> =
+            std::collections::HashMap::new();
+        // Per data-plane port: was its current artifact set by a section-specific
+        // policy? A section-specific (sectionName) policy takes precedence over a
+        // Service-wide (no sectionName) one for that port, regardless of sort order.
+        let mut port_specific: std::collections::HashSet<(String, String, u16)> =
+            std::collections::HashSet::new();
+
         for policy in &policies {
             let pol_ns = policy.namespace().unwrap_or_default();
-            // Resolve+validate the CA bundle ONCE: Some(ca_pem) if valid, else None.
+            let pol_key = (pol_ns.clone(), policy.name_any());
             let ca = self.resolve_policy_ca(policy, &pol_ns);
-            let resolved = ca.is_some();
-            outcomes.insert(
-                (pol_ns.clone(), policy.name_any()),
-                PolicyOutcome { resolved },
-            );
 
-            // Only a valid policy contributes a usable upstream-TLS artifact.
-            let Some(ca_pem) = ca else { continue };
+            // Invalid policies: emit the right ResolvedRefs reason, and mark every
+            // Service PORT they target as Invalid so the data plane 5xxes (no
+            // plaintext fallback) — but never overwrite a valid ReEncrypt artifact.
+            let ca_pem = match ca {
+                CaResult::Valid(pem) => pem,
+                CaResult::InvalidKind | CaResult::InvalidRef => {
+                    let status = match ca {
+                        CaResult::InvalidKind => PolicyStatus::InvalidKind,
+                        _ => PolicyStatus::InvalidCaRef,
+                    };
+                    outcomes.insert(pol_key, PolicyOutcome { status });
+                    for t in &policy.spec.target_refs {
+                        if !t.group.is_empty() || t.kind != "Service" {
+                            continue;
+                        }
+                        for port in self.target_ports(&pol_ns, &t.name, &t.section_name) {
+                            artifacts
+                                .entry((pol_ns.clone(), t.name.clone(), port))
+                                .or_insert(BackendTls::Invalid);
+                        }
+                    }
+                    continue;
+                }
+            };
+
+            // Valid policy: claim each target section; first claimant wins, later
+            // claimants are Conflicted. A policy is Conflicted only if it loses
+            // every target it has (won_any wins).
             let hostname = policy.spec.validation.hostname.clone();
+            let mut won_any = false;
+            let mut lost_any = false;
             for t in &policy.spec.target_refs {
                 if !t.group.is_empty() || t.kind != "Service" {
                     continue;
                 }
-                // First valid policy for this Service wins (policies are sorted).
-                artifacts
-                    .entry((pol_ns.clone(), t.name.clone()))
-                    .or_insert_with(|| crate::route_table::UpstreamTls {
-                        hostname: hostname.clone(),
-                        ca_pem: ca_pem.clone(),
-                    });
+                // Conflict key includes sectionName (per spec): two policies on the
+                // same Service with different/absent sections do NOT conflict.
+                let ckey = (pol_ns.clone(), t.name.clone(), t.section_name.clone());
+                if winners.contains_key(&ckey) {
+                    lost_any = true; // an earlier policy already owns this section
+                    continue;
+                }
+                winners.insert(ckey, pol_key.clone());
+                won_any = true;
+                // Data-plane map is keyed by Service PORT (sectionName → port name →
+                // number; absent section → all ports). Precedence per port: a
+                // section-specific policy beats a Service-wide one (and beats an
+                // Invalid placeholder); a Service-wide one only fills ports not yet
+                // claimed by a section-specific policy.
+                let specific = t.section_name.is_some();
+                for port in self.target_ports(&pol_ns, &t.name, &t.section_name) {
+                    let pkey = (pol_ns.clone(), t.name.clone(), port);
+                    if !specific && port_specific.contains(&pkey) {
+                        continue; // a section-specific policy already owns this port
+                    }
+                    artifacts.insert(
+                        pkey.clone(),
+                        BackendTls::ReEncrypt(crate::route_table::UpstreamTls {
+                            hostname: hostname.clone(),
+                            ca_pem: ca_pem.clone(),
+                        }),
+                    );
+                    if specific {
+                        port_specific.insert(pkey);
+                    }
+                }
             }
+            let status = if lost_any && !won_any {
+                PolicyStatus::Conflicted
+            } else {
+                PolicyStatus::Accepted
+            };
+            outcomes.insert(pol_key, PolicyOutcome { status });
         }
         (artifacts, outcomes)
     }
 
-    /// Resolve + validate a policy's CA bundle. Returns the concatenated CA PEM if
-    /// valid (empty for wellKnownCACertificates=System → use system roots), or None
-    /// if any CA ref is the wrong kind, missing, or unparseable. This is the single
-    /// CA validation path — both the artifact and the status derive from it.
-    fn resolve_policy_ca(&self, policy: &BackendTLSPolicy, pol_ns: &str) -> Option<Vec<u8>> {
+    /// The Service port NUMBERS a BackendTLSPolicy target covers. A target's
+    /// `sectionName` is a Service port NAME → resolve it to that port's number; an
+    /// absent sectionName covers every port of the Service. Returns empty if the
+    /// Service (or named port) isn't found — that target then contributes nothing.
+    fn target_ports(&self, ns: &str, svc_name: &str, section: &Option<String>) -> Vec<u16> {
+        let Some(svc) = find_in(&self.stores.services, ns, svc_name) else {
+            return Vec::new();
+        };
+        let ports = svc.spec.as_ref().and_then(|s| s.ports.as_ref());
+        let Some(ports) = ports else { return Vec::new() };
+        match section {
+            // sectionName = a specific Service port name.
+            Some(name) => ports
+                .iter()
+                .filter(|p| p.name.as_deref() == Some(name.as_str()))
+                .map(|p| p.port as u16)
+                .collect(),
+            // No sectionName → all the Service's ports.
+            None => ports.iter().map(|p| p.port as u16).collect(),
+        }
+    }
+
+    /// Resolve + validate a policy's CA bundle. The single CA validation path —
+    /// both the artifact and the status derive from its [`CaResult`], which
+    /// distinguishes a wrong-kind ref (InvalidKind) from a missing/malformed CA
+    /// (InvalidCACertificateRef).
+    fn resolve_policy_ca(&self, policy: &BackendTLSPolicy, pol_ns: &str) -> CaResult {
         let v = &policy.spec.validation;
         match &v.ca_certificate_refs {
             None => {
                 // No explicit CA refs: valid only if it uses well-known CAs.
                 if v.well_known_ca_certificates.is_some() {
-                    Some(Vec::new()) // system roots
+                    CaResult::Valid(Vec::new()) // system roots
                 } else {
-                    None
+                    CaResult::InvalidRef
                 }
             }
             Some(refs) => {
                 let mut pem = Vec::new();
                 for r in refs {
                     if !r.group.is_empty() || r.kind != "ConfigMap" {
-                        return None;
+                        return CaResult::InvalidKind;
                     }
-                    let bytes = self.load_configmap_ca(pol_ns, &r.name)?;
+                    let Some(bytes) = self.load_configmap_ca(pol_ns, &r.name) else {
+                        return CaResult::InvalidRef;
+                    };
                     if !ca_pem_is_valid(&bytes) {
-                        return None;
+                        return CaResult::InvalidRef;
                     }
                     pem.extend_from_slice(&bytes);
                     pem.push(b'\n');
                 }
-                Some(pem)
+                CaResult::Valid(pem)
             }
         }
     }
@@ -1117,17 +1259,26 @@ impl ReconcileCtx {
             let pol_ns = policy.namespace().unwrap_or_default();
             let outcome = outcomes
                 .get(&(pol_ns.clone(), policy.name_any()));
-            let refs_ok = outcome.map(|o| o.resolved).unwrap_or(false);
-            let (resolved, accepted) = if refs_ok {
-                (
+            // Map the computed PolicyStatus to its (ResolvedRefs, Accepted) pair.
+            let (resolved, accepted) = match outcome.map(|o| &o.status) {
+                Some(PolicyStatus::Accepted) => (
                     condition("ResolvedRefs", "True", "ResolvedRefs", gen),
                     condition("Accepted", "True", "Accepted", gen),
-                )
-            } else {
-                (
+                ),
+                Some(PolicyStatus::Conflicted) => (
+                    // Conflicted policies have valid refs → ResolvedRefs stays True.
+                    condition("ResolvedRefs", "True", "ResolvedRefs", gen),
+                    condition("Accepted", "False", "Conflicted", gen),
+                ),
+                Some(PolicyStatus::InvalidKind) => (
+                    condition("ResolvedRefs", "False", "InvalidKind", gen),
+                    condition("Accepted", "False", "NoValidCACertificate", gen),
+                ),
+                // InvalidCaRef, or no outcome (shouldn't happen) → invalid-ref reason.
+                _ => (
                     condition("ResolvedRefs", "False", "InvalidCACertificateRef", gen),
                     condition("Accepted", "False", "NoValidCACertificate", gen),
-                )
+                ),
             };
 
             // Ancestors: Gateways that a route targeting this Service attaches to.
@@ -1288,7 +1439,9 @@ impl ReconcileCtx {
                         endpoints.push(Endpoint {
                             ip,
                             port: port as u16,
-                            tls: None, // set later if a BackendTLSPolicy targets this Service
+                            // Plaintext by default; a BackendTLSPolicy targeting this
+                            // Service overrides it (ReEncrypt or Invalid) in process_route.
+                            tls: crate::route_table::BackendTls::Plaintext,
                         });
                     }
                 }

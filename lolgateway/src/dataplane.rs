@@ -14,7 +14,7 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
 use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
 
-use crate::route_table::{Endpoint, Filters, HeaderMods};
+use crate::route_table::{BackendTls, Endpoint, Filters, HeaderMods};
 use crate::snapshot::DataPlane;
 
 /// The proxy. Holds the shared snapshot handle.
@@ -142,6 +142,13 @@ impl ProxyHttp for GatewayProxy {
         ctx.request_timeout = entry.request_timeout;
 
         match entry.pick_endpoint(next_rng()) {
+            Some((ep, _)) if matches!(ep.tls, BackendTls::Invalid) => {
+                // The backend is targeted by an INVALID BackendTLSPolicy. We must
+                // not fall back to plaintext — fail the request (Gateway API: 5xx).
+                tracing::debug!(%host, %path, "backend has an invalid BackendTLSPolicy -> 500");
+                session.respond_error(500).await?;
+                Ok(true)
+            }
             Some((ep, backend)) => {
                 tracing::debug!(%host, %path, %method, ip = %ep.ip, port = ep.port, "matched route");
                 // Rule-level filters plus the chosen backend's per-backendRef filters.
@@ -219,7 +226,7 @@ impl ProxyHttp for GatewayProxy {
         // BackendTLSPolicy: re-encrypt to the backend over TLS, verifying its cert
         // against the policy CA with SNI = the policy hostname. Plain HTTP otherwise.
         let mut peer = match &ep.tls {
-            Some(tls) => {
+            BackendTls::ReEncrypt(tls) => {
                 let mut p = HttpPeer::new((ep.ip, ep.port), true, tls.hostname.clone());
                 p.options.verify_cert = true;
                 p.options.verify_hostname = true;
@@ -230,7 +237,10 @@ impl ProxyHttp for GatewayProxy {
                 }
                 p
             }
-            None => HttpPeer::new((ep.ip, ep.port), false, String::new()),
+            BackendTls::Plaintext => HttpPeer::new((ep.ip, ep.port), false, String::new()),
+            // Invalid endpoints are rejected with a 5xx in request_filter, so the
+            // request never reaches here.
+            BackendTls::Invalid => unreachable!("invalid-TLS endpoint reached upstream_peer"),
         };
         // Apply the route's request timeout to the upstream read (response) wait.
         if let Some(t) = ctx.request_timeout {
