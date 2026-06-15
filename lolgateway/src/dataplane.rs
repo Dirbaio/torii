@@ -6,7 +6,7 @@
 //!
 //! Pingora's `Server::run_forever` is blocking and manages its own tokio
 //! runtime, so this runs on a dedicated OS thread, separate from the kube
-//! controller's runtime. They share state only through [`SharedRouteTable`].
+//! controller's runtime. They share state only through the [`DataPlane`] snapshot.
 
 use async_trait::async_trait;
 use pingora_core::prelude::*;
@@ -14,12 +14,12 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
 use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
 
-use crate::cert_store::SharedCertStore;
-use crate::route_table::{Endpoint, Filters, HeaderMods, SharedRouteTable};
+use crate::route_table::{Endpoint, Filters, HeaderMods};
+use crate::snapshot::DataPlane;
 
-/// The proxy. Holds the shared routing snapshot handle.
+/// The proxy. Holds the shared snapshot handle.
 pub struct GatewayProxy {
-    routes: SharedRouteTable,
+    data_plane: DataPlane,
     /// Ports that terminate TLS (HTTPS listeners). Used so redirects from an
     /// HTTPS listener default their scheme to `https`.
     tls_ports: Vec<u16>,
@@ -40,8 +40,8 @@ pub struct RequestCtx {
 }
 
 impl GatewayProxy {
-    pub fn new(routes: SharedRouteTable, tls_ports: Vec<u16>) -> Self {
-        GatewayProxy { routes, tls_ports }
+    pub fn new(data_plane: DataPlane, tls_ports: Vec<u16>) -> Self {
+        GatewayProxy { data_plane, tls_ports }
     }
 }
 
@@ -77,8 +77,8 @@ impl ProxyHttp for GatewayProxy {
             .map(|a| a.port())
             .unwrap_or(0);
 
-        let table = self.routes.load();
-        let Some(entry) = table.match_request(port, &host, &path, &method, &headers, &query) else {
+        let snapshot = self.data_plane.load();
+        let Some(entry) = snapshot.routes.match_request(port, &host, &path, &method, &headers, &query) else {
             tracing::debug!(%host, %path, %method, "no route matched -> 404");
             session.respond_error(404).await?;
             return Ok(true);
@@ -477,10 +477,10 @@ fn strip_port(host: &str) -> &str {
 }
 
 /// A Pingora TLS accept callback that selects a server certificate by SNI from
-/// the shared [`SharedCertStore`], loading the PEM cert+key in-memory per
+/// the current snapshot's cert store, loading the PEM cert+key in-memory per
 /// handshake. This is what makes per-listener / per-SNI HTTPS termination work.
 struct SniCertCallback {
-    certs: SharedCertStore,
+    data_plane: DataPlane,
 }
 
 #[async_trait]
@@ -490,8 +490,8 @@ impl pingora_core::listeners::TlsAccept for SniCertCallback {
         let sni = ssl
             .servername(pingora_core::tls::ssl::NameType::HOST_NAME)
             .map(|s| s.to_string());
-        let store = self.certs.load();
-        let Some(ck) = store.select(sni.as_deref()) else {
+        let snapshot = self.data_plane.load();
+        let Some(ck) = snapshot.certs.select(sni.as_deref()) else {
             // No cert available; leave the default (handshake will fail cleanly).
             return;
         };
@@ -507,13 +507,13 @@ impl pingora_core::listeners::TlsAccept for SniCertCallback {
 }
 
 /// Run the Pingora proxy server: `http_ports` get plain-TCP listeners, `tls_ports`
-/// get HTTPS listeners that terminate TLS using SNI-selected certs from `certs`.
+/// get HTTPS listeners that terminate TLS using SNI-selected certs from the
+/// snapshot's cert store.
 ///
 /// This blocks forever (Pingora calls `std::process::exit` on shutdown), so call
 /// it from a dedicated thread.
 pub fn run(
-    routes: SharedRouteTable,
-    certs: SharedCertStore,
+    data_plane: DataPlane,
     bind_ip: &str,
     http_ports: &[u16],
     tls_ports: &[u16],
@@ -526,7 +526,7 @@ pub fn run(
 
     let mut proxy = http_proxy_service(
         &server.configuration,
-        GatewayProxy::new(routes, tls_ports.to_vec()),
+        GatewayProxy::new(data_plane.clone(), tls_ports.to_vec()),
     );
 
     // Plain HTTP listeners. The proxy routes per-port via server_addr().
@@ -536,7 +536,7 @@ pub fn run(
     // HTTPS listeners: terminate TLS, selecting the cert by SNI per handshake.
     for port in tls_ports {
         let cb: pingora_core::listeners::TlsAcceptCallbacks =
-            Box::new(SniCertCallback { certs: certs.clone() });
+            Box::new(SniCertCallback { data_plane: data_plane.clone() });
         let settings = TlsSettings::with_callbacks(cb).expect("failed to build TLS settings");
         proxy
             .add_tls_with_settings(&format!("{bind_ip}:{port}"), None, settings);

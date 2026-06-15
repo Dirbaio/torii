@@ -1,14 +1,11 @@
-//! TLS certificate store shared from the control plane to the data plane.
+//! TLS certificate store the control plane builds for the data plane.
 //!
 //! The control plane resolves HTTPS-listener certificate Secrets into PEM
-//! cert+key pairs keyed by the listener hostname, and atomically swaps in a new
-//! [`CertStore`]. The data plane's TLS `certificate_callback` reads it per
-//! handshake to select a cert by SNI.
+//! cert+key pairs keyed by the listener hostname; it's published to the data plane
+//! (with the route table) via the atomic [`crate::snapshot::Snapshot`]. The data
+//! plane's TLS `certificate_callback` reads it per handshake to select a cert by SNI.
 
 use std::collections::HashMap;
-use std::sync::Arc;
-
-use arc_swap::ArcSwap;
 
 /// A resolved server certificate (PEM-encoded chain + private key).
 #[derive(Clone)]
@@ -49,29 +46,5 @@ impl CertStore {
         self.by_host
             .get("")
             .or_else(|| if self.by_host.len() == 1 { self.by_host.values().next() } else { None })
-    }
-}
-
-/// Lock-free, atomically-swappable handle to the current [`CertStore`].
-#[derive(Clone)]
-pub struct SharedCertStore(Arc<ArcSwap<CertStore>>);
-
-impl SharedCertStore {
-    pub fn new() -> Self {
-        SharedCertStore(Arc::new(ArcSwap::from_pointee(CertStore::default())))
-    }
-
-    pub fn store(&self, store: CertStore) {
-        self.0.store(Arc::new(store));
-    }
-
-    pub fn load(&self) -> arc_swap::Guard<Arc<CertStore>> {
-        self.0.load()
-    }
-}
-
-impl Default for SharedCertStore {
-    fn default() -> Self {
-        Self::new()
     }
 }
