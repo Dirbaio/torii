@@ -8,6 +8,8 @@ use clap::{Parser, Subcommand};
 use k8s_openapi::api::core::v1::Namespace;
 use kube::{api::ListParams, Api, Client};
 
+mod acme;
+mod acme_cert;
 mod cert_store;
 mod controller;
 mod dataplane;
@@ -62,6 +64,23 @@ struct RunArgs {
     /// conformance suite. Defaults to the loopback address.
     #[arg(long, env = "LOLGATEWAY_ADVERTISE", default_value = "127.0.0.1")]
     advertise: String,
+
+    /// Enable automatic TLS certificate issuance via ACME (TLS-ALPN-01).
+    /// OFF by default; even when on, a Gateway must opt in with the
+    /// `lolgateway.dev/acme-issuer` annotation. Requires a TLS listener port.
+    #[arg(long, env = "LOLGATEWAY_ACME")]
+    acme: bool,
+
+    /// Namespace where ACME state Secrets are stored (account key, in-flight
+    /// challenge cert). The issued certs go into each listener's own
+    /// certificateRefs Secret, not here.
+    #[arg(long, env = "LOLGATEWAY_ACME_NAMESPACE", default_value = "lolgateway-system")]
+    acme_namespace: String,
+
+    /// Contact email for the ACME account (used if a Gateway's
+    /// `lolgateway.dev/acme-email` annotation is absent). Optional.
+    #[arg(long, env = "LOLGATEWAY_ACME_EMAIL")]
+    acme_email: Option<String>,
 }
 
 #[tokio::main]
@@ -101,11 +120,35 @@ async fn run(args: RunArgs) -> Result<()> {
         .spawn(move || dataplane::run(dp, &bind_ip, &http_ports, &tls_ports))
         .context("failed to spawn data-plane thread")?;
 
+    // ACME (optional): only spawned with --acme. When off, nothing changes.
+    if args.acme {
+        let acme_config = acme::AcmeConfig {
+            namespace: args.acme_namespace.clone(),
+            default_email: args.acme_email.clone(),
+            holder_id: acme_holder_id(),
+        };
+        let acme_client = client.clone();
+        let acme_dp = data_plane.clone();
+        tokio::spawn(async move {
+            if let Err(e) = acme::run(acme_client, acme_dp, acme_config).await {
+                tracing::error!(error = %e, "ACME subsystem exited");
+            }
+        });
+    }
+
     // Control plane on this runtime.
     let config = controller::ControllerConfig {
         advertise_address: args.advertise,
     };
     controller::run(client, data_plane, config).await
+}
+
+/// A stable-per-process identity for ACME Lease leader election. Prefer the pod
+/// name (downward API via `POD_NAME`/`HOSTNAME`); fall back to the hostname.
+fn acme_holder_id() -> String {
+    std::env::var("POD_NAME")
+        .or_else(|_| std::env::var("HOSTNAME"))
+        .unwrap_or_else(|_| format!("lolgateway-{}", std::process::id()))
 }
 
 fn init_tracing(filter: &str) {

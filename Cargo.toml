@@ -48,3 +48,13 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# ACME (automatic TLS cert issuance via TLS-ALPN-01). Use the `ring` crypto
+# backend to match our rustls(ring) process provider and avoid pulling aws-lc-rs.
+instant-acme = { version = "0.8", default-features = false, features = [
+    "ring",
+    "hyper-rustls",
+] }
+rcgen = "0.14" # validation cert (id-pe-acmeIdentifier) + issued-cert keypair/CSR
+kube-leader-election = "0.43" # coordination.k8s.io Lease leader election
+x509-parser = "0.16" # read cert notAfter for renewal scheduling
