@@ -51,6 +51,15 @@ request. Keep these two concerns cleanly separated.
   generated types via `kube::CustomResource` for the Gateway CRDs.
 - Reconcilers must be **idempotent** and **level-triggered**. Always recompute desired
   state from the full set of watched objects; never accumulate deltas.
+- **Periodic resyncs are FORBIDDEN.** The reconcile loop is purely event-driven: it
+  wakes only on watch events (each watcher updates its reflector Store *before* poking
+  the wake channel, so no wake-up can be lost — a missed Store write always has a
+  paired, still-queued poke that forces a re-reconcile). Do **not** add a timer-based
+  resync, a "safety-net" tick, or a short timeout on the wake channel to "heal"
+  convergence. If something doesn't converge, that is a **real bug** — find and fix the
+  root cause (a missing watch, a dropped event, a non-idempotent reconcile, a status
+  patch that silently no-ops). A periodic resync masks such bugs instead of fixing them
+  and is never an acceptable fix.
 - **Status reporting is load-bearing.** Many conformance tests only check conditions.
   Get `GatewayClass`/`Gateway`/`HTTPRoute` status conditions correct early —
   `observedGeneration` must track `metadata.generation` (there are explicit
