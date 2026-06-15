@@ -34,13 +34,17 @@ conformance profile. Implemented and verified against the upstream suite:
   via ReferenceGrant; OpenSSL `certificate_callback`), listener cert-ref status
   (`InvalidCertificateRef`/`RefNotPermitted`, with PEM validation), and **BackendTLSPolicy**
   upstream re-encryption (gateway→backend TLS with custom CA from a ConfigMap + SNI/hostname
-  verification).
+  verification), including invalid-policy→5xx and conflict resolution.
+- **Automatic TLS certs via ACME (opt-in)** — see [ACME](#automatic-tls-certificates-acme).
 
-Architecture: a level-triggered kube controller publishes a routing snapshot via
-`ArcSwap<RouteTable>` (plus an `ArcSwap<CertStore>` for TLS certs); a Pingora `ProxyHttp`
-data plane reads them lock-free per request. The Pingora TLS backend is **OpenSSL** (not
-rustls), because per-SNI cert selection needs the OpenSSL/BoringSSL certificate callback.
-See the modules in [lolgateway/src/](lolgateway/src/).
+Architecture: a level-triggered kube controller computes the entire data-plane view —
+route table + TLS cert store — and publishes both together in **one atomic
+`ArcSwap<Snapshot>`** so readers never see a torn state; a Pingora `ProxyHttp` data plane
+reads it lock-free per request. Request dispatch is indexed by `(port, listener hostname)`
+— exact/wildcard/any tiers — so it scans only the routes serving the request's Host, not
+the whole table. The Pingora TLS backend is **OpenSSL** (not rustls), because per-SNI cert
+selection needs the OpenSSL/BoringSSL certificate callback. See the modules in
+[lolgateway/src/](lolgateway/src/).
 
 ### Conformance results
 
@@ -87,6 +91,56 @@ distinct from the HTTP proxy:
 
 The control-plane status side (TLSRoute parent conditions, listener `TLS`/`Passthrough`
 handling) is straightforward; the L4 stream subsystem is the substantial piece.
+
+### Automatic TLS certificates (ACME)
+
+lolgateway can obtain and renew TLS certificates automatically via **ACME TLS-ALPN-01**
+(e.g. from Let's Encrypt). It is **off by default** and must be enabled with `--acme`.
+
+The Gateway API v1.5 spec has **no official field** for ACME issuance — listeners only
+reference a pre-existing `certificateRefs` Secret — so opt-in is an **annotation** on the
+Gateway (the cert-manager convention):
+
+```yaml
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: web
+  annotations:
+    lolgateway.dev/acme-issuer: "https://acme-v02.api.letsencrypt.org/directory"
+    lolgateway.dev/acme-email: "you@example.com"
+spec:
+  gatewayClassName: lolgateway
+  listeners:
+    - name: https
+      port: 443
+      protocol: HTTPS
+      hostname: app.example.com          # required; wildcards aren't supported by TLS-ALPN-01
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - { kind: Secret, name: app-tls }   # we create/populate this Secret
+```
+
+How it works:
+- Run with `--acme [--acme-namespace lolgateway-system] [--acme-email ...]`.
+- For each opted-in HTTPS listener whose `certificateRefs` Secret is missing, invalid, or
+  expiring (renewed ~30 days before `notAfter`), lolgateway runs an ACME order and writes
+  the issued cert into that Secret — which then flows through the normal cert path.
+- **All state lives in Kubernetes:** the ACME account key and in-flight challenge certs are
+  Secrets in `--acme-namespace`; issued certs go in each listener's own `certificateRefs`
+  Secret.
+- **Multiple controller replicas are supported.** A `coordination.k8s.io` Lease elects one
+  leader that drives all issuance/renewal. Because the TLS-ALPN-01 verification connection
+  can land on **any** replica, the challenge validation cert is stored in a shared Secret
+  that every replica serves — so validation works regardless of which replica is hit.
+
+RBAC beyond the base controller: `create`/`update`/`patch` on `secrets` in
+`--acme-namespace` and `get`/`create`/`update`/`patch` on `coordination.k8s.io/leases`.
+
+End-to-end test against a local [pebble](https://github.com/letsencrypt/pebble) ACME
+server: [`hack/acme-e2e.sh`](hack/acme-e2e.sh). The certificate crypto (the RFC 8737
+`acme-tls/1` validation cert + CSR) is also covered by `cargo test`.
 
 ### Scope
 

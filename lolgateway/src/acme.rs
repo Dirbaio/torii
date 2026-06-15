@@ -464,3 +464,35 @@ fn now_unix() -> i64 {
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_key_is_stable_and_per_directory() {
+        let a = account_key("https://acme-staging.example/dir");
+        let b = account_key("https://acme-staging.example/dir");
+        let c = account_key("https://acme-prod.example/dir");
+        assert_eq!(a, b, "same directory → same key (stable)");
+        assert_ne!(a, c, "different directory → different key");
+        assert!(a.starts_with("credentials-") && a.ends_with(".json"));
+    }
+
+    #[test]
+    fn cert_not_after_parses_validity() {
+        // Generate a self-signed cert and confirm we read a plausible notAfter.
+        let key = rcgen::KeyPair::generate().unwrap();
+        let params = rcgen::CertificateParams::new(vec!["x.example.com".to_string()]).unwrap();
+        let cert = params.self_signed(&key).unwrap();
+        let pem = cert.pem().into_bytes();
+        let not_after = cert_not_after(&pem).expect("parse notAfter");
+        // rcgen's default validity is in the future relative to now.
+        assert!(not_after > now_unix(), "notAfter should be in the future");
+    }
+
+    #[test]
+    fn cert_not_after_rejects_garbage() {
+        assert!(cert_not_after(b"not a pem").is_none());
+    }
+}
