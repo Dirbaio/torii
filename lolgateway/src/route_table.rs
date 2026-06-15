@@ -1,39 +1,11 @@
-//! The routing snapshot shared from the control plane to the data plane.
+//! The routing table the control plane computes for the data plane.
 //!
 //! The control plane recomputes a [`RouteTable`] from the full set of watched
-//! Kubernetes objects and atomically swaps it in. The data plane reads it
-//! lock-free on every request via [`SharedRouteTable`].
+//! Kubernetes objects; it's published to the data plane (with the cert store) via
+//! the atomic [`crate::snapshot::Snapshot`]. The data plane reads it lock-free on
+//! every request.
 
 use std::cmp::Ordering;
-use std::sync::Arc;
-
-use arc_swap::ArcSwap;
-
-/// A lock-free, atomically-swappable handle to the current [`RouteTable`].
-#[derive(Clone)]
-pub struct SharedRouteTable(Arc<ArcSwap<RouteTable>>);
-
-impl SharedRouteTable {
-    pub fn new() -> Self {
-        SharedRouteTable(Arc::new(ArcSwap::from_pointee(RouteTable::default())))
-    }
-
-    /// Publish a new routing snapshot. Readers see it on their next `load`.
-    pub fn store(&self, table: RouteTable) {
-        self.0.store(Arc::new(table));
-    }
-
-    /// Load the current snapshot (cheap, lock-free).
-    pub fn load(&self) -> arc_swap::Guard<Arc<RouteTable>> {
-        self.0.load()
-    }
-}
-
-impl Default for SharedRouteTable {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 /// The data plane's view of all programmed routing.
 ///

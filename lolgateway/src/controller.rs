@@ -36,11 +36,12 @@ use gateway_api::apis::standard::backendtlspolicies::{
     BackendTlsPolicyStatusAncestorsAncestorRef,
 };
 
-use crate::cert_store::{CertKey, CertStore, SharedCertStore};
+use crate::cert_store::{CertKey, CertStore};
 use crate::route_table::{
     Backend, Endpoint, Filters, HeaderMatch, HeaderMods, HeaderValueMatch, PathMatch, PathRewrite,
-    QueryMatch, Redirect, RouteEntry, RouteMatch, RouteTable, SharedRouteTable, UrlRewrite,
+    QueryMatch, Redirect, RouteEntry, RouteMatch, RouteTable, UrlRewrite,
 };
+use crate::snapshot::{DataPlane, Snapshot};
 
 /// Our controller name. Must be DOMAIN/PATH and match GatewayClass.spec.controllerName.
 pub const CONTROLLER_NAME: &str = "lolgateway.dev/controller";
@@ -87,8 +88,7 @@ struct Stores {
 /// Run the control plane forever: start watchers, and on any change recompute.
 pub async fn run(
     client: Client,
-    shared: SharedRouteTable,
-    certs: SharedCertStore,
+    data_plane: DataPlane,
     config: ControllerConfig,
 ) -> Result<()> {
     let gc_api: Api<GatewayClass> = Api::all(client.clone());
@@ -184,8 +184,7 @@ pub async fn run(
     let ctx = ReconcileCtx {
         client,
         gc_api,
-        shared,
-        certs,
+        data_plane,
         config,
         stores,
     };
@@ -219,8 +218,7 @@ struct ReconcileCtx {
     // GatewayClass is cluster-scoped; Gateway/HTTPRoute status use namespaced
     // APIs built inline per object.
     gc_api: Api<GatewayClass>,
-    shared: SharedRouteTable,
-    certs: SharedCertStore,
+    data_plane: DataPlane,
     config: ControllerConfig,
     stores: Arc<Stores>,
 }
@@ -381,11 +379,14 @@ impl ReconcileCtx {
         patches.extend(self.policy_patches(&usable_gateways, &routes, &policy_outcomes));
 
         // ── Publish the data plane FIRST (convergence shouldn't wait on the API
-        //    server), then flush all status writes concurrently. ──
-        self.certs.store(cert_store);
+        //    server), then flush all status writes concurrently. Route table and
+        //    cert store swap together atomically — readers never see a torn state. ──
         route_table.sort();
-        tracing::debug!(entries = route_table.entries.len(), "publishing route table");
-        self.shared.store(route_table);
+        tracing::debug!(entries = route_table.entries.len(), "publishing snapshot");
+        self.data_plane.store(Snapshot {
+            routes: route_table,
+            certs: cert_store,
+        });
 
         self.flush_status(patches).await
     }
