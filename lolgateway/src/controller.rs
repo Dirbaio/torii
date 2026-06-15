@@ -191,12 +191,18 @@ pub async fn run(
     };
 
     // Reconcile loop: debounce bursts of events, then recompute everything.
+    //
+    // NO periodic resync — purely event-driven. Every watcher updates its
+    // reflector Store *before* poking `rx` (`.reflect()` applies the change as
+    // the stream item is produced, the poke fires after). So: if an event's
+    // Store write lands before a reconcile reads that object, this pass sees it;
+    // if it lands after, the paired poke is still queued in `rx` and triggers an
+    // immediate re-reconcile that does see it. No wake-up can be lost, so no
+    // timer is needed to "heal" convergence. If something fails to converge,
+    // that is a real bug — fix the bug, never paper over it with a resync.
     loop {
-        // Wait for at least one event (or periodic resync every 10s).
-        // Wait for an event, or resync periodically. The short resync interval is
-        // a safety net: it heals any convergence we might miss if a watched
-        // object's cache update lands in a narrow window around a reconcile.
-        let _ = tokio::time::timeout(Duration::from_secs(2), rx.recv()).await;
+        // Block until at least one event arrives.
+        let _ = rx.recv().await;
         // Coalesce a short burst, then drain so events that arrive *after* this
         // point (e.g. during the reconcile) trigger a fresh pass next iteration.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -219,10 +225,87 @@ struct ReconcileCtx {
     stores: Arc<Stores>,
 }
 
+// ── Internal reconcile model ────────────────────────────────────────────────
+//
+// Validity is carried as plain DATA, computed once from spec. Conditions (status)
+// are derived from this data — we never read a condition back to compute another.
+// Each field is read + validated + USED in one place, which also produces the
+// status outcome (no separate validate-for-status vs validate-for-use path).
+
+/// The computed outcome for a single Gateway listener: validity as data, the
+/// resolved supported kinds, attached-route count (filled during route
+/// processing), and the validated+loaded certificate (the single TLS path —
+/// both the listener status and the CertStore come from `resolved_cert`).
+struct ListenerOutcome {
+    name: String,
+    /// Whether the listener's protocol is one we understand (HTTP/HTTPS/TLS).
+    /// Drives the listener `Accepted` condition.
+    protocol_supported: bool,
+    /// A requested allowedRoutes.kind invalid for the protocol → InvalidRouteKinds.
+    invalid_kind: bool,
+    /// HTTPS/TLS cert-ref failure reason, or None if it resolved (or N/A).
+    tls_failure: Option<&'static str>,
+    supported_kinds: Vec<&'static str>,
+    /// The validated cert for this listener, keyed by listener hostname ("" =
+    /// default). Some only when the cert ref resolved AND parsed. Feeds CertStore.
+    resolved_cert: Option<(String, CertKey)>,
+}
+
+/// The per-Gateway compute model: usability + per-listener outcomes. Holds the
+/// `Arc<Gateway>` so route processing can compute attachment against it.
+struct GatewayModel {
+    gw: Arc<Gateway>,
+    gen: i64,
+    /// False when the Gateway is rejected (invalid parametersRef) — it must not
+    /// serve traffic, and routes must not claim it as a parent.
+    usable: bool,
+    invalid_parameters: bool,
+    listeners: Vec<ListenerOutcome>,
+}
+
+/// CA-validation outcome for one BackendTLSPolicy (status side). The usable
+/// artifact (UpstreamTls) lives in the [`UpstreamTlsMap`], keyed by target Service.
+struct PolicyOutcome {
+    /// Whether the CA validated. Drives both Accepted and ResolvedRefs (they move
+    /// together for BackendTLSPolicy: valid CA → both True, invalid → both False).
+    resolved: bool,
+}
+
+/// (service-namespace, service-name) → resolved upstream TLS. Built once from all
+/// policies (with the conflict tiebreak applied on insert) so route resolution and
+/// policy status agree on which policy wins.
+type UpstreamTlsMap =
+    std::collections::HashMap<(String, String), crate::route_table::UpstreamTls>;
+
+/// Which API kind a deferred status patch targets (for building the right `Api<K>`).
+enum PatchTarget {
+    GatewayClass,
+    Gateway,
+    HttpRoute,
+    BackendTlsPolicy,
+}
+
+/// A status write deferred to the end of the pass. All fields owned, so the flush
+/// phase borrows nothing from the compute phase.
+struct StatusPatch {
+    target: PatchTarget,
+    ns: Option<String>,
+    name: String,
+    json: serde_json::Value,
+}
+
 impl ReconcileCtx {
-    /// Full level-triggered recompute: set all statuses and rebuild the RouteTable.
+    /// Full level-triggered recompute, in ONE pass:
+    ///   stage 1 — per-Gateway model (validity as data) + CertStore,
+    ///   stage 2 — policy CA artifacts, then routes (RouteTable + attach counts),
+    ///   stage 3 — derive Gateway/Policy/Class status from the data,
+    /// then publish the data plane and flush all status writes concurrently.
+    /// Every condition is derived from spec-computed data — never from another
+    /// condition — so the pass converges without any resync.
     async fn reconcile_all(&self) -> Result<()> {
-        // 1. GatewayClasses we own → Accepted=True.
+        let mut patches: Vec<StatusPatch> = Vec::new();
+
+        // GatewayClasses we own → Accepted=True (+ supportedFeatures).
         let owned_classes: Vec<Arc<GatewayClass>> = self
             .stores
             .gateway_classes
@@ -232,12 +315,11 @@ impl ReconcileCtx {
             .collect();
         let owned_class_names: Vec<String> =
             owned_classes.iter().map(|gc| gc.name_any()).collect();
-
         for gc in &owned_classes {
-            self.set_gatewayclass_accepted(gc).await?;
+            patches.push(self.gatewayclass_patch(gc));
         }
 
-        // 2. Gateways whose class we own → program listeners, set address + status.
+        // Gateways whose class we own.
         let gateways: Vec<Arc<Gateway>> = self
             .stores
             .gateways
@@ -246,64 +328,96 @@ impl ReconcileCtx {
             .filter(|gw| owned_class_names.contains(&gw.spec.gateway_class_name))
             .collect();
 
-        let mut route_table = RouteTable::default();
-
+        // ── Stage 1: per-Gateway model + CertStore (single TLS validate path) ──
+        let mut cert_store = CertStore::default();
+        let mut models: Vec<GatewayModel> = Vec::with_capacity(gateways.len());
         for gw in &gateways {
-            self.reconcile_gateway(gw).await?;
-        }
-
-        // 3. HTTPRoutes → resolve, set parent status, contribute to RouteTable.
-        let routes: Vec<Arc<HTTPRoute>> = self.stores.routes.state();
-        for route in &routes {
-            self.reconcile_route(route, &gateways, &mut route_table)
-                .await?;
-        }
-
-        // 4. Build the TLS cert store from owned Gateways' HTTPS listeners.
-        let cert_store = self.build_cert_store(&gateways);
-        self.certs.store(cert_store);
-
-        // 4b. Set BackendTLSPolicy status (ancestors = Gateways routing to the
-        //     target Service).
-        self.reconcile_backend_tls_policies(&gateways, &routes).await?;
-
-        // 5. Sort by Gateway API precedence, then publish the data-plane snapshot.
-        route_table.sort();
-        tracing::debug!(entries = route_table.entries.len(), "publishing route table");
-        self.shared.store(route_table);
-        Ok(())
-    }
-
-    /// Build the SNI→cert store from every owned Gateway's HTTPS/TLS-terminate
-    /// listeners whose certificate Secret resolves.
-    fn build_cert_store(&self, gateways: &[Arc<Gateway>]) -> CertStore {
-        use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
-        let mut store = CertStore::default();
-        for gw in gateways {
-            let gw_ns = gw.namespace().unwrap_or_default();
-            for l in &gw.spec.listeners {
-                if l.protocol != "HTTPS" {
-                    continue;
-                }
-                let Some(tls) = l.tls.as_ref() else { continue };
-                if matches!(tls.mode, Some(Mode::Passthrough)) {
-                    continue;
-                }
-                for r in tls.certificate_refs.clone().unwrap_or_default() {
-                    let ref_ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
-                    // Only load a cert that's actually permitted + present.
-                    if ref_ns != gw_ns && !self.secret_ref_permitted(&gw_ns, &ref_ns, &r.name) {
-                        continue;
-                    }
-                    if let Some(ck) = self.load_tls_secret(&ref_ns, &r.name) {
-                        // Key by the listener hostname; "" is the default cert.
-                        let host = l.hostname.clone().unwrap_or_default();
-                        store.insert(host, ck);
+            let model = self.build_gateway_model(gw);
+            // Only a usable Gateway contributes certs to the data plane.
+            if model.usable {
+                for l in &model.listeners {
+                    if let Some((host, ck)) = &l.resolved_cert {
+                        cert_store.insert(host.clone(), ck.clone());
                     }
                 }
             }
+            models.push(model);
         }
-        store
+
+        // ── Stage 2a: validate each policy's CA once → artifacts + status ──
+        let routes: Vec<Arc<HTTPRoute>> = self.stores.routes.state();
+        let (upstream_tls, policy_outcomes) = self.build_policy_artifacts();
+
+        // ── Stage 2b: routes → RouteTable, parent status, attachment counts ──
+        // Attachment is computed ONCE per (route, gateway, parentRef) and feeds
+        // both the data plane and the per-listener attachedRoutes counts.
+        let usable_gateways: Vec<Arc<Gateway>> = models
+            .iter()
+            .filter(|m| m.usable)
+            .map(|m| m.gw.clone())
+            .collect();
+        let mut route_table = RouteTable::default();
+        // (gw_ns, gw_name) → (listener_name → count).
+        let mut attach_counts: BTreeMap<(String, String), BTreeMap<String, i32>> =
+            BTreeMap::new();
+        for route in &routes {
+            if let Some(patch) = self.process_route(
+                route,
+                &usable_gateways,
+                &upstream_tls,
+                &mut route_table,
+                &mut attach_counts,
+            ) {
+                patches.push(patch);
+            }
+        }
+
+        // ── Stage 3: derive Gateway + Policy status from the computed data ──
+        for model in &models {
+            patches.push(self.gateway_patch(model, &attach_counts));
+        }
+        // Policy ancestors are only usable Gateways (a rejected Gateway isn't an
+        // ancestor), matching the route-attachment gating above.
+        patches.extend(self.policy_patches(&usable_gateways, &routes, &policy_outcomes));
+
+        // ── Publish the data plane FIRST (convergence shouldn't wait on the API
+        //    server), then flush all status writes concurrently. ──
+        self.certs.store(cert_store);
+        route_table.sort();
+        tracing::debug!(entries = route_table.entries.len(), "publishing route table");
+        self.shared.store(route_table);
+
+        self.flush_status(patches).await
+    }
+
+    /// Write all accumulated status patches concurrently. Fails fast on the first
+    /// non-404 error (404 = object deleted mid-pass, tolerated in `patch_status`).
+    async fn flush_status(&self, patches: Vec<StatusPatch>) -> Result<()> {
+        let futs = patches.into_iter().map(|p| self.apply_patch(p));
+        futures::future::try_join_all(futs).await?;
+        Ok(())
+    }
+
+    /// Apply one deferred status patch, building the right typed `Api` for its kind.
+    async fn apply_patch(&self, p: StatusPatch) -> Result<()> {
+        let ns = p.ns.unwrap_or_default();
+        match p.target {
+            PatchTarget::GatewayClass => {
+                self.patch_status(&self.gc_api, &p.name, p.json).await
+            }
+            PatchTarget::Gateway => {
+                let api: Api<Gateway> = Api::namespaced(self.client.clone(), &ns);
+                self.patch_status(&api, &p.name, p.json).await
+            }
+            PatchTarget::HttpRoute => {
+                let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), &ns);
+                self.patch_status(&api, &p.name, p.json).await
+            }
+            PatchTarget::BackendTlsPolicy => {
+                let api: Api<BackendTLSPolicy> = Api::namespaced(self.client.clone(), &ns);
+                self.patch_status(&api, &p.name, p.json).await
+            }
+        }
     }
 
     /// Load a kubernetes.io/tls Secret's cert+key (tls.crt / tls.key) as PEM.
@@ -320,7 +434,7 @@ impl ReconcileCtx {
         })
     }
 
-    async fn set_gatewayclass_accepted(&self, gc: &GatewayClass) -> Result<()> {
+    fn gatewayclass_patch(&self, gc: &GatewayClass) -> StatusPatch {
         let gen = gc.meta().generation.unwrap_or(0);
         let status = GatewayClassStatus {
             conditions: Some(vec![condition("Accepted", "True", "Accepted", gen)]),
@@ -331,80 +445,57 @@ impl ReconcileCtx {
                     .collect(),
             ),
         };
-        self.patch_status(&self.gc_api, &gc.name_any(), serde_json::json!({ "status": status }))
-            .await
+        StatusPatch {
+            target: PatchTarget::GatewayClass,
+            ns: None,
+            name: gc.name_any(),
+            json: serde_json::json!({ "status": status }),
+        }
     }
 
-    /// Program a Gateway: all listeners Accepted/Programmed/ResolvedRefs=True,
-    /// top-level Accepted/Programmed=True, and a status address.
-    async fn reconcile_gateway(&self, gw: &Gateway) -> Result<()> {
+    /// STAGE 1: build the per-Gateway compute model — usability + per-listener
+    /// outcomes (validity as data) + the validated cert. No status is read here;
+    /// no status is written here. The cert is loaded ONCE (used for both the
+    /// listener status and the CertStore).
+    fn build_gateway_model(&self, gw: &Gateway) -> GatewayModel {
         let gen = gw.meta().generation.unwrap_or(0);
-        let ns = gw.namespace().unwrap_or_default();
 
-        // Count routes attached to each listener (for attachedRoutes).
-        let attached = self.count_attached_routes(gw);
+        // An invalid/unsupported `spec.infrastructure.parametersRef` makes the
+        // whole Gateway unacceptable (Accepted=False/InvalidParameters) and unusable.
+        // We support no parametersRef kinds, so *any* reference is invalid.
+        let invalid_parameters = gw
+            .spec
+            .infrastructure
+            .as_ref()
+            .and_then(|i| i.parameters_ref.as_ref())
+            .is_some();
 
-        let listeners: Vec<GatewayStatusListeners> = gw
+        let listeners: Vec<ListenerOutcome> = gw
             .spec
             .listeners
             .iter()
-            .map(|l| {
-                self.listener_status(l, gw, gen, *attached.get(&l.name).unwrap_or(&0))
-            })
+            .map(|l| self.listener_outcome(l, gw))
             .collect();
 
-        // Derive Gateway-level conditions from listener state.
-        let listener_accepted = |l: &GatewayStatusListeners| {
-            l.conditions
-                .iter()
-                .any(|c| c.type_ == "Accepted" && c.status == "True")
-        };
-        let any_accepted = listeners.iter().any(listener_accepted);
-        let all_accepted = listeners.iter().all(listener_accepted);
-        let all_programmed = listeners.iter().all(|l| {
-            l.conditions
-                .iter()
-                .any(|c| c.type_ == "Programmed" && c.status == "True")
-        });
-
-        // Accepted: True if ≥1 listener is accepted; reason ListenersNotValid when
-        // any listener is invalid (per the conformance spec), else Accepted.
-        let accepted = if any_accepted {
-            let reason = if all_accepted { "Accepted" } else { "ListenersNotValid" };
-            condition("Accepted", "True", reason, gen)
-        } else {
-            condition("Accepted", "False", "ListenersNotValid", gen)
-        };
-        let programmed = if all_programmed && any_accepted {
-            condition("Programmed", "True", "Programmed", gen)
-        } else {
-            condition("Programmed", "False", "Invalid", gen)
-        };
-
-        let status = GatewayStatus {
-            addresses: Some(vec![GatewayStatusAddresses {
-                r#type: Some("IPAddress".into()),
-                value: self.config.advertise_address.clone(),
-            }]),
-            conditions: Some(vec![accepted, programmed]),
-            listeners: Some(listeners),
-            attached_listener_sets: None,
-        };
-
-        let api: Api<Gateway> = Api::namespaced(self.client.clone(), &ns);
-        self.patch_status(&api, &gw.name_any(), serde_json::json!({ "status": status }))
-            .await
+        GatewayModel {
+            gw: Arc::new(gw.clone()),
+            gen,
+            usable: !invalid_parameters,
+            invalid_parameters,
+            listeners,
+        }
     }
 
-    /// Compute the status for one listener: Accepted/Programmed/ResolvedRefs
-    /// conditions and the resolved supportedKinds.
-    fn listener_status(
+    /// Compute one listener's outcome: validity as data + supportedKinds + the
+    /// validated+loaded certificate. This is the single TLS code path — it both
+    /// decides the listener's ResolvedRefs status AND produces the cert the data
+    /// plane will serve. A cert that fails to parse is neither served nor reported
+    /// as resolved.
+    fn listener_outcome(
         &self,
         l: &gateway_api::apis::standard::gateways::GatewayListeners,
         gw: &Gateway,
-        gen: i64,
-        attached_routes: i32,
-    ) -> GatewayStatusListeners {
+    ) -> ListenerOutcome {
         // Which route kinds are valid for this listener's protocol.
         let protocol_kinds: &[&str] = match l.protocol.as_str() {
             "HTTP" | "HTTPS" => &["HTTPRoute"],
@@ -413,117 +504,193 @@ impl ReconcileCtx {
         };
 
         // Reconcile requested allowedRoutes.kinds against the protocol's valid set.
-        // Any requested kind not valid → ResolvedRefs=False, InvalidRouteKinds, and
-        // it is dropped from supportedKinds.
+        // Any requested kind not valid → InvalidRouteKinds, dropped from supportedKinds.
         let mut invalid_kind = false;
-        let supported: Vec<&str> = match l.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref()) {
-            Some(requested) => requested
-                .iter()
-                .filter_map(|k| {
-                    match protocol_kinds.iter().find(|p| **p == k.kind) {
+        let supported_kinds: Vec<&'static str> =
+            match l.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref()) {
+                Some(requested) => requested
+                    .iter()
+                    .filter_map(|k| match protocol_kinds.iter().find(|p| **p == k.kind) {
                         Some(p) => Some(*p),
                         None => {
                             invalid_kind = true;
                             None
                         }
-                    }
-                })
-                .collect(),
-            None => protocol_kinds.to_vec(),
-        };
+                    })
+                    .collect(),
+                None => protocol_kinds.to_vec(),
+            };
 
-        let supported_kinds: Vec<GatewayStatusListenersSupportedKinds> = supported
-            .iter()
-            .map(|k| GatewayStatusListenersSupportedKinds {
-                group: Some("gateway.networking.k8s.io".into()),
-                kind: k.to_string(),
-            })
-            .collect();
-
-        // Is the listener's protocol one we support?
         let protocol_supported = matches!(l.protocol.as_str(), "HTTP" | "HTTPS" | "TLS");
 
-        // For HTTPS/TLS listeners, the certificate ref(s) must resolve (and any
-        // cross-namespace ref must be permitted by a ReferenceGrant).
-        let tls_failure = self.listener_tls_failure(l, gw);
-        let tls_ok = tls_failure.is_none();
+        // Validate + load the cert once: (tls_failure, resolved_cert).
+        let (tls_failure, resolved_cert) = self.listener_cert(l, gw);
 
-        let accepted = if !protocol_supported {
-            condition("Accepted", "False", "UnsupportedProtocol", gen)
-        } else {
-            condition("Accepted", "True", "Accepted", gen)
-        };
-
-        // ResolvedRefs failure precedence: InvalidRouteKinds, then TLS ref issue.
-        let resolved = if invalid_kind {
-            condition("ResolvedRefs", "False", "InvalidRouteKinds", gen)
-        } else if let Some(reason) = tls_failure {
-            condition("ResolvedRefs", "False", reason, gen)
-        } else {
-            condition("ResolvedRefs", "True", "ResolvedRefs", gen)
-        };
-
-        // Programmed requires the listener to be acceptable and refs resolved.
-        let programmed = if protocol_supported && tls_ok && !invalid_kind {
-            condition("Programmed", "True", "Programmed", gen)
-        } else {
-            condition("Programmed", "False", "Invalid", gen)
-        };
-
-        GatewayStatusListeners {
+        ListenerOutcome {
             name: l.name.clone(),
-            attached_routes,
-            supported_kinds: Some(supported_kinds),
-            conditions: vec![accepted, programmed, resolved],
+            protocol_supported,
+            invalid_kind,
+            tls_failure,
+            supported_kinds,
+            resolved_cert,
         }
     }
 
-    /// Check an HTTPS/TLS listener's certificate references. Returns None if they
-    /// resolve, or the ResolvedRefs failure reason:
-    /// - `RefNotPermitted`: cross-namespace cert Secret without a ReferenceGrant.
-    /// - `InvalidCertificateRef`: missing Secret, non-Secret kind, or no cert at all.
-    fn listener_tls_failure(
+    /// The single read+validate+use path for an HTTPS/TLS listener's certificate
+    /// ref. Returns `(failure_reason, loaded_cert)`:
+    /// - `(None, Some((host, cert)))` — resolved + parsed; serve it (host "" = default).
+    /// - `(None, None)` — N/A (non-TLS protocol, or passthrough needs no cert).
+    /// - `(Some(reason), None)` — RefNotPermitted (cross-ns w/o grant) or
+    ///   InvalidCertificateRef (missing/wrong-kind/malformed). Not served.
+    fn listener_cert(
         &self,
         l: &gateway_api::apis::standard::gateways::GatewayListeners,
         gw: &Gateway,
-    ) -> Option<&'static str> {
+    ) -> (Option<&'static str>, Option<(String, CertKey)>) {
         if !matches!(l.protocol.as_str(), "HTTPS" | "TLS") {
-            return None;
+            return (None, None);
         }
         use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
-        // HTTPS/TLS listener with no tls block can't resolve a cert.
         let Some(tls) = l.tls.as_ref() else {
-            return Some("InvalidCertificateRef");
+            return (Some("InvalidCertificateRef"), None);
         };
+        let passthrough = matches!(tls.mode, Some(Mode::Passthrough));
         let refs = tls.certificate_refs.clone().unwrap_or_default();
         if refs.is_empty() {
-            return if matches!(tls.mode, Some(Mode::Passthrough)) {
-                None // passthrough needs no cert
+            // Passthrough needs no cert; terminate without one is invalid.
+            return if passthrough {
+                (None, None)
             } else {
-                Some("InvalidCertificateRef")
+                (Some("InvalidCertificateRef"), None)
             };
         }
         let gw_ns = gw.namespace().unwrap_or_default();
+        // Key by the listener hostname; "" is the default cert.
+        let host = l.hostname.clone().unwrap_or_default();
+        let mut loaded: Option<(String, CertKey)> = None;
         for r in &refs {
             // Only core Secrets are valid cert refs.
             let group = r.group.clone().unwrap_or_default();
             let kind = r.kind.clone().unwrap_or_else(|| "Secret".into());
             if !group.is_empty() || kind != "Secret" {
-                return Some("InvalidCertificateRef");
+                return (Some("InvalidCertificateRef"), None);
             }
             let ref_ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
-            // Cross-namespace cert Secret requires a permitting ReferenceGrant
-            // (from Gateway in gw_ns → to Secret in ref_ns).
+            // Cross-namespace cert Secret requires a permitting ReferenceGrant.
             if ref_ns != gw_ns && !self.secret_ref_permitted(&gw_ns, &ref_ns, &r.name) {
-                return Some("RefNotPermitted");
+                return (Some("RefNotPermitted"), None);
             }
             // The Secret must exist AND contain a valid tls.crt + tls.key.
             match self.load_tls_secret(&ref_ns, &r.name) {
-                Some(ck) if cert_key_is_valid(&ck) => {}
-                _ => return Some("InvalidCertificateRef"),
+                Some(ck) if cert_key_is_valid(&ck) => {
+                    // First valid cert is the one we serve for this listener host.
+                    loaded.get_or_insert((host.clone(), ck));
+                }
+                _ => return (Some("InvalidCertificateRef"), None),
             }
         }
-        None
+        (None, loaded)
+    }
+
+    /// STAGE 3: derive a Gateway's status from its computed model + attachment
+    /// counts. Conditions come from `ListenerOutcome` DATA, never from conditions.
+    fn gateway_patch(
+        &self,
+        model: &GatewayModel,
+        attach_counts: &BTreeMap<(String, String), BTreeMap<String, i32>>,
+    ) -> StatusPatch {
+        let gw = &model.gw;
+        let gen = model.gen;
+        let ns = gw.namespace().unwrap_or_default();
+        let counts = attach_counts.get(&(ns.clone(), gw.name_any()));
+
+        // Per-listener status, derived from each ListenerOutcome.
+        let listeners: Vec<GatewayStatusListeners> = model
+            .listeners
+            .iter()
+            .map(|o| {
+                let attached_routes = counts
+                    .and_then(|c| c.get(&o.name).copied())
+                    .unwrap_or(0);
+                let accepted = if !o.protocol_supported {
+                    condition("Accepted", "False", "UnsupportedProtocol", gen)
+                } else {
+                    condition("Accepted", "True", "Accepted", gen)
+                };
+                // ResolvedRefs precedence: InvalidRouteKinds, then TLS ref issue.
+                let resolved = if o.invalid_kind {
+                    condition("ResolvedRefs", "False", "InvalidRouteKinds", gen)
+                } else if let Some(reason) = o.tls_failure {
+                    condition("ResolvedRefs", "False", reason, gen)
+                } else {
+                    condition("ResolvedRefs", "True", "ResolvedRefs", gen)
+                };
+                let programmed =
+                    if o.protocol_supported && o.tls_failure.is_none() && !o.invalid_kind {
+                        condition("Programmed", "True", "Programmed", gen)
+                    } else {
+                        condition("Programmed", "False", "Invalid", gen)
+                    };
+                GatewayStatusListeners {
+                    name: o.name.clone(),
+                    attached_routes,
+                    supported_kinds: Some(
+                        o.supported_kinds
+                            .iter()
+                            .map(|k| GatewayStatusListenersSupportedKinds {
+                                group: Some("gateway.networking.k8s.io".into()),
+                                kind: k.to_string(),
+                            })
+                            .collect(),
+                    ),
+                    conditions: vec![accepted, programmed, resolved],
+                }
+            })
+            .collect();
+
+        // Gateway-level conditions from the OUTCOME DATA (not from the listener
+        // conditions above). Listener Accepted depends on protocol_supported alone;
+        // invalid_kind/tls_failure affect ResolvedRefs/Programmed, not Accepted.
+        let conditions = if model.invalid_parameters {
+            vec![
+                condition("Accepted", "False", "InvalidParameters", gen),
+                condition("Programmed", "False", "InvalidParameters", gen),
+            ]
+        } else {
+            let any_accepted = model.listeners.iter().any(|o| o.protocol_supported);
+            let all_accepted = model.listeners.iter().all(|o| o.protocol_supported);
+            let all_programmed = model.listeners.iter().all(|o| {
+                o.protocol_supported && o.tls_failure.is_none() && !o.invalid_kind
+            });
+            let accepted = if any_accepted {
+                let reason = if all_accepted { "Accepted" } else { "ListenersNotValid" };
+                condition("Accepted", "True", reason, gen)
+            } else {
+                condition("Accepted", "False", "ListenersNotValid", gen)
+            };
+            let programmed = if all_programmed && any_accepted {
+                condition("Programmed", "True", "Programmed", gen)
+            } else {
+                condition("Programmed", "False", "Invalid", gen)
+            };
+            vec![accepted, programmed]
+        };
+
+        let status = GatewayStatus {
+            addresses: Some(vec![GatewayStatusAddresses {
+                r#type: Some("IPAddress".into()),
+                value: self.config.advertise_address.clone(),
+            }]),
+            conditions: Some(conditions),
+            listeners: Some(listeners),
+            attached_listener_sets: None,
+        };
+        StatusPatch {
+            target: PatchTarget::Gateway,
+            ns: Some(ns),
+            name: gw.name_any(),
+            json: serde_json::json!({ "status": status }),
+        }
     }
 
     /// Is a cross-namespace cert Secret ref (Gateway in `from_ns` → Secret
@@ -550,39 +717,18 @@ impl ReconcileCtx {
     }
 
 
-    /// How many routes are actually attached to each listener of this gateway,
-    /// using the same attachment rules as reconcile (sectionName, allowedRoutes,
-    /// hostname, kind).
-    fn count_attached_routes(&self, gw: &Gateway) -> BTreeMap<String, i32> {
-        let gw_name = gw.name_any();
-        let gw_ns = gw.namespace().unwrap_or_default();
-        let mut counts: BTreeMap<String, i32> = BTreeMap::new();
-        for l in &gw.spec.listeners {
-            counts.insert(l.name.clone(), 0);
-        }
-        for route in self.stores.routes.state() {
-            let route_ns = route.namespace().unwrap_or_default();
-            for pref in route.spec.parent_refs.clone().unwrap_or_default() {
-                let pns = pref.namespace.as_deref().unwrap_or(&route_ns);
-                if pref.name != gw_name || pns != gw_ns {
-                    continue;
-                }
-                let (attached, _) = self.attached_listeners(&route, gw, &pref);
-                for l in attached {
-                    *counts.entry(l.name.clone()).or_insert(0) += 1;
-                }
-            }
-        }
-        counts
-    }
-
-    /// Resolve a route's backends, set its parent status, and add it to the table.
-    async fn reconcile_route(
+    /// STAGE 2b: resolve a route's backends, build its RouteEntries, count its
+    /// attachment per listener, and produce its parent status patch (or None if it
+    /// has no parent we own). Attachment is computed ONCE here and used for both
+    /// routing and the `attachedRoutes` counts (written into `attach_counts`).
+    fn process_route(
         &self,
         route: &HTTPRoute,
         gateways: &[Arc<Gateway>],
+        upstream_tls: &UpstreamTlsMap,
         table: &mut RouteTable,
-    ) -> Result<()> {
+        attach_counts: &mut BTreeMap<(String, String), BTreeMap<String, i32>>,
+    ) -> Option<StatusPatch> {
         let gen = route.meta().generation.unwrap_or(0);
         let route_ns = route.namespace().unwrap_or_default();
 
@@ -590,20 +736,32 @@ impl ReconcileCtx {
 
         let parent_refs = route.spec.parent_refs.clone().unwrap_or_default();
         for pref in &parent_refs {
-            // Find the parent Gateway among the ones we own.
+            // Find the parent Gateway among the usable ones we own.
             let parent_ns = pref.namespace.clone().unwrap_or_else(|| route_ns.clone());
             let Some(gw) = gateways
                 .iter()
                 .find(|g| g.name_any() == pref.name && g.namespace().unwrap_or_default() == parent_ns)
             else {
-                continue; // not ours / not found — skip (don't claim parent status)
+                continue; // not ours / not found / not usable — don't claim status
             };
 
             // Determine which of the Gateway's listeners this route attaches to,
             // honoring sectionName, port, allowedRoutes (namespaces + kinds), and
             // listener hostname. Returns the attached listeners and, if none, the
-            // Accepted=False reason.
+            // Accepted=False reason. Computed ONCE; drives both counts and routing.
             let (attached_listeners, accept_reason) = self.attached_listeners(route, gw, pref);
+
+            // attachedRoutes counts: ensure every listener has a 0 entry, then
+            // increment the ones this route attached to.
+            let gw_counts = attach_counts
+                .entry((parent_ns.clone(), gw.name_any()))
+                .or_default();
+            for l in &gw.spec.listeners {
+                gw_counts.entry(l.name.clone()).or_insert(0);
+            }
+            for l in &attached_listeners {
+                *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
+            }
 
             let accepted = match accept_reason {
                 None => condition("Accepted", "True", "Accepted", gen),
@@ -651,9 +809,10 @@ impl ReconcileCtx {
                         // endpoints, the ref is resolved; an empty backend yields a
                         // 503 at traffic time, not BackendNotFound.
                         Some(mut endpoints) => {
-                            // Apply a matching BackendTLSPolicy (re-encrypt to backend).
+                            // Apply a matching BackendTLSPolicy (re-encrypt to backend),
+                            // looked up from the pre-built artifact map.
                             if let Some(tls) =
-                                self.backend_tls_for(&bns, &backend_ref.name, svc_port)
+                                upstream_tls.get(&(bns.clone(), backend_ref.name.clone()))
                             {
                                 for ep in &mut endpoints {
                                     ep.tls = Some(tls.clone());
@@ -756,13 +915,16 @@ impl ReconcileCtx {
         }
 
         if parents.is_empty() {
-            return Ok(()); // nothing of ours to claim
+            return None; // nothing of ours to claim
         }
 
         let status = HttpRouteStatus { parents };
-        let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), &route_ns);
-        self.patch_status(&api, &route.name_any(), serde_json::json!({ "status": status }))
-            .await
+        Some(StatusPatch {
+            target: PatchTarget::HttpRoute,
+            ns: Some(route_ns),
+            name: route.name_any(),
+            json: serde_json::json!({ "status": status }),
+        })
     }
 
     /// Compute which of a Gateway's listeners an HTTPRoute attaches to.
@@ -902,31 +1064,108 @@ impl ReconcileCtx {
             })
     }
 
-    /// Set status on every BackendTLSPolicy: one ancestor per Gateway that has a
-    /// route to the policy's target Service, with Accepted + ResolvedRefs.
-    async fn reconcile_backend_tls_policies(
+    /// STAGE 2a: validate every BackendTLSPolicy's CA ONCE, producing both:
+    ///   - the [`UpstreamTlsMap`] artifact (keyed by target Service) the data plane
+    ///     uses to re-encrypt, and
+    ///   - a per-policy [`PolicyOutcome`] (the validated status), keyed by (ns, name).
+    /// The conflict tiebreak (oldest creationTimestamp, then name) is applied while
+    /// building the map, so the use-side and the status-side agree on which policy
+    /// wins for a given Service.
+    fn build_policy_artifacts(
+        &self,
+    ) -> (UpstreamTlsMap, BTreeMap<(String, String), PolicyOutcome>) {
+        let mut artifacts: UpstreamTlsMap = UpstreamTlsMap::new();
+        let mut outcomes: BTreeMap<(String, String), PolicyOutcome> = BTreeMap::new();
+
+        // Sort policies by the conflict tiebreak so the FIRST one to claim a given
+        // (svc_ns, svc_name) in the artifact map is the winner.
+        let mut policies = self.stores.backend_tls_policies.state();
+        policies.sort_by_key(|p| {
+            (
+                p.meta().creation_timestamp.as_ref().map(|t| t.0.as_second()).unwrap_or(0),
+                p.name_any(),
+            )
+        });
+
+        for policy in &policies {
+            let pol_ns = policy.namespace().unwrap_or_default();
+            // Resolve+validate the CA bundle ONCE: Some(ca_pem) if valid, else None.
+            let ca = self.resolve_policy_ca(policy, &pol_ns);
+            let resolved = ca.is_some();
+            outcomes.insert(
+                (pol_ns.clone(), policy.name_any()),
+                PolicyOutcome { resolved },
+            );
+
+            // Only a valid policy contributes a usable upstream-TLS artifact.
+            let Some(ca_pem) = ca else { continue };
+            let hostname = policy.spec.validation.hostname.clone();
+            for t in &policy.spec.target_refs {
+                if !t.group.is_empty() || t.kind != "Service" {
+                    continue;
+                }
+                // First valid policy for this Service wins (policies are sorted).
+                artifacts
+                    .entry((pol_ns.clone(), t.name.clone()))
+                    .or_insert_with(|| crate::route_table::UpstreamTls {
+                        hostname: hostname.clone(),
+                        ca_pem: ca_pem.clone(),
+                    });
+            }
+        }
+        (artifacts, outcomes)
+    }
+
+    /// Resolve + validate a policy's CA bundle. Returns the concatenated CA PEM if
+    /// valid (empty for wellKnownCACertificates=System → use system roots), or None
+    /// if any CA ref is the wrong kind, missing, or unparseable. This is the single
+    /// CA validation path — both the artifact and the status derive from it.
+    fn resolve_policy_ca(&self, policy: &BackendTLSPolicy, pol_ns: &str) -> Option<Vec<u8>> {
+        let v = &policy.spec.validation;
+        match &v.ca_certificate_refs {
+            None => {
+                // No explicit CA refs: valid only if it uses well-known CAs.
+                if v.well_known_ca_certificates.is_some() {
+                    Some(Vec::new()) // system roots
+                } else {
+                    None
+                }
+            }
+            Some(refs) => {
+                let mut pem = Vec::new();
+                for r in refs {
+                    if !r.group.is_empty() || r.kind != "ConfigMap" {
+                        return None;
+                    }
+                    let bytes = self.load_configmap_ca(pol_ns, &r.name)?;
+                    if !ca_pem_is_valid(&bytes) {
+                        return None;
+                    }
+                    pem.extend_from_slice(&bytes);
+                    pem.push(b'\n');
+                }
+                Some(pem)
+            }
+        }
+    }
+
+    /// STAGE 3: build each BackendTLSPolicy's status patch. Ancestors are derived
+    /// from raw route + gateway SPECS (never from route outcomes — that would make
+    /// policy status depend on route processing and create a cycle). The per-policy
+    /// Accepted/ResolvedRefs come from the already-computed [`PolicyOutcome`].
+    fn policy_patches(
         &self,
         gateways: &[Arc<Gateway>],
         routes: &[Arc<HTTPRoute>],
-    ) -> Result<()> {
+        outcomes: &BTreeMap<(String, String), PolicyOutcome>,
+    ) -> Vec<StatusPatch> {
+        let mut patches = Vec::new();
         for policy in self.stores.backend_tls_policies.state() {
             let gen = policy.meta().generation.unwrap_or(0);
             let pol_ns = policy.namespace().unwrap_or_default();
-
-            // Validate CA refs → ResolvedRefs reason. The CA ConfigMap must exist,
-            // be a core ConfigMap, and contain a parseable ca.crt PEM.
-            let v = &policy.spec.validation;
-            let refs_ok = match &v.ca_certificate_refs {
-                None => v.well_known_ca_certificates.is_some(),
-                Some(refs) => refs.iter().all(|r| {
-                    r.group.is_empty()
-                        && r.kind == "ConfigMap"
-                        && self
-                            .load_configmap_ca(&pol_ns, &r.name)
-                            .map(|pem| ca_pem_is_valid(&pem))
-                            .unwrap_or(false)
-                }),
-            };
+            let outcome = outcomes
+                .get(&(pol_ns.clone(), policy.name_any()));
+            let refs_ok = outcome.map(|o| o.resolved).unwrap_or(false);
             let (resolved, accepted) = if refs_ok {
                 (
                     condition("ResolvedRefs", "True", "ResolvedRefs", gen),
@@ -981,66 +1220,14 @@ impl ReconcileCtx {
                 continue; // no ancestor → don't claim status
             }
             let status = BackendTlsPolicyStatus { ancestors };
-            let api: Api<BackendTLSPolicy> = Api::namespaced(self.client.clone(), &pol_ns);
-            self.patch_status(&api, &policy.name_any(), serde_json::json!({ "status": status }))
-                .await?;
+            patches.push(StatusPatch {
+                target: PatchTarget::BackendTlsPolicy,
+                ns: Some(pol_ns),
+                name: policy.name_any(),
+                json: serde_json::json!({ "status": status }),
+            });
         }
-        Ok(())
-    }
-
-    /// Find the effective BackendTLSPolicy for a Service port and resolve it to
-    /// an [`UpstreamTls`] (SNI hostname + CA bundle). Returns None if no valid
-    /// policy targets the Service. On conflict, the oldest/alphabetically-first
-    /// policy wins.
-    fn backend_tls_for(
-        &self,
-        svc_ns: &str,
-        svc_name: &str,
-        _svc_port: u16,
-    ) -> Option<crate::route_table::UpstreamTls> {
-        let mut matching: Vec<Arc<BackendTLSPolicy>> = self
-            .stores
-            .backend_tls_policies
-            .state()
-            .into_iter()
-            .filter(|p| {
-                p.namespace().as_deref() == Some(svc_ns)
-                    && p.spec.target_refs.iter().any(|t| {
-                        t.group.is_empty() && t.kind == "Service" && t.name == svc_name
-                    })
-            })
-            .collect();
-        // Conflict resolution: oldest creationTimestamp, then name.
-        matching.sort_by_key(|p| {
-            (
-                p.meta().creation_timestamp.as_ref().map(|t| t.0.as_second()).unwrap_or(0),
-                p.name_any(),
-            )
-        });
-        let policy = matching.into_iter().next()?;
-        let v = &policy.spec.validation;
-        // Resolve the CA bundle. wellKnownCACertificates=System → empty (use roots).
-        let ca_pem = if let Some(refs) = &v.ca_certificate_refs {
-            let mut pem = Vec::new();
-            for r in refs {
-                if !r.group.is_empty() || r.kind != "ConfigMap" {
-                    return None; // InvalidKind → no valid CA
-                }
-                let bytes = self.load_configmap_ca(svc_ns, &r.name)?;
-                if !ca_pem_is_valid(&bytes) {
-                    return None; // invalid CA → no usable upstream TLS
-                }
-                pem.extend_from_slice(&bytes);
-                pem.push(b'\n');
-            }
-            pem
-        } else {
-            Vec::new() // System CAs
-        };
-        Some(crate::route_table::UpstreamTls {
-            hostname: v.hostname.clone(),
-            ca_pem,
-        })
+        patches
     }
 
     /// Read a CA bundle (ca.crt) from a ConfigMap.
