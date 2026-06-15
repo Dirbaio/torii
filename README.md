@@ -44,24 +44,30 @@ See the modules in [lolgateway/src/](lolgateway/src/).
 
 ### Conformance results
 
-Running each in-scope test individually (`hack/run-tests.sh`), the implemented features
-pass. A full serial run of ~68 in-scope tests lands at **63 passed** with these caveats,
-all investigated:
+The full `GATEWAY-HTTP` profile passes cleanly:
 
-- 3 `HTTPRouteRetry*` failures are **out of scope** — `retry` is an experimental-channel
-  feature (not in the standard CRDs / GATEWAY-HTTP profile); they were only swept in by a
-  too-broad test list.
-- `HTTPRouteInvalidReferenceGrant` **passes in isolation**; its serial-run failure is
-  test-isolation contamination (a valid ReferenceGrant left in the cluster by the preceding
-  `HTTPRouteReferenceGrant` test, which the controller correctly honors).
-- `BackendTLSPolicy` passes 4/5 sub-cases; the `ConfigMap`-content-reconcile sub-case is
-  timing-sensitive under cluster/API load (every individual transition — valid→Accepted,
-  invalid→False, create-CM→Accepted, with correct reasons and `observedGeneration` — is
-  verified correct via direct reproduction, but the test's rapid multi-step polling can
-  outrun convergence when the API server is slow).
+```
+go test ./conformance -run TestConformance -count=1 \
+  -args --gateway-class=gateway-conformance \
+  --conformance-profiles=GATEWAY-HTTP --allow-crds-mismatch
+```
 
-Run tests one at a time against the cluster — running two conformance tests concurrently
-makes them fight over the shared base resources and fail spuriously.
+→ **405 passed, 0 failed, 87 skipped.** The 87 skips are out-of-scope features we don't
+report in `supportedFeatures` (UDP/TCP/gRPC routes, retries, ListenerSet, static
+addresses, frontend client-cert validation, mesh, h2c, TLSRoute). Everything we declare
+support for passes — including TLS termination (HTTPS listeners, per-SNI certs,
+cross-namespace cert ReferenceGrants) and the full BackendTLSPolicy surface (re-encrypt,
+invalid-CA/invalid-kind → 5xx, and conflict resolution).
+
+Notes:
+- Use the `GATEWAY-HTTP` profile only. The `GATEWAY-TLS` profile forces its Core tests —
+  including `TLSRoute` — to run regardless of `supportedFeatures`, and TLSRoute (L4
+  passthrough) is out of scope (see below). TLS *termination* is exercised within
+  `GATEWAY-HTTP` via `supportedFeatures`.
+- Always pass `-count=1`: `go test` caches results, and a cached pass returns in ~20s
+  without re-running against the cluster.
+- Run one conformance invocation at a time — two at once fight over the shared base
+  resources and fail spuriously.
 
 ### Not yet implemented: TLSRoute (TLS passthrough)
 
