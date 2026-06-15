@@ -64,8 +64,11 @@ conformance +tests:
     bash hack/run-tests.sh {{tests}}
 
 # Run the whole GATEWAY-HTTP profile (controller must be running).
+# -count=1 bypasses go's test cache (a cached run returns "ok" in ~20s WITHOUT
+# actually re-testing against the cluster). GATEWAY-HTTP only: the GATEWAY-TLS
+# profile forces out-of-scope TLSRoute core tests; TLS termination is covered here.
 conformance-all:
-    cd gateway-api && go test ./conformance -run TestConformance -timeout 30m -args \
+    cd gateway-api && go test ./conformance -run TestConformance -count=1 -timeout 30m -args \
       --gateway-class=gateway-conformance \
       --conformance-profiles=GATEWAY-HTTP \
       --allow-crds-mismatch
