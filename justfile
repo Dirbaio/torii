@@ -25,7 +25,7 @@ check:
 # Run the controller + proxy. HTTP listeners on 80/8080/8090, HTTPS (TLS-terminate,
 # per-SNI cert) on 443. Requires `sudo sysctl net.ipv4.ip_unprivileged_port_start=80`.
 run:
-    cargo run -- run --bind-ip 0.0.0.0 --http-ports 80,8080,8090 --tls-ports 443 --advertise 127.0.0.1
+    cargo run -- run --bind-ip 0.0.0.0 --http-ports 80,8080,8090 --tls-ports 443,8443,8883 --advertise 127.0.0.1
 
 # Create the local kind cluster and make Pod/Service CIDRs host-routable.
 cluster-up:

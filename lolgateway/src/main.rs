@@ -15,6 +15,8 @@ mod controller;
 mod dataplane;
 mod route_table;
 mod snapshot;
+mod tls_sni;
+mod tls_table;
 
 /// lolgateway: a Kubernetes Gateway API controller built on Pingora.
 #[derive(Parser, Debug)]
@@ -51,12 +53,15 @@ struct RunArgs {
     )]
     http_ports: Vec<u16>,
 
-    /// HTTPS listener ports (TLS terminated, cert selected by SNI).
+    /// TLS listener ports. Each runs the SNI-dispatch app: TLSRoute passthrough /
+    /// terminate-to-TCP per SNI, falling back to TLS-terminate + HTTP (HTTPS
+    /// HTTPRoutes) when no TLSRoute matches. Includes the conformance TLSRoute
+    /// ports (8443, 8883) alongside the standard 443.
     #[arg(
         long,
         env = "LOLGATEWAY_TLS_PORTS",
         value_delimiter = ',',
-        default_value = "443"
+        default_value = "443,8443,8883"
     )]
     tls_ports: Vec<u16>,
 

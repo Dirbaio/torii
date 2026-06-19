@@ -8,14 +8,17 @@
 //! runtime, so this runs on a dedicated OS thread, separate from the kube
 //! controller's runtime. They share state only through the [`DataPlane`] snapshot.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use pingora_core::prelude::*;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
-use pingora_proxy::{http_proxy_service, ProxyHttp, Session};
+use pingora_proxy::{http_proxy, http_proxy_service, ProxyHttp, Session};
 
 use crate::route_table::{BackendTls, Endpoint, Filters, HeaderMods};
 use crate::snapshot::DataPlane;
+use crate::tls_table::TlsDecision;
 
 /// The proxy. Holds the shared snapshot handle.
 pub struct GatewayProxy {
@@ -562,9 +565,321 @@ fn install_cert(ssl: &mut pingora_core::tls::ssl::SslRef, ck: &crate::cert_store
     }
 }
 
-/// Run the Pingora proxy server: `http_ports` get plain-TCP listeners, `tls_ports`
-/// get HTTPS listeners that terminate TLS using SNI-selected certs from the
-/// snapshot's cert store.
+/// A newtype that re-exposes a boxed [`pingora_core::protocols::Stream`]
+/// (`Box<dyn IO>`) as a concrete `S: IO`.
+///
+/// Pingora's `handshake_with_callback<S: IO>` and `ServerSession::new_http1` take
+/// a generic `S: IO` / a `Stream`, but `Box<dyn IO>` does not itself implement the
+/// `IO` supertraits, so it can't be passed where `S: IO` is required. This wrapper
+/// delegates every supertrait method to the inner trait object; the blanket
+/// `impl IO for T` in pingora then applies to `BoxedStream` automatically.
+#[derive(Debug)]
+struct BoxedStream(pingora_core::protocols::Stream);
+
+impl tokio::io::AsyncRead for BoxedStream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.0).poll_read(cx, buf)
+    }
+}
+
+impl tokio::io::AsyncWrite for BoxedStream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.0).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.0).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.0).poll_shutdown(cx)
+    }
+}
+
+#[async_trait]
+impl pingora_core::protocols::Shutdown for BoxedStream {
+    async fn shutdown(&mut self) {
+        self.0.shutdown().await
+    }
+}
+
+impl pingora_core::protocols::UniqueID for BoxedStream {
+    fn id(&self) -> pingora_core::protocols::UniqueIDType {
+        self.0.id()
+    }
+}
+
+impl pingora_core::protocols::Ssl for BoxedStream {
+    fn get_ssl(&self) -> Option<&pingora_core::protocols::tls::TlsRef> {
+        self.0.get_ssl()
+    }
+    fn get_ssl_digest(&self) -> Option<std::sync::Arc<pingora_core::protocols::tls::SslDigest>> {
+        self.0.get_ssl_digest()
+    }
+    fn selected_alpn_proto(&self) -> Option<pingora_core::protocols::ALPN> {
+        self.0.selected_alpn_proto()
+    }
+}
+
+impl pingora_core::protocols::GetTimingDigest for BoxedStream {
+    fn get_timing_digest(&self) -> Vec<Option<pingora_core::protocols::TimingDigest>> {
+        self.0.get_timing_digest()
+    }
+    fn get_read_pending_time(&self) -> std::time::Duration {
+        self.0.get_read_pending_time()
+    }
+    fn get_write_pending_time(&self) -> std::time::Duration {
+        self.0.get_write_pending_time()
+    }
+}
+
+impl pingora_core::protocols::GetProxyDigest for BoxedStream {
+    fn get_proxy_digest(
+        &self,
+    ) -> Option<std::sync::Arc<pingora_core::protocols::raw_connect::ProxyDigest>> {
+        self.0.get_proxy_digest()
+    }
+}
+
+impl pingora_core::protocols::GetSocketDigest for BoxedStream {
+    fn get_socket_digest(
+        &self,
+    ) -> Option<std::sync::Arc<pingora_core::protocols::SocketDigest>> {
+        self.0.get_socket_digest()
+    }
+}
+
+#[async_trait]
+impl pingora_core::protocols::Peek for BoxedStream {
+    async fn try_peek(&mut self, buf: &mut [u8]) -> std::io::Result<bool> {
+        self.0.try_peek(buf).await
+    }
+}
+
+/// Maximum ClientHello we'll peek when extracting the SNI. A real ClientHello is
+/// well under this; capping bounds the `read_exact`-based peek so a malicious or
+/// broken client can't make us wait for bytes that never arrive.
+const MAX_CLIENT_HELLO: usize = 16 * 1024;
+
+/// How long to wait for the ClientHello bytes during the SNI peek. The peek uses
+/// `read_exact` (not MSG_PEEK), so without a timeout a stalled/partial handshake
+/// would hang the per-connection task.
+const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The TLS data-plane application for a port that may carry TLSRoutes.
+///
+/// On a **plain-TCP** listener (so Pingora does NOT terminate TLS for us), this
+/// peeks the SNI out of the ClientHello and dispatches:
+///
+/// - TLSRoute **passthrough**: pipe the still-encrypted bytes to the backend.
+/// - TLSRoute **terminate**: terminate TLS here, pipe the cleartext TCP to the
+///   backend (the backend speaks a raw protocol, not HTTP).
+/// - **otherwise** (SNI matched no TLSRoute): terminate TLS here and run the HTTP
+///   proxy — this is how HTTPS HTTPRoutes keep working on the same port.
+///
+/// The peek is non-destructive (`Stream::rewind`), so whichever branch we take
+/// sees the full original byte stream, ClientHello included.
+pub struct GatewayTlsApp {
+    data_plane: DataPlane,
+    /// The HTTP proxy, driven directly for the terminate-then-HTTP fallback.
+    proxy: Arc<pingora_proxy::HttpProxy<GatewayProxy>>,
+    /// Server-side TLS acceptor (built once) + its SNI/ACME certificate callback,
+    /// used to terminate TLS on a stream we hand it.
+    acceptor: Arc<pingora_core::tls::ssl::SslAcceptor>,
+    tls_callbacks: Arc<pingora_core::listeners::TlsAcceptCallbacks>,
+}
+
+#[async_trait]
+impl pingora_core::apps::ServerApp for GatewayTlsApp {
+    async fn process_new(
+        self: &Arc<Self>,
+        mut stream: pingora_core::protocols::Stream,
+        shutdown: &pingora_core::server::ShutdownWatch,
+    ) -> Option<pingora_core::protocols::Stream> {
+        let port = stream
+            .get_socket_digest()
+            .and_then(|d| d.local_addr().and_then(|a| a.as_inet().map(|i| i.port())))
+            .unwrap_or(0);
+
+        // Peek the SNI from the ClientHello without consuming the bytes.
+        let sni = peek_sni(&mut stream).await;
+
+        // Decide what to do based on (port, SNI).
+        let decision = {
+            let snap = self.data_plane.load();
+            snap.tls.lookup(port, sni.as_deref(), next_rng())
+        };
+
+        match decision {
+            TlsDecision::Passthrough(ep) => {
+                tracing::debug!(port, ?sni, ip = %ep.ip, ep_port = ep.port, "TLS passthrough");
+                let Ok(mut upstream) = tokio::net::TcpStream::connect((ep.ip, ep.port)).await else {
+                    tracing::debug!(ip = %ep.ip, "passthrough backend connect failed");
+                    return None;
+                };
+                // True bidirectional pipe: the backend may speak first.
+                let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                None
+            }
+            TlsDecision::Terminate(ep) => {
+                tracing::debug!(port, ?sni, ip = %ep.ip, ep_port = ep.port, "TLS terminate -> TCP");
+                // Terminate TLS here (cert chosen by SNI via the callback), then
+                // pipe the cleartext to the backend (which expects plaintext TCP).
+                let tls_stream = match pingora_core::protocols::tls::server::handshake_with_callback(
+                    &self.acceptor,
+                    BoxedStream(stream),
+                    &self.tls_callbacks,
+                )
+                .await
+                {
+                    Ok(s) => s,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "TLSRoute terminate handshake failed");
+                        return None;
+                    }
+                };
+                let Ok(mut upstream) = tokio::net::TcpStream::connect((ep.ip, ep.port)).await else {
+                    tracing::debug!(ip = %ep.ip, "terminate backend connect failed");
+                    return None;
+                };
+                let mut tls_stream = tls_stream;
+                let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream).await;
+                None
+            }
+            TlsDecision::NoBackend => {
+                tracing::debug!(port, ?sni, "TLSRoute matched but no backend -> close");
+                None
+            }
+            TlsDecision::NoRoute => {
+                // No TLSRoute matched. Terminate TLS and run the HTTP proxy, so
+                // HTTPS HTTPRoutes on this same port keep working.
+                self.terminate_and_serve_http(stream, shutdown).await
+            }
+        }
+    }
+}
+
+impl GatewayTlsApp {
+    /// Terminate TLS and feed the resulting stream to the HTTP proxy, looping for
+    /// HTTP/1.1 keepalive reuse. Mirrors pingora's own `HttpServerApp` accept loop
+    /// (`apps/mod.rs`), HTTP/1.1 only — our ALPN never negotiates h2, so h2c is
+    /// not a concern here.
+    async fn terminate_and_serve_http(
+        &self,
+        stream: pingora_core::protocols::Stream,
+        shutdown: &pingora_core::server::ShutdownWatch,
+    ) -> Option<pingora_core::protocols::Stream> {
+        use pingora_core::apps::HttpServerApp;
+        use pingora_core::protocols::http::ServerSession;
+
+        let tls_stream = match pingora_core::protocols::tls::server::handshake_with_callback(
+            &self.acceptor,
+            BoxedStream(stream),
+            &self.tls_callbacks,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::debug!(error = %e, "HTTPS terminate handshake failed");
+                return None;
+            }
+        };
+
+        let mut session = ServerSession::new_http1(Box::new(tls_stream));
+        // Default keepalive (60s), or none while shutting down.
+        session.set_keepalive(if *shutdown.borrow() { None } else { Some(60) });
+
+        let mut result = self.proxy.process_new_http(session, shutdown).await;
+        while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
+            let mut session = ServerSession::new_http1(stream);
+            if let Some(ps) = persistent_settings {
+                ps.apply_to_session(&mut session);
+            }
+            result = self.proxy.process_new_http(session, shutdown).await;
+        }
+        None
+    }
+}
+
+/// Peek the SNI hostname out of a connection's ClientHello, non-destructively.
+///
+/// `Stream::try_peek` is `read_exact` + `rewind` (not MSG_PEEK), so we size the
+/// peek precisely: first the 5-byte TLS record header (to learn the record
+/// length), then exactly the record. The whole thing is timeout-bounded. On any
+/// failure (not TLS, truncated, timeout, no SNI) we return `None`, and the bytes
+/// remain rewound for the next consumer.
+async fn peek_sni(stream: &mut pingora_core::protocols::Stream) -> Option<String> {
+    use tokio::time::timeout;
+
+    // 1. Peek the record header.
+    let mut header = [0u8; 5];
+    match timeout(PEEK_TIMEOUT, stream.try_peek(&mut header)).await {
+        Ok(Ok(true)) => {}
+        _ => return None,
+    }
+    if header[0] != 0x16 {
+        return None; // not a TLS handshake record
+    }
+    let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
+    let total = (5 + record_len).min(MAX_CLIENT_HELLO);
+
+    // 2. Peek the full record (header + body). try_peek rewinds it for us.
+    let mut buf = vec![0u8; total];
+    match timeout(PEEK_TIMEOUT, stream.try_peek(&mut buf)).await {
+        Ok(Ok(true)) => {}
+        _ => return None,
+    }
+    crate::tls_sni::parse_client_hello_sni(&buf)
+}
+
+/// Build the shared server-side TLS acceptor + its SNI/ACME certificate callback.
+/// The acceptor is built the same way pingora's own `TlsSettings` does (Mozilla
+/// intermediate v5), with the ACME `acme-tls/1` ALPN handling we already use; the
+/// callback selects the per-SNI cert from the live snapshot at handshake time.
+fn build_tls_acceptor(
+    data_plane: DataPlane,
+) -> (
+    Arc<pingora_core::tls::ssl::SslAcceptor>,
+    Arc<pingora_core::listeners::TlsAcceptCallbacks>,
+) {
+    use pingora_core::tls::ssl::{SslAcceptor, SslMethod};
+
+    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
+        .expect("failed to create TLS acceptor builder");
+    // ALPN: accept the ACME `acme-tls/1` challenge protocol; decline anything else
+    // (NOACK → client falls back to HTTP/1.1), identical to the previous listener.
+    builder.set_alpn_select_callback(|_ssl, client| {
+        use pingora_core::tls::ssl::AlpnError;
+        match select_alpn(client, b"acme-tls/1") {
+            Some(p) => Ok(p),
+            None => Err(AlpnError::NOACK),
+        }
+    });
+    let acceptor = Arc::new(builder.build());
+    let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
+        Box::new(SniCertCallback { data_plane });
+    (acceptor, Arc::new(callbacks))
+}
+
+/// Run the Pingora data-plane server.
+///
+/// `http_ports` get plain-TCP listeners served by the HTTP proxy. `tls_ports` get
+/// plain-TCP listeners served by [`GatewayTlsApp`], which peeks the SNI and
+/// dispatches per connection: TLSRoute passthrough / terminate-to-TCP, or (no
+/// TLSRoute match) TLS-terminate-then-HTTP for HTTPS HTTPRoutes.
 ///
 /// This blocks forever (Pingora calls `std::process::exit` on shutdown), so call
 /// it from a dedicated thread.
@@ -574,40 +889,43 @@ pub fn run(
     http_ports: &[u16],
     tls_ports: &[u16],
 ) -> ! {
-    use pingora_core::listeners::tls::TlsSettings;
-
     // Pass None so Pingora doesn't parse our process argv as its own options.
     let mut server = Server::new(None).expect("failed to create pingora server");
     server.bootstrap();
 
-    let mut proxy = http_proxy_service(
+    // Plain-HTTP proxy service. The proxy routes per-port via server_addr().
+    let mut http_service = http_proxy_service(
         &server.configuration,
         GatewayProxy::new(data_plane.clone(), tls_ports.to_vec()),
     );
-
-    // Plain HTTP listeners. The proxy routes per-port via server_addr().
     for port in http_ports {
-        proxy.add_tcp(&format!("{bind_ip}:{port}"));
+        http_service.add_tcp(&format!("{bind_ip}:{port}"));
     }
-    // HTTPS listeners: terminate TLS, selecting the cert by SNI per handshake.
-    for port in tls_ports {
-        let cb: pingora_core::listeners::TlsAcceptCallbacks =
-            Box::new(SniCertCallback { data_plane: data_plane.clone() });
-        let mut settings = TlsSettings::with_callbacks(cb).expect("failed to build TLS settings");
-        // ALPN: accept the ACME `acme-tls/1` challenge protocol; for anything else
-        // decline (NOACK) — identical to pingora's default (no ALPN → client falls
-        // back to HTTP/1.1), so normal traffic is unaffected whether or not --acme.
-        settings.set_alpn_select_callback(|_ssl, client| {
-            use pingora_core::tls::ssl::AlpnError;
-            match select_alpn(client, b"acme-tls/1") {
-                Some(p) => Ok(p),
-                None => Err(AlpnError::NOACK),
-            }
-        });
-        proxy
-            .add_tls_with_settings(&format!("{bind_ip}:{port}"), None, settings);
+    server.add_service(http_service);
+
+    // TLS ports: a plain-TCP listener whose ServerApp peeks SNI and dispatches.
+    if !tls_ports.is_empty() {
+        let (acceptor, tls_callbacks) = build_tls_acceptor(data_plane.clone());
+        // A second HttpProxy drives the terminate-then-HTTP fallback. It is built
+        // with the same configuration; running it via process_new_http needs an
+        // Arc<HttpProxy>, not a Service, so we use the http_proxy() factory.
+        let proxy = Arc::new(http_proxy(
+            &server.configuration,
+            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec()),
+        ));
+        let app = GatewayTlsApp {
+            data_plane: data_plane.clone(),
+            proxy,
+            acceptor,
+            tls_callbacks,
+        };
+        let mut tls_service =
+            pingora_core::services::listening::Service::new("tls-sni-dispatch".to_string(), app);
+        for port in tls_ports {
+            tls_service.add_tcp(&format!("{bind_ip}:{port}"));
+        }
+        server.add_service(tls_service);
     }
-    server.add_service(proxy);
 
     tracing::info!(bind_ip, ?http_ports, ?tls_ports, "data plane listening");
     server.run_forever();
