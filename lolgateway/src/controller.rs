@@ -30,6 +30,9 @@ use gateway_api::apis::standard::gateways::{
 use gateway_api::apis::standard::httproutes::{
     HTTPRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
 };
+use gateway_api::apis::standard::tlsroutes::{
+    TLSRoute, TlsRouteStatus, TlsRouteStatusParents, TlsRouteStatusParentsParentRef,
+};
 use gateway_api::apis::standard::referencegrants::ReferenceGrant;
 use gateway_api::apis::standard::backendtlspolicies::{
     BackendTLSPolicy, BackendTlsPolicyStatus, BackendTlsPolicyStatusAncestors,
@@ -42,6 +45,7 @@ use crate::route_table::{
     QueryMatch, Redirect, RouteEntry, RouteMatch, RouteTable, UrlRewrite,
 };
 use crate::snapshot::{DataPlane, Snapshot};
+use crate::tls_table::{TlsAction, TlsBackend, TlsBackends, TlsTable};
 
 /// Our controller name. Must be DOMAIN/PATH and match GatewayClass.spec.controllerName.
 pub const CONTROLLER_NAME: &str = "lolgateway.dev/controller";
@@ -87,6 +91,10 @@ const SUPPORTED_FEATURES: &[&str] = &[
     "HTTPRouteCORS",
     // TLS.
     "BackendTLSPolicy",
+    // TLSRoute: passthrough (core) + terminate (extended). We do NOT claim
+    // TLSRouteModeMixed — two TLS modes on one port get Accepted=False/ProtocolConflict.
+    "TLSRoute",
+    "TLSRouteModeTerminate",
 ];
 
 /// The address we advertise in Gateway.status.addresses — where our proxy listens,
@@ -100,6 +108,7 @@ struct Stores {
     gateway_classes: Store<GatewayClass>,
     gateways: Store<Gateway>,
     routes: Store<HTTPRoute>,
+    tls_routes: Store<TLSRoute>,
     services: Store<Service>,
     endpoint_slices: Store<EndpointSlice>,
     reference_grants: Store<ReferenceGrant>,
@@ -153,6 +162,7 @@ pub async fn run(
         gateway_classes: watch!(GatewayClass, "GatewayClass"),
         gateways: watch!(Gateway, "Gateway"),
         routes: watch!(HTTPRoute, "HTTPRoute"),
+        tls_routes: watch!(TLSRoute, "TLSRoute"),
         services: watch!(Service, "Service"),
         endpoint_slices: watch!(EndpointSlice, "EndpointSlice"),
         reference_grants: watch!(ReferenceGrant, "ReferenceGrant"),
@@ -236,6 +246,23 @@ struct ListenerOutcome {
     /// The validated cert for this listener, keyed by listener hostname ("" =
     /// default). Some only when the cert ref resolved AND parsed. Feeds CertStore.
     resolved_cert: Option<(String, CertKey)>,
+    /// This listener's port (for grouping listeners that share a port).
+    port: u16,
+    /// For a `protocol: TLS` listener, its TLS mode; None for non-TLS protocols.
+    tls_mode: Option<TlsListenerMode>,
+    /// True when this listener shares its port with another TLS listener of a
+    /// *different* mode (Terminate vs Passthrough) and we don't support mixed
+    /// termination → Accepted=False/ProtocolConflict. Computed across the port.
+    protocol_conflict: bool,
+}
+
+/// A `protocol: TLS` listener's mode, which decides the TLSRoute data path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum TlsListenerMode {
+    /// TLS passthrough — pipe encrypted bytes to the backend.
+    Passthrough,
+    /// TLS terminate — terminate here, pipe cleartext to the backend.
+    Terminate,
 }
 
 /// The per-Gateway compute model: usability + per-listener outcomes. Holds the
@@ -296,6 +323,7 @@ enum PatchTarget {
     GatewayClass,
     Gateway,
     HttpRoute,
+    TlsRoute,
     BackendTlsPolicy,
 }
 
@@ -371,6 +399,7 @@ impl ReconcileCtx {
             .map(|m| m.gw.clone())
             .collect();
         let mut route_table = RouteTable::default();
+        let mut tls_table = crate::tls_table::TlsTable::default();
         // (gw_ns, gw_name) → (listener_name → count).
         let mut attach_counts: BTreeMap<(String, String), BTreeMap<String, i32>> =
             BTreeMap::new();
@@ -380,6 +409,21 @@ impl ReconcileCtx {
                 &usable_gateways,
                 &upstream_tls,
                 &mut route_table,
+                &mut attach_counts,
+            ) {
+                patches.push(patch);
+            }
+        }
+
+        // ── Stage 2c: TLSRoutes → TlsTable (SNI dispatch), parent status, counts.
+        // Mirrors HTTPRoute processing but matches on SNI only and produces an L4
+        // (passthrough / terminate-then-TCP) data path, not HTTP entries.
+        let tls_routes: Vec<Arc<TLSRoute>> = self.stores.tls_routes.state();
+        for route in &tls_routes {
+            if let Some(patch) = self.process_tls_route(
+                route,
+                &models,
+                &mut tls_table,
                 &mut attach_counts,
             ) {
                 patches.push(patch);
@@ -402,16 +446,29 @@ impl ReconcileCtx {
         self.data_plane.store(Snapshot {
             routes: route_table,
             certs: cert_store,
+            tls: tls_table,
         });
 
         self.flush_status(patches).await
     }
 
-    /// Write all accumulated status patches concurrently. Fails fast on the first
-    /// non-404 error (404 = object deleted mid-pass, tolerated in `patch_status`).
+    /// Write all accumulated status patches concurrently. Each patch is applied
+    /// INDEPENDENTLY: a single failing patch (transient API error, conflict) is
+    /// logged but must NOT abort the others — otherwise one bad write would drop
+    /// every other object's status for the pass. A genuinely failed write is
+    /// retried on the next event-driven reconcile (level-triggered), so there is
+    /// no lost convergence. (404 = object deleted mid-pass, already tolerated as
+    /// Ok in `patch_status`.)
     async fn flush_status(&self, patches: Vec<StatusPatch>) -> Result<()> {
-        let futs = patches.into_iter().map(|p| self.apply_patch(p));
-        futures::future::try_join_all(futs).await?;
+        let futs = patches.into_iter().map(|p| {
+            let name = p.name.clone();
+            async move {
+                if let Err(e) = self.apply_patch(p).await {
+                    tracing::warn!(name, error = %e, "status patch failed (will retry on next event)");
+                }
+            }
+        });
+        futures::future::join_all(futs).await;
         Ok(())
     }
 
@@ -428,6 +485,10 @@ impl ReconcileCtx {
             }
             PatchTarget::HttpRoute => {
                 let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), &ns);
+                self.patch_status(&api, &p.name, p.json).await
+            }
+            PatchTarget::TlsRoute => {
+                let api: Api<TLSRoute> = Api::namespaced(self.client.clone(), &ns);
                 self.patch_status(&api, &p.name, p.json).await
             }
             PatchTarget::BackendTlsPolicy => {
@@ -485,12 +546,33 @@ impl ReconcileCtx {
             .and_then(|i| i.parameters_ref.as_ref())
             .is_some();
 
-        let listeners: Vec<ListenerOutcome> = gw
+        let mut listeners: Vec<ListenerOutcome> = gw
             .spec
             .listeners
             .iter()
             .map(|l| self.listener_outcome(l, gw))
             .collect();
+
+        // Mixed TLS termination is not supported (we don't claim
+        // SupportTLSRouteModeMixed): if a port carries TLS listeners of BOTH modes
+        // (Terminate and Passthrough), every TLS listener on that port is rejected
+        // with Accepted=False/ProtocolConflict.
+        let mut conflict_ports: std::collections::HashSet<u16> = std::collections::HashSet::new();
+        for port in listeners.iter().map(|o| o.port).collect::<Vec<_>>() {
+            let modes: std::collections::HashSet<TlsListenerMode> = listeners
+                .iter()
+                .filter(|o| o.port == port)
+                .filter_map(|o| o.tls_mode)
+                .collect();
+            if modes.len() > 1 {
+                conflict_ports.insert(port);
+            }
+        }
+        for o in &mut listeners {
+            if o.tls_mode.is_some() && conflict_ports.contains(&o.port) {
+                o.protocol_conflict = true;
+            }
+        }
 
         GatewayModel {
             gw: Arc::new(gw.clone()),
@@ -541,6 +623,18 @@ impl ReconcileCtx {
         // Validate + load the cert once: (tls_failure, resolved_cert).
         let (tls_failure, resolved_cert) = self.listener_cert(l, gw);
 
+        // A `protocol: TLS` listener's mode drives the TLSRoute data path.
+        let tls_mode = if l.protocol == "TLS" {
+            use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
+            match l.tls.as_ref().and_then(|t| t.mode.as_ref()) {
+                Some(Mode::Passthrough) => Some(TlsListenerMode::Passthrough),
+                // Terminate is the default mode when unspecified.
+                _ => Some(TlsListenerMode::Terminate),
+            }
+        } else {
+            None
+        };
+
         ListenerOutcome {
             name: l.name.clone(),
             protocol_supported,
@@ -548,6 +642,9 @@ impl ReconcileCtx {
             tls_failure,
             supported_kinds,
             resolved_cert,
+            port: l.port as u16,
+            tls_mode,
+            protocol_conflict: false, // filled in across the port in build_gateway_model
         }
     }
 
@@ -631,6 +728,9 @@ impl ReconcileCtx {
                     .unwrap_or(0);
                 let accepted = if !o.protocol_supported {
                     condition("Accepted", "False", "UnsupportedProtocol", gen)
+                } else if o.protocol_conflict {
+                    // Two TLS modes share this port and we don't support mixed.
+                    condition("Accepted", "False", "ProtocolConflict", gen)
                 } else {
                     condition("Accepted", "True", "Accepted", gen)
                 };
@@ -642,24 +742,34 @@ impl ReconcileCtx {
                 } else {
                     condition("ResolvedRefs", "True", "ResolvedRefs", gen)
                 };
-                let programmed =
-                    if o.protocol_supported && o.tls_failure.is_none() && !o.invalid_kind {
-                        condition("Programmed", "True", "Programmed", gen)
+                let programmed = if o.protocol_supported
+                    && o.tls_failure.is_none()
+                    && !o.invalid_kind
+                    && !o.protocol_conflict
+                {
+                    condition("Programmed", "True", "Programmed", gen)
+                } else {
+                    condition("Programmed", "False", "Invalid", gen)
+                };
+                // A protocol-conflicted listener (mixed TLS termination, which we
+                // don't support) is rejected and advertises NO supported kinds —
+                // the conformance suite asserts an empty SupportedKinds for it.
+                let supported_kinds: Vec<GatewayStatusListenersSupportedKinds> =
+                    if o.protocol_conflict {
+                        Vec::new()
                     } else {
-                        condition("Programmed", "False", "Invalid", gen)
-                    };
-                GatewayStatusListeners {
-                    name: o.name.clone(),
-                    attached_routes,
-                    supported_kinds: Some(
                         o.supported_kinds
                             .iter()
                             .map(|k| GatewayStatusListenersSupportedKinds {
                                 group: Some("gateway.networking.k8s.io".into()),
                                 kind: k.to_string(),
                             })
-                            .collect(),
-                    ),
+                            .collect()
+                    };
+                GatewayStatusListeners {
+                    name: o.name.clone(),
+                    attached_routes,
+                    supported_kinds: Some(supported_kinds),
                     conditions: vec![accepted, programmed, resolved],
                 }
             })
@@ -1008,7 +1118,7 @@ impl ReconcileCtx {
                 rejected_by_allow = true;
                 continue;
             }
-            if !listener_hostname_overlaps(l.hostname.as_deref(), &route_hostnames) {
+            if !listener_hostname_overlaps(l.hostname.as_deref(), route_hostnames) {
                 rejected_by_hostname = true;
                 continue;
             }
@@ -1018,6 +1128,214 @@ impl ReconcileCtx {
         if attached.is_empty() {
             // Prefer NotAllowedByListeners over hostname (matches upstream behavior
             // when both apply); fall back to NoMatchingParent.
+            let reason = if rejected_by_allow {
+                "NotAllowedByListeners"
+            } else if rejected_by_hostname {
+                "NoMatchingListenerHostname"
+            } else {
+                "NoMatchingParent"
+            };
+            return (vec![], Some(reason));
+        }
+        (attached, None)
+    }
+
+    /// Process one TLSRoute: compute attachment + status across its parents, and
+    /// populate the [`TlsTable`] with per-SNI passthrough/terminate actions.
+    ///
+    /// Mirrors [`Self::process_route`] but matches purely on the SNI hostname and
+    /// produces an L4 data path (no HTTP). `models` is needed because attachment
+    /// depends on each listener's TLS mode and protocol-conflict status.
+    fn process_tls_route(
+        &self,
+        route: &TLSRoute,
+        models: &[GatewayModel],
+        tls_table: &mut TlsTable,
+        attach_counts: &mut BTreeMap<(String, String), BTreeMap<String, i32>>,
+    ) -> Option<StatusPatch> {
+        let gen = route.meta().generation.unwrap_or(0);
+        let route_ns = route.namespace().unwrap_or_default();
+        let route_hostnames = &route.spec.hostnames;
+
+        let mut parents: Vec<TlsRouteStatusParents> = Vec::new();
+
+        for pref in route.spec.parent_refs.iter().flatten() {
+            let parent_ns = pref.namespace.clone().unwrap_or_else(|| route_ns.clone());
+            // Find the parent among usable Gateways we own.
+            let Some(model) = models.iter().find(|m| {
+                m.usable
+                    && m.gw.name_any() == pref.name
+                    && m.gw.namespace().unwrap_or_default() == parent_ns
+            }) else {
+                continue; // not ours / not found / not usable
+            };
+            let gw = &model.gw;
+
+            // Which TLS listeners this route attaches to (sectionName/port +
+            // allowedRoutes + SNI hostname overlap + not protocol-conflicted).
+            let (attached, accept_reason) =
+                self.attached_tls_listeners(route, gw, model, pref);
+
+            // attachedRoutes counts: ensure every listener has a 0, then bump ours.
+            let gw_counts = attach_counts
+                .entry((parent_ns.clone(), gw.name_any()))
+                .or_default();
+            for l in &gw.spec.listeners {
+                gw_counts.entry(l.name.clone()).or_insert(0);
+            }
+            for (l, _) in &attached {
+                *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
+            }
+
+            let accepted = match accept_reason {
+                None => condition("Accepted", "True", "Accepted", gen),
+                Some(reason) => condition("Accepted", "False", reason, gen),
+            };
+
+            // Resolve backends across all rules (shared by every matched SNI), and
+            // track the ResolvedRefs failure reason (RefNotPermitted first).
+            let mut refs_failure: Option<&'static str> = None;
+            let mut backends = TlsBackends::default();
+            for rule in &route.spec.rules {
+                for backend_ref in &rule.backend_refs {
+                    let svc_port = backend_ref.port.unwrap_or(0) as u16;
+                    let bns = backend_ref.namespace.clone().unwrap_or_else(|| route_ns.clone());
+
+                    let group = backend_ref.group.as_deref().unwrap_or("");
+                    let kind = backend_ref.kind.as_deref().unwrap_or("Service");
+                    if !group.is_empty() || kind != "Service" {
+                        refs_failure = Some("InvalidKind");
+                        continue;
+                    }
+                    if bns != route_ns
+                        && !self.ref_grant_permits(&route_ns, "TLSRoute", &bns, "Service", &backend_ref.name)
+                    {
+                        refs_failure = Some("RefNotPermitted");
+                        continue;
+                    }
+                    match self.resolve_endpoints(&bns, &backend_ref.name, svc_port) {
+                        Some(endpoints) => backends.backends.push(TlsBackend {
+                            weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
+                            endpoints,
+                        }),
+                        None => {
+                            refs_failure.get_or_insert("BackendNotFound");
+                        }
+                    }
+                }
+            }
+
+            // For each attached listener, add its effective SNIs to the dispatch
+            // table with the listener's mode (Passthrough vs Terminate).
+            for (l, mode) in &attached {
+                let action = match mode {
+                    TlsListenerMode::Passthrough => TlsAction::Passthrough(backends.clone()),
+                    TlsListenerMode::Terminate => TlsAction::Terminate(backends.clone()),
+                };
+                for sni in effective_hostnames(route_hostnames, l.hostname.as_deref()) {
+                    tls_table.insert(l.port as u16, &sni, action.clone());
+                }
+            }
+
+            let resolved = match refs_failure {
+                None => condition("ResolvedRefs", "True", "ResolvedRefs", gen),
+                Some(reason) => condition("ResolvedRefs", "False", reason, gen),
+            };
+
+            parents.push(TlsRouteStatusParents {
+                parent_ref: TlsRouteStatusParentsParentRef {
+                    group: pref.group.clone().or_else(|| Some("gateway.networking.k8s.io".into())),
+                    kind: pref.kind.clone().or_else(|| Some("Gateway".into())),
+                    name: pref.name.clone(),
+                    namespace: Some(parent_ns),
+                    port: pref.port,
+                    section_name: pref.section_name.clone(),
+                },
+                controller_name: CONTROLLER_NAME.to_string(),
+                conditions: vec![accepted, resolved],
+            });
+        }
+
+        if parents.is_empty() {
+            return None;
+        }
+        let status = TlsRouteStatus { parents };
+        Some(StatusPatch {
+            target: PatchTarget::TlsRoute,
+            ns: Some(route_ns),
+            name: route.name_any(),
+            json: serde_json::json!({ "status": status }),
+        })
+    }
+
+    /// Compute which of a Gateway's `protocol: TLS` listeners a TLSRoute attaches
+    /// to, returning each attached listener paired with its mode. When none
+    /// attach, the Accepted=False reason. A listener in protocol-conflict (mixed
+    /// termination, unsupported) cannot accept routes.
+    fn attached_tls_listeners(
+        &self,
+        route: &TLSRoute,
+        gw: &Gateway,
+        model: &GatewayModel,
+        pref: &gateway_api::apis::standard::tlsroutes::TlsRouteParentRefs,
+    ) -> (
+        Vec<(gateway_api::apis::standard::gateways::GatewayListeners, TlsListenerMode)>,
+        Option<&'static str>,
+    ) {
+        let route_ns = route.namespace().unwrap_or_default();
+        let route_hostnames = &route.spec.hostnames;
+
+        // Narrow by sectionName / port first (a hard parentRef selector).
+        let candidates: Vec<_> = gw
+            .spec
+            .listeners
+            .iter()
+            .filter(|l| {
+                pref.section_name.as_ref().map(|s| &l.name == s).unwrap_or(true)
+                    && pref.port.map(|p| l.port == p).unwrap_or(true)
+            })
+            .cloned()
+            .collect();
+        if candidates.is_empty() {
+            return (vec![], Some("NoMatchingParent"));
+        }
+
+        let mut attached = Vec::new();
+        let mut rejected_by_allow = false;
+        let mut rejected_by_hostname = false;
+        for l in candidates {
+            // Only TLS listeners carry TLSRoutes. A non-TLS listener selected by
+            // sectionName/port is "not allowed" for this kind.
+            let Some(outcome) = model.listeners.iter().find(|o| o.name == l.name) else {
+                rejected_by_allow = true;
+                continue;
+            };
+            let Some(mode) = outcome.tls_mode else {
+                rejected_by_allow = true; // non-TLS protocol
+                continue;
+            };
+            // A protocol-conflicted listener (mixed termination) is Accepted=False
+            // and accepts no routes.
+            if outcome.protocol_conflict {
+                rejected_by_allow = true;
+                continue;
+            }
+            if !self.listener_allows_namespace(&l, gw, &route_ns) {
+                rejected_by_allow = true;
+                continue;
+            }
+            if !listener_allows_kind(&l, "TLSRoute") {
+                rejected_by_allow = true;
+                continue;
+            }
+            if !listener_hostname_overlaps(l.hostname.as_deref(), route_hostnames) {
+                rejected_by_hostname = true;
+                continue;
+            }
+            attached.push((l, mode));
+        }
+
+        if attached.is_empty() {
             let reason = if rejected_by_allow {
                 "NotAllowedByListeners"
             } else if rejected_by_hostname {

@@ -13,12 +13,16 @@ use arc_swap::ArcSwap;
 
 use crate::cert_store::{CertKey, CertStore};
 use crate::route_table::RouteTable;
+use crate::tls_table::TlsTable;
 
 /// Everything the data plane needs, published atomically as a unit.
 #[derive(Default)]
 pub struct Snapshot {
     pub routes: RouteTable,
     pub certs: CertStore,
+    /// SNI dispatch for TLSRoute (passthrough / terminate-then-TCP). Empty unless
+    /// a `protocol: TLS` listener with attached TLSRoutes exists.
+    pub tls: TlsTable,
 }
 
 /// In-flight ACME TLS-ALPN-01 challenge certs, keyed by SNI hostname (lowercased).

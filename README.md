@@ -35,6 +35,9 @@ conformance profile. Implemented and verified against the upstream suite:
   (`InvalidCertificateRef`/`RefNotPermitted`, with PEM validation), and **BackendTLSPolicy**
   upstream re-encryption (gateway→backend TLS with custom CA from a ConfigMap + SNI/hostname
   verification), including invalid-policy→5xx and conflict resolution.
+- **TLSRoute (SNI passthrough + terminate)** — route raw TCP by ClientHello SNI: passthrough
+  (encrypted bytes piped to a TLS backend) and terminate (decrypt here, pipe cleartext TCP),
+  coexisting with HTTPS HTTPRoutes on one port. See [TLSRoute](#tlsroute-sni-passthrough--terminate).
 - **Automatic TLS certs via ACME (opt-in)** — see [ACME](#automatic-tls-certificates-acme).
 
 Architecture: a level-triggered kube controller computes the entire data-plane view —
@@ -58,39 +61,52 @@ go test ./conformance -run TestConformance -count=1 \
 
 → **405 passed, 0 failed, 87 skipped.** The 87 skips are out-of-scope features we don't
 report in `supportedFeatures` (UDP/TCP/gRPC routes, retries, ListenerSet, static
-addresses, frontend client-cert validation, mesh, h2c, TLSRoute). Everything we declare
+addresses, frontend client-cert validation, mesh, h2c). Everything we declare
 support for passes — including TLS termination (HTTPS listeners, per-SNI certs,
 cross-namespace cert ReferenceGrants) and the full BackendTLSPolicy surface (re-encrypt,
 invalid-CA/invalid-kind → 5xx, and conflict resolution).
 
+**TLSRoute** is exercised separately (see [TLSRoute](#tlsroute-sni-passthrough--terminate)):
+11/12 of its tests pass, run with targeted `--run-test` against ports 443/8443/8883.
+
 Notes:
-- Use the `GATEWAY-HTTP` profile only. The `GATEWAY-TLS` profile forces its Core tests —
-  including `TLSRoute` — to run regardless of `supportedFeatures`, and TLSRoute (L4
-  passthrough) is out of scope (see below). TLS *termination* is exercised within
+- Use the `GATEWAY-HTTP` profile for the HTTP run. The `GATEWAY-TLS` profile also pulls in
+  out-of-scope route types (UDP/TCP), so for TLSRoute we scope to individual tests with
+  `--run-test=TLSRoute...` plus `--supported-features=Gateway,ReferenceGrant,TLSRoute,TLSRouteModeTerminate`
+  rather than running the whole profile. TLS *termination* for HTTPRoute is exercised within
   `GATEWAY-HTTP` via `supportedFeatures`.
 - Always pass `-count=1`: `go test` caches results, and a cached pass returns in ~20s
   without re-running against the cluster.
 - Run one conformance invocation at a time — two at once fight over the shared base
   resources and fail spuriously.
 
-### Not yet implemented: TLSRoute (TLS passthrough)
+### TLSRoute (SNI passthrough + terminate)
 
-`TLSRoute` (the GATEWAY-TLS core route type) does **SNI-based TLS passthrough**: the
-gateway must route a raw TLS stream to a backend *by the ClientHello SNI, without
-decrypting it*. This is intentionally not implemented yet, because it needs a data path
-distinct from the HTTP proxy:
+`TLSRoute` routes a raw TCP connection **by the ClientHello SNI**. Both of its modes are
+implemented, coexisting with HTTPS HTTPRoutes on the same port:
 
-- A **layer-4 stream listener** that peeks the TLS ClientHello, parses the SNI, matches it
-  against `TLSRoute.hostnames`, and forwards the raw bytes to the chosen backend (Pingora's
-  `ServerApp` trait + a manual ClientHello parse — there is no built-in SNI peek).
-- It **conflicts with HTTPS termination on the same port**: port 443 can be either a
-  TLS-terminating HTTP listener (for HTTPRoute) or a TLS-passthrough L4 listener (for
-  TLSRoute), not both on one socket. A full implementation would put a ClientHello-peeking
-  demux in front of port 443 that decides, per connection, whether to hand off to the
-  TLS-terminating HTTP service or to raw-forward.
+- **Passthrough** — peek the SNI without decrypting, then a true full-duplex byte pipe to a
+  backend that terminates TLS itself.
+- **Terminate** — peek the SNI, terminate TLS here (cert selected per-SNI), then pipe the
+  *cleartext* TCP to the backend (the conformance backend speaks a raw line protocol, not
+  HTTP, and talks first — so the pipe must be bidirectional).
 
-The control-plane status side (TLSRoute parent conditions, listener `TLS`/`Passthrough`
-handling) is straightforward; the L4 stream subsystem is the substantial piece.
+The data path is a custom Pingora `ServerApp` (`GatewayTlsApp`) on a plain-TCP listener: it
+peeks the ClientHello (`Stream::try_peek` + a hand-written SNI parser — Pingora has no
+built-in peek), looks up `(port, SNI)` in an `ArcSwap`-published `TlsTable`, and dispatches
+to passthrough / terminate-to-TCP / (no TLSRoute match) TLS-terminate-then-HTTP. This last
+fallback is what lets HTTPS HTTPRoutes keep working on the **same** socket — the demux the
+old "not implemented" note called for. No edits to vendored `pingora/` were needed; see
+[docs/tlsroute-plan.md](docs/tlsroute-plan.md). We report `TLSRoute` + `TLSRouteModeTerminate`;
+mixing both TLS modes on one port is rejected with `Accepted=False`/`ProtocolConflict`
+(`TLSRouteModeMixed` is not claimed).
+
+Verified against the suite (11/12 TLSRoute tests): passthrough + terminate traffic, all
+parent/listener status (attachment, `ResolvedRefs`, supported-kinds, `ProtocolConflict`).
+The one gap is `TLSRouteHostnameIntersection`, which assigns each of several Gateways its own
+address; we advertise a single shared address, so a broad `*.com` Gateway answers an SNI the
+test expects rejected on a *different* Gateway. Per-Gateway addressing is a separate,
+pre-existing limitation (the HTTP data path shares the same single-address model).
 
 ### Automatic TLS certificates (ACME)
 
