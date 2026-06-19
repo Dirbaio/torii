@@ -539,16 +539,27 @@ impl pingora_core::listeners::TlsAccept for SniCertCallback {
 }
 
 /// Install a PEM cert+key onto an in-progress TLS handshake.
+///
+/// `cert_pem` may be a full chain (leaf first, then intermediates): the first
+/// certificate is installed as the leaf and the remainder are added to the
+/// presented chain. Serving the intermediates is what lets clients build a path
+/// to a root they trust — without them, an ACME/CA-issued leaf fails to verify.
 fn install_cert(ssl: &mut pingora_core::tls::ssl::SslRef, ck: &crate::cert_store::CertKey) {
     use pingora_core::tls::ext;
-    let (Ok(cert), Ok(key)) = (
-        pingora_core::tls::x509::X509::from_pem(&ck.cert_pem),
+    let (Ok(chain), Ok(key)) = (
+        pingora_core::tls::x509::X509::stack_from_pem(&ck.cert_pem),
         pingora_core::tls::pkey::PKey::private_key_from_pem(&ck.key_pem),
     ) else {
         return;
     };
-    let _ = ext::ssl_use_certificate(ssl, &cert);
+    let Some((leaf, intermediates)) = chain.split_first() else {
+        return;
+    };
+    let _ = ext::ssl_use_certificate(ssl, leaf);
     let _ = ext::ssl_use_private_key(ssl, &key);
+    for inter in intermediates {
+        let _ = ext::ssl_add_chain_cert(ssl, inter);
+    }
 }
 
 /// Run the Pingora proxy server: `http_ports` get plain-TCP listeners, `tls_ports`
