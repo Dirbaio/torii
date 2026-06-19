@@ -70,6 +70,9 @@ pub struct AcmeConfig {
     pub default_email: Option<String>,
     /// A stable identity for this instance (Lease holder id). Pod name or a uuid.
     pub holder_id: String,
+    /// Path to a PEM root CA the ACME client should trust, for ACME servers with a
+    /// testing PKI (e.g. pebble). `None` → use the system trust roots.
+    pub ca_cert_path: Option<String>,
 }
 
 /// Spawn the ACME subsystem: a challenge-Secret reflector (every instance, feeds
@@ -102,7 +105,7 @@ pub async fn run(client: Client, data_plane: DataPlane, config: AcmeConfig) -> R
             Ok(LeaseLockResult::Acquired(_)) => true,
             Ok(LeaseLockResult::NotAcquired(_)) => false,
             Err(e) => {
-                tracing::warn!(error = %e, "ACME lease acquire/renew failed");
+                tracing::warn!(error = format!("{e:#}"), "ACME lease acquire/renew failed");
                 false
             }
         };
@@ -110,7 +113,7 @@ pub async fn run(client: Client, data_plane: DataPlane, config: AcmeConfig) -> R
         if is_leader && last_scan.elapsed() >= SCAN_INTERVAL {
             last_scan = std::time::Instant::now();
             if let Err(e) = scan_and_issue(&client, &gw_api, &config).await {
-                tracing::warn!(error = %e, "ACME scan/issue failed");
+                tracing::warn!(error = format!("{e:#}"), "ACME scan/issue failed");
             }
         }
 
@@ -143,7 +146,7 @@ async fn scan_and_issue(
     tracing::info!(count = needs.len(), "ACME: certs to issue/renew");
     for need in needs {
         if let Err(e) = issue(client, config, &need).await {
-            tracing::warn!(host = %need.hostname, error = %e, "ACME issuance failed");
+            tracing::warn!(host = %need.hostname, error = format!("{e:#}"), "ACME issuance failed");
         }
     }
     Ok(())
@@ -278,6 +281,16 @@ async fn issue(client: &Client, config: &AcmeConfig, need: &CertNeed) -> Result<
     Ok(())
 }
 
+/// Build an ACME account builder, trusting a custom root CA when configured (for
+/// testing PKIs like pebble); otherwise the default client with system roots.
+fn account_builder(config: &AcmeConfig) -> Result<instant_acme::AccountBuilder> {
+    match &config.ca_cert_path {
+        Some(path) => Account::builder_with_root(path)
+            .with_context(|| format!("load ACME CA cert from {path}")),
+        None => Ok(Account::builder()?),
+    }
+}
+
 /// Load the persisted ACME account, or create one and persist its credentials.
 /// Keyed per directory URL so staging/prod accounts don't collide.
 async fn load_or_create_account(
@@ -293,14 +306,14 @@ async fn load_or_create_account(
         if let Some(creds_raw) = secret.data.as_ref().and_then(|d| d.get(&key)) {
             let creds: AccountCredentials = serde_json::from_slice(&creds_raw.0)
                 .context("parse stored ACME credentials")?;
-            let account = Account::builder()?.from_credentials(creds).await?;
+            let account = account_builder(config)?.from_credentials(creds).await?;
             return Ok(account);
         }
     }
 
     let contact: Vec<String> = email.map(|e| format!("mailto:{e}")).into_iter().collect();
     let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
-    let (account, creds) = Account::builder()?
+    let (account, creds) = account_builder(config)?
         .create(
             &NewAccount {
                 contact: &contact_refs,

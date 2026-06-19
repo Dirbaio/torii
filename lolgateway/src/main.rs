@@ -81,6 +81,12 @@ struct RunArgs {
     /// `lolgateway.dev/acme-email` annotation is absent). Optional.
     #[arg(long, env = "LOLGATEWAY_ACME_EMAIL")]
     acme_email: Option<String>,
+
+    /// Path to a PEM root CA the ACME client should trust. Only needed for ACME
+    /// servers with a testing PKI (e.g. pebble); production CAs are publicly
+    /// trusted. Optional.
+    #[arg(long, env = "LOLGATEWAY_ACME_CA_CERT")]
+    acme_ca_cert: Option<String>,
 }
 
 #[tokio::main]
@@ -126,6 +132,7 @@ async fn run(args: RunArgs) -> Result<()> {
             namespace: args.acme_namespace.clone(),
             default_email: args.acme_email.clone(),
             holder_id: acme_holder_id(),
+            ca_cert_path: args.acme_ca_cert.clone(),
         };
         let acme_client = client.clone();
         let acme_dp = data_plane.clone();
