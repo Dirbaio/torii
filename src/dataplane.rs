@@ -277,11 +277,10 @@ impl ProxyHttp for GatewayProxy {
                 let mut p = HttpPeer::new((ep.ip, ep.port), true, tls.hostname.clone());
                 p.options.verify_cert = true;
                 p.options.verify_hostname = true;
-                if !tls.ca_pem.is_empty() {
-                    if let Ok(certs) = pingora_core::tls::x509::X509::stack_from_pem(&tls.ca_pem) {
+                if !tls.ca_pem.is_empty()
+                    && let Ok(certs) = pingora_core::tls::x509::X509::stack_from_pem(&tls.ca_pem) {
                         p.options.ca = Some(std::sync::Arc::new(certs.into_boxed_slice()));
                     }
-                }
                 p
             }
             BackendTls::Plaintext => HttpPeer::new((ep.ip, ep.port), false, String::new()),
@@ -528,10 +527,10 @@ fn split_host_port(hostport: &str) -> Result<(&str, &str), HostPortError> {
             return Err(HostPortError::TooManyColons);
         }
     }
-    if hostport[j..].as_bytes().contains(&b'[') {
+    if hostport.as_bytes()[j..].contains(&b'[') {
         return Err(HostPortError::UnexpectedLBracket);
     }
-    if hostport[k..].as_bytes().contains(&b']') {
+    if hostport.as_bytes()[k..].contains(&b']') {
         return Err(HostPortError::UnexpectedRBracket);
     }
 
@@ -960,7 +959,7 @@ impl GatewayTlsApp {
         // Advertise a bounded max_concurrent_streams so a single connection can't
         // open unboundedly many streams (each a spawned task). Start from any
         // options the proxy provides, then enforce our cap.
-        let mut h2_options = self.proxy.h2_options().unwrap_or_else(server::H2Options::new);
+        let mut h2_options = self.proxy.h2_options().unwrap_or_default();
         h2_options.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
         let mut conn = match server::handshake(stream, Some(h2_options)).await {
             Ok(c) => c,
@@ -1073,11 +1072,10 @@ impl<T: tokio::io::AsyncRead + Unpin + ?Sized> tokio::io::AsyncRead for Activity
     ) -> std::task::Poll<std::io::Result<()>> {
         let before = buf.filled().len();
         let r = std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf);
-        if let std::task::Poll::Ready(Ok(())) = &r {
-            if buf.filled().len() != before {
+        if let std::task::Poll::Ready(Ok(())) = &r
+            && buf.filled().len() != before {
                 self.mark();
             }
-        }
         r
     }
 }
@@ -1089,11 +1087,10 @@ impl<T: tokio::io::AsyncWrite + Unpin + ?Sized> tokio::io::AsyncWrite for Activi
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let r = std::pin::Pin::new(&mut *self.inner).poll_write(cx, buf);
-        if let std::task::Poll::Ready(Ok(n)) = &r {
-            if *n > 0 {
+        if let std::task::Poll::Ready(Ok(n)) = &r
+            && *n > 0 {
                 self.mark();
             }
-        }
         r
     }
     fn poll_flush(

@@ -638,14 +638,13 @@ async fn load_or_create_account(
     let api: Api<Secret> = Api::namespaced(client.clone(), &config.namespace);
     let key = account_key(directory);
 
-    if let Ok(secret) = api.get(ACCOUNT_SECRET).await {
-        if let Some(creds_raw) = secret.data.as_ref().and_then(|d| d.get(&key)) {
+    if let Ok(secret) = api.get(ACCOUNT_SECRET).await
+        && let Some(creds_raw) = secret.data.as_ref().and_then(|d| d.get(&key)) {
             let creds: AccountCredentials = serde_json::from_slice(&creds_raw.0)
                 .context("parse stored ACME credentials")?;
             let account = account_builder(config)?.from_credentials(creds).await?;
             return Ok(account);
         }
-    }
 
     let contact: Vec<String> = email.map(|e| format!("mailto:{e}")).into_iter().collect();
     let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
@@ -769,7 +768,9 @@ fn spawn_challenge_reflector(client: Client, data_plane: DataPlane, ns: String) 
 
 /// Build the in-memory challenge store (host → CertKey) from the challenge Secret.
 fn build_challenge_store(store: &Store<Secret>) -> ChallengeStore {
-    let mut out: HashMap<String, (Option<Vec<u8>>, Option<Vec<u8>>)> = HashMap::new();
+    // host → (cert PEM, key PEM), each filled as we encounter the `.crt`/`.key` key.
+    type PartialCerts = HashMap<String, (Option<Vec<u8>>, Option<Vec<u8>>)>;
+    let mut out: PartialCerts = HashMap::new();
     for secret in store.state() {
         let Some(data) = secret.data.as_ref() else { continue };
         for (k, v) in data {
