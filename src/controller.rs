@@ -838,12 +838,14 @@ impl ReconcileCtx {
         to_kind: &str,
         to_name: &str,
     ) -> bool {
+        // Store::find iterates the reflector map under a read lock and short-circuits
+        // on the first match, without cloning every grant into a Vec (as state() does).
         self.stores
             .reference_grants
-            .state()
-            .into_iter()
-            .filter(|rg| rg.namespace().unwrap_or_default() == to_ns)
-            .any(|rg| {
+            .find(|rg| {
+                if rg.namespace().unwrap_or_default() != to_ns {
+                    return false;
+                }
                 let from_ok = rg.spec.from.iter().any(|f| {
                     f.group == "gateway.networking.k8s.io"
                         && f.kind == from_kind
@@ -856,6 +858,7 @@ impl ReconcileCtx {
                 });
                 from_ok && to_ok
             })
+            .is_some()
     }
 
 
@@ -1372,11 +1375,10 @@ impl ReconcileCtx {
                 // Find the route's namespace object and evaluate the LabelSelector
                 // against its labels. A LabelSelector is matchLabels AND
                 // matchExpressions; an empty selector matches everything.
+                // Namespace is cluster-scoped, so key by name only (O(1) get).
                 self.stores
                     .namespaces
-                    .state()
-                    .into_iter()
-                    .find(|n| n.name_any() == route_ns)
+                    .get(&reflector::ObjectRef::new(route_ns))
                     .map(|n| {
                         let ns_labels = n.labels();
                         // matchLabels: every (k, v) must be present and equal.
@@ -2194,10 +2196,9 @@ where
     K: Resource + Clone + 'static,
     K::DynamicType: Eq + std::hash::Hash + Clone + Default,
 {
-    store
-        .state()
-        .into_iter()
-        .find(|o| o.name_any() == name && o.namespace().as_deref() == Some(ns))
+    // O(1) keyed lookup against the reflector's HashMap, instead of cloning the
+    // whole store into a Vec and linear-scanning it on every call.
+    store.get(&reflector::ObjectRef::new(name).within(ns))
 }
 
 /// Build a metav1 Condition with observedGeneration set.
