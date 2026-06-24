@@ -1,0 +1,236 @@
+# Torii — Kubernetes Gateway API controller + Pingora data plane.
+#
+# A full single-file deployment: Namespace, ServiceAccount, RBAC (ClusterRole +
+# binding for the cluster-wide watches/status, plus a namespaced Role for ACME
+# state), Deployment, and a Service that exposes the gateway data-plane ports.
+#
+# Apply with:
+#   kubectl apply -f gateway-api/config/crd/standard/   # the Gateway API CRDs first
+#   kubectl apply -f deploy/torii.yaml
+#
+# Then register a GatewayClass pointing at this controller:
+#   apiVersion: gateway.networking.k8s.io/v1
+#   kind: GatewayClass
+#   metadata: { name: torii }
+#   spec: { controllerName: torii.dirba.io/controller }
+#
+# Edit before applying:
+#   - Deployment image:  ghcr.io/you/torii:<tag>   (build from the repo Dockerfile)
+#   - Deployment args:    --advertise, --http-ports, --tls-ports, --acme*
+#   - Service type:       LoadBalancer (cloud) vs NodePort/hostPort (bare-metal)
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: torii-system
+  labels:
+    app.kubernetes.io/name: torii
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: torii
+  namespace: torii-system
+  labels:
+    app.kubernetes.io/name: torii
+---
+# Cluster-wide permissions. Torii watches these resources in ALL namespaces
+# (Api::all) and writes status back on the Gateway-API kinds.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: torii
+  labels:
+    app.kubernetes.io/name: torii
+rules:
+  # --- Gateway API: read spec, write status ---
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - gatewayclasses
+      - gateways
+      - httproutes
+      - tlsroutes
+      - referencegrants
+      - backendtlspolicies
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["gateway.networking.k8s.io"]
+    resources:
+      - gatewayclasses/status
+      - gateways/status
+      - httproutes/status
+      - tlsroutes/status
+      - backendtlspolicies/status
+    verbs: ["get", "patch", "update"]
+  # --- Core resources used for routing/backends/certs (read-only) ---
+  - apiGroups: [""]
+    resources: ["services", "namespaces", "configmaps"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["discovery.k8s.io"]
+    resources: ["endpointslices"]
+    verbs: ["get", "list", "watch"]
+  # --- Secrets: read everywhere (TLS cert Secrets referenced by listeners /
+  #     BackendTLSPolicy can live in any namespace via ReferenceGrant). ---
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch"]
+  # --- Secrets WRITE (ACME only): torii writes each issued cert into the
+  #     listener's own certificateRefs Secret, which may be in ANY namespace.
+  #     Drop this rule if you don't run with --acme. ---
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["create", "update", "patch"]
+  # --- Events (optional, for surfacing problems via kubectl describe). ---
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["create", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: torii
+  labels:
+    app.kubernetes.io/name: torii
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: torii
+subjects:
+  - kind: ServiceAccount
+    name: torii
+    namespace: torii-system
+---
+# Namespaced permissions for ACME state (account key, in-flight challenge cert)
+# and leader election — all confined to torii-system (--acme-namespace).
+# Harmless to keep even when --acme is off.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: torii-acme
+  namespace: torii-system
+  labels:
+    app.kubernetes.io/name: torii
+rules:
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: torii-acme
+  namespace: torii-system
+  labels:
+    app.kubernetes.io/name: torii
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: torii-acme
+subjects:
+  - kind: ServiceAccount
+    name: torii
+    namespace: torii-system
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: torii
+  namespace: torii-system
+  labels:
+    app.kubernetes.io/name: torii
+spec:
+  # ACME issuance is leader-elected (a coordination.k8s.io Lease), so >1 replica
+  # is safe for HA: all replicas serve traffic + the per-SNI cert callback; one
+  # leader drives issuance. Start with 1; raise for availability.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: torii
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: torii
+    spec:
+      serviceAccountName: torii
+      # Bind the privileged gateway ports (80/443) directly on the pod. Either
+      # grant NET_BIND_SERVICE (below) or move the listeners to ports >=1024.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: torii
+          # Build from the repo Dockerfile and push to your registry.
+          image: ghcr.io/CHANGEME/torii:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - run
+            - --bind-ip=0.0.0.0
+            - --http-ports=80
+            - --tls-ports=443
+            # The address published in Gateway.status.addresses — must be where
+            # clients/DNS reach this gateway. Set to your Service's external IP
+            # (LoadBalancer) or node IP. The downward API can't give a LB IP, so
+            # set it explicitly here.
+            - --advertise=CHANGEME.gateway.example.com
+            # --- ACME (optional). Remove these to disable automatic TLS certs. ---
+            - --acme
+            - --acme-namespace=torii-system
+            - --acme-email=ops@example.com
+          env:
+            # Stable leader-election identity for ACME (downward API → pod name).
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TORII_LOG
+              value: "torii=info,kube=warn"
+          ports:
+            - { name: http,  containerPort: 80,  protocol: TCP }
+            - { name: https, containerPort: 443, protocol: TCP }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+              # Needed only because the listeners bind ports <1024 as non-root.
+              add: ["NET_BIND_SERVICE"]
+          resources:
+            requests: { cpu: "100m", memory: "128Mi" }
+            limits:   { memory: "512Mi" }
+          # Liveness/readiness: torii has no HTTP health endpoint, so probe the
+          # data-plane TCP port — if the proxy thread is up, the port accepts.
+          livenessProbe:
+            tcpSocket: { port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            tcpSocket: { port: http }
+            initialDelaySeconds: 2
+            periodSeconds: 5
+      terminationGracePeriodSeconds: 30
+---
+# Exposes the gateway data-plane ports to the outside world. On a cloud provider
+# a LoadBalancer gives you an external IP/hostname — put that in --advertise and
+# point your domains' DNS at it. For bare-metal use MetalLB, or switch to
+# type: NodePort / a hostPort on the Deployment.
+apiVersion: v1
+kind: Service
+metadata:
+  name: torii
+  namespace: torii-system
+  labels:
+    app.kubernetes.io/name: torii
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: torii
+  ports:
+    - { name: http,  port: 80,  targetPort: http,  protocol: TCP }
+    - { name: https, port: 443, targetPort: https, protocol: TCP }
+  # Preserve the client source IP so X-Forwarded-For is accurate (and ACME
+  # challenge traffic reaches the right pod).
+  externalTrafficPolicy: Local
