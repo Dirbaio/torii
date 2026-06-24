@@ -589,11 +589,25 @@ fn path_prefix_matches(prefix: &str, path: &str) -> bool {
 }
 
 /// Hostname match supporting a single leading wildcard label (`*.example.com`).
+/// Case-INSENSITIVE on both sides (RFC 3986 §3.2.2 / RFC 9110 §4.2.3 — host
+/// comparison is case-insensitive). The wildcard branch previously used a
+/// byte-exact `strip_suffix`, so a legal mixed-case `Host: A.EXAMPLE.COM` against
+/// `*.example.com` spuriously 404'd.
 fn hostname_matches(pattern: &str, host: &str) -> bool {
     if let Some(suffix) = pattern.strip_prefix("*.") {
-        host.strip_suffix(suffix)
-            .map(|p| p.ends_with('.') && p.len() > 1)
-            .unwrap_or(false)
+        // `host` must end with `.<suffix>` (case-insensitively) with a non-empty
+        // leftmost label, so `*.example.com` covers `a.example.com` but not
+        // `example.com`.
+        let Some(rest_len) = host.len().checked_sub(suffix.len()) else {
+            return false;
+        };
+        // Need at least "x." before the suffix; guard char boundary so a
+        // multibyte (non-ASCII) host can't panic split_at.
+        if rest_len < 2 || !host.is_char_boundary(rest_len) {
+            return false;
+        }
+        let (prefix, tail) = host.split_at(rest_len);
+        tail.eq_ignore_ascii_case(suffix) && prefix.ends_with('.')
     } else {
         pattern.eq_ignore_ascii_case(host)
     }
@@ -620,6 +634,17 @@ mod tests {
         assert!(hostname_matches("example.com", "EXAMPLE.com"));
         assert!(hostname_matches("*.example.com", "a.example.com"));
         assert!(!hostname_matches("*.example.com", "example.com"));
+        // L1: the wildcard branch must be case-insensitive on both sides.
+        assert!(hostname_matches("*.example.com", "A.EXAMPLE.COM"));
+        assert!(hostname_matches("*.example.com", "a.Example.Com"));
+        assert!(hostname_matches("*.EXAMPLE.COM", "a.example.com"));
+        // Still must not match the bare domain or a too-short leftmost label.
+        assert!(!hostname_matches("*.example.com", "EXAMPLE.COM"));
+        assert!(!hostname_matches("*.example.com", ".example.com"));
+        // A non-ASCII leftmost label is a valid subdomain and must not panic.
+        assert!(hostname_matches("*.example.com", "ñ.example.com"));
+        // A multibyte char straddling the suffix boundary must not panic.
+        let _ = hostname_matches("*.example.com", "añ.example.com");
     }
 
     fn entry(path: PathMatch, headers: usize) -> RouteEntry {
