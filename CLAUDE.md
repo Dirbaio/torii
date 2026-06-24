@@ -16,7 +16,7 @@ the workspace; see **Building from here** below.
 ```
 torii/
 ├── CLAUDE.md            # this file
-├── pingora/             # vendored Pingora source — depend on via path, do NOT edit
+├── pingora/             # Pingora source — READ-ONLY API reference (dep is from crates.io)
 ├── gateway-api/         # vendored Gateway API v1.5 — CRDs, docs, conformance suite (Go)
 └── src/ (TBD)           # our controller + data plane (does not exist yet)
 ```
@@ -142,12 +142,14 @@ Iterate one test at a time. `HTTPRouteSimpleSameNamespace`
 
 1. Scaffold a Cargo workspace at the repo root. Suggested members: `torii`
    (binary), plus crates for control plane and data plane if it helps separation.
-2. Add **path** dependencies on Pingora, e.g.:
+2. Add the Pingora dependencies from crates.io, e.g.:
    ```toml
-   pingora = { path = "pingora/pingora" }
-   pingora-proxy = { path = "pingora/pingora-proxy" }
-   pingora-core = { path = "pingora/pingora-core" }
+   pingora-core  = { version = "0.8", features = ["openssl"] }
+   pingora-proxy = { version = "0.8", features = ["openssl"] }
+   pingora-http  = "0.8"
    ```
+   (`pingora/` is kept only as a read-only API reference — see below — not as a
+   build dependency.)
 3. Add `kube`, `kube-runtime`, `k8s-openapi` (pin the k8s version feature), `tokio`,
    `arc-swap`, `serde`. For Gateway CRD types, prefer the `gateway-api` Rust crate; if it
    lags v1.5, generate types from the CRDs in `gateway-api/config/crd/` with

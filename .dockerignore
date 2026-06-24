@@ -1,17 +1,19 @@
-# Keep the build context small. The Rust build needs only Cargo.{toml,lock},
-# src/ (our crate), and pingora/ (vendored path deps).
+# Keep the build context small. The Rust build needs only Cargo.{toml,lock} and
+# src/ (our crate); all dependencies, including Pingora, come from crates.io.
 target/
 .git/
 gateway-api/
+pingora/
 kubeconfig
 *.md
 hack/
 examples/
+deploy/
+rfcs/
+audit/
+docs/
 .vscode/
 .claude/
 .cargo-home/
 env.txt
 sandbox*.sh
-# pingora's own target dirs / git, if any
-pingora/target/
-pingora/**/target/
