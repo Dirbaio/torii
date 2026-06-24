@@ -1,11 +1,12 @@
 # Keep the build context small. The Rust build needs only Cargo.{toml,lock},
-# lolgateway/ (our crate), and pingora/ (vendored path deps).
+# src/ (our crate), and pingora/ (vendored path deps).
 target/
 .git/
 gateway-api/
 kubeconfig
 *.md
 hack/
+examples/
 .vscode/
 .claude/
 .cargo-home/
