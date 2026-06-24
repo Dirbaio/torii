@@ -40,6 +40,28 @@ pub struct RequestCtx {
     request_timeout: Option<std::time::Duration>,
     /// If set, the request's allowed Origin — add CORS headers to the response.
     cors_origin: Option<String>,
+    /// Forwarded-header values captured from the inbound connection in
+    /// `request_filter` (the only phase with `Session` access), emitted to the
+    /// upstream in `upstream_request_filter`. We OVERWRITE any client-supplied
+    /// `X-Forwarded-*` rather than appending: lolgateway may sit directly on the
+    /// public internet with no trusted proxy in front, so an inbound XFF is
+    /// attacker-controlled and must not be honored (it would let a client spoof
+    /// its source IP past rate-limits / geo-blocking).
+    fwd: Forwarded,
+}
+
+/// Values for the `X-Forwarded-*` headers, captured from the inbound request.
+#[derive(Default)]
+struct Forwarded {
+    /// Client IP (no port), for `X-Forwarded-For`.
+    client_ip: Option<String>,
+    /// Original `Host` header (with any port stripped), for `X-Forwarded-Host`.
+    /// Captured before a URLRewrite filter can rewrite `Host`.
+    host: String,
+    /// Listener port the request arrived on, for `X-Forwarded-Port`.
+    port: u16,
+    /// `https` for a TLS listener, else `http`; for `X-Forwarded-Proto`/`-Scheme`.
+    scheme: &'static str,
 }
 
 impl GatewayProxy {
@@ -79,6 +101,18 @@ impl ProxyHttp for GatewayProxy {
             .and_then(|a| a.as_inet())
             .map(|a| a.port())
             .unwrap_or(0);
+
+        // Capture the forwarded-header values now, while we have the Session and
+        // the original (pre-rewrite) Host. Emitted to the upstream later.
+        ctx.fwd = Forwarded {
+            client_ip: session
+                .client_addr()
+                .and_then(|a| a.as_inet())
+                .map(|a| a.ip().to_string()),
+            host: host.clone(),
+            port,
+            scheme: if self.tls_ports.contains(&port) { "https" } else { "http" },
+        };
 
         let snapshot = self.data_plane.load();
         let Some(entry) = snapshot.routes.match_request(port, &host, &path, &method, &headers, &query) else {
@@ -180,6 +214,22 @@ impl ProxyHttp for GatewayProxy {
     where
         Self::CTX: Send + Sync,
     {
+        // Forwarded headers (nginx-ingress parity). OVERWRITE rather than append:
+        // an inbound X-Forwarded-* is attacker-controlled when lolgateway faces
+        // the internet directly, so we never trust/extend it. Set before
+        // apply_header_mods so an explicit user RequestHeaderModifier still wins.
+        let fwd = &ctx.fwd;
+        match &fwd.client_ip {
+            Some(ip) => upstream.set_header("X-Forwarded-For", ip),
+            // No known client IP: strip any inbound value so a spoofed one can't
+            // leak through. Better to send nothing than an untrusted address.
+            None => HeaderTarget::remove_header(upstream, "X-Forwarded-For"),
+        }
+        upstream.set_header("X-Forwarded-Host", &fwd.host);
+        upstream.set_header("X-Forwarded-Port", &fwd.port.to_string());
+        upstream.set_header("X-Forwarded-Proto", fwd.scheme);
+        upstream.set_header("X-Forwarded-Scheme", fwd.scheme);
+
         apply_header_mods(&ctx.filters.request_headers, upstream);
 
         // URL rewrite: path and/or hostname.
