@@ -349,6 +349,11 @@ fn write_cors_headers(resp: &mut ResponseHeader, cors: &crate::route_table::Cors
     if !cors.expose_headers.is_empty() {
         let _ = resp.insert_header("Access-Control-Expose-Headers", cors.expose_headers.join(", "));
     }
+    // The Allow-Origin value is selected per request Origin, so the response is not
+    // safely cacheable across origins. Advertise that with `Vary: Origin` (RFC 9110
+    // §12.5.5) so a shared cache can't serve one origin's grant to another. Append
+    // rather than overwrite, to preserve any Vary the upstream already set.
+    let _ = ResponseHeader::append_header(resp, "Vary", "Origin");
 }
 
 /// Write CORS headers for an allowed preflight request. A `*` in allow-methods or
@@ -360,7 +365,7 @@ fn write_cors_preflight(
     req_method: &str,
     req_headers: &str,
 ) {
-    write_cors_headers(resp, cors, origin);
+    write_cors_headers(resp, cors, origin); // adds `Vary: Origin`
     let methods = expand_wildcard(&cors.allow_methods, req_method);
     if !methods.is_empty() {
         let _ = resp.insert_header("Access-Control-Allow-Methods", methods);
@@ -372,6 +377,10 @@ fn write_cors_preflight(
     if let Some(age) = cors.max_age {
         let _ = resp.insert_header("Access-Control-Max-Age", age.to_string());
     }
+    // A `*` allow-list echoes the request's method/headers, so the preflight
+    // response also varies on those request headers — advertise that for caches.
+    let _ = ResponseHeader::append_header(resp, "Vary", "Access-Control-Request-Method");
+    let _ = ResponseHeader::append_header(resp, "Vary", "Access-Control-Request-Headers");
 }
 
 /// Join a CORS allow-list, expanding a sole `*` to the requested value.
