@@ -61,3 +61,11 @@ instant-acme = { version = "0.8", default-features = false, features = [
 rcgen = "0.14" # validation cert (id-pe-acmeIdentifier) + issued-cert keypair/CSR
 kube-leader-election = "0.43" # coordination.k8s.io Lease leader election
 x509-parser = "0.16" # read cert notAfter for renewal scheduling
+
+# Global allocator. The default glibc malloc creates up to 8*nCPU arenas and
+# never returns freed memory to the OS, so a busy multi-threaded proxy ratchets
+# RSS up to a per-arena high-water mark under concurrency bursts and OOMs (seen
+# in prod: anon heap climbing to the cgroup limit with no code leak). jemalloc
+# fragments far less and decays memory back to the OS, bounding steady-state RSS.
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"

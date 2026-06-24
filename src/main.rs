@@ -7,6 +7,16 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use kube::Client;
 
+// Use jemalloc instead of the system glibc malloc. glibc malloc spawns up to
+// 8*nCPU arenas and caches freed chunks per-arena without returning them to the
+// OS, so under bursts of concurrent connections this proxy's RSS ratchets up to a
+// fragmented high-water mark and never recedes — which OOM-killed it in prod with
+// no actual code leak. jemalloc fragments far less and decays memory back to the
+// OS, keeping steady-state RSS bounded.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 mod acme;
 mod acme_cert;
 mod cert_store;
