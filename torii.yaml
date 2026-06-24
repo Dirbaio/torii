@@ -159,8 +159,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: torii
-          # Build from the repo Dockerfile and push to your registry.
-          image: ghcr.io/CHANGEME/torii:latest
+          image: ghcr.io/dirbaio/torii:latest
           imagePullPolicy: IfNotPresent
           args:
             - --bind-ip=0.0.0.0
@@ -170,7 +169,7 @@ spec:
             # clients/DNS reach this gateway. Set to your Service's external IP
             # (LoadBalancer) or node IP. The downward API can't give a LB IP, so
             # set it explicitly here.
-            - --advertise=CHANGEME.gateway.example.com
+            - --advertise=0.0.0.0
             # --- ACME (optional). Remove these to disable automatic TLS certs.
             #     A Gateway then opts in with the `torii.dirba.io/acme` annotation;
             #     issuer/email default to these flags (override per-Gateway with the
@@ -213,7 +212,7 @@ spec:
       terminationGracePeriodSeconds: 30
 ---
 # Exposes the gateway data-plane ports to the outside world. On a cloud provider
-# a LoadBalancer gives you an external IP/hostname — put that in --advertise and
+# a LoadBalancer gives you an external IP — put that in --advertise and
 # point your domains' DNS at it. For bare-metal use MetalLB, or switch to
 # type: NodePort / a hostPort on the Deployment.
 apiVersion: v1
@@ -232,3 +231,10 @@ spec:
     - { name: https, port: 443, targetPort: https, protocol: TCP }
   # Preserve the client source IP so X-Forwarded-For is accurate.
   externalTrafficPolicy: Local
+---
+apiVersion: gateway.networking.k8s.io/v1
+kind: GatewayClass
+metadata:
+  name: torii
+spec:
+  controllerName: torii.dirba.io/controller
