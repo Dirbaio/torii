@@ -94,7 +94,7 @@ impl ProxyHttp for GatewayProxy {
             .uri
             .host()
             .or_else(|| req.headers.get("host").and_then(|v| v.to_str().ok()))
-            .map(strip_port)
+            .and_then(host_from_authority)
             .unwrap_or_default()
             .to_string();
         let headers = req.headers.clone();
@@ -540,8 +540,87 @@ fn is_default_port(scheme: &str, port: u16) -> bool {
     matches!((scheme, port), ("http", 80) | ("https", 443))
 }
 
-fn strip_port(host: &str) -> &str {
-    host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
+/// Split a `host:port`, `[host]:port`, or `[host%zone]:port` authority into its
+/// `(host, port)` parts, unbracketing an IPv6 literal. A faithful port of Go's
+/// `net.SplitHostPort` (the stdlib gets the IPv6-bracket and stray-bracket cases
+/// right), so it returns an error — rather than silently passing garbage through —
+/// for a malformed authority. Like Go, it REQUIRES a port: a bare host with no
+/// `:port` is `MissingPort` (the caller decides how to treat that).
+fn split_host_port(hostport: &str) -> Result<(&str, &str), HostPortError> {
+    let b = hostport.as_bytes();
+    // The port starts after the last colon.
+    let Some(i) = b.iter().rposition(|&c| c == b':') else {
+        return Err(HostPortError::MissingPort);
+    };
+
+    let host;
+    let (mut j, mut k) = (0usize, 0usize);
+    if b[0] == b'[' {
+        // Expect the first ']' just before the last ':'.
+        let Some(end) = b.iter().position(|&c| c == b']') else {
+            return Err(HostPortError::MissingRBracket);
+        };
+        if end + 1 == hostport.len() {
+            // There can't be a ':' behind the ']' now.
+            return Err(HostPortError::MissingPort);
+        } else if end + 1 == i {
+            // The expected result. (fallthrough)
+        } else {
+            // Either ']' isn't followed by a colon, or it's followed by a colon
+            // that is not the last one.
+            if b[end + 1] == b':' {
+                return Err(HostPortError::TooManyColons);
+            }
+            return Err(HostPortError::MissingPort);
+        }
+        host = &hostport[1..end];
+        j = 1;
+        k = end + 1; // there can't be a '[' resp. ']' before these positions
+    } else {
+        host = &hostport[..i];
+        if host.as_bytes().contains(&b':') {
+            return Err(HostPortError::TooManyColons);
+        }
+    }
+    if hostport[j..].as_bytes().contains(&b'[') {
+        return Err(HostPortError::UnexpectedLBracket);
+    }
+    if hostport[k..].as_bytes().contains(&b']') {
+        return Err(HostPortError::UnexpectedRBracket);
+    }
+
+    let port = &hostport[i + 1..];
+    Ok((host, port))
+}
+
+/// Why an authority string isn't a valid `host:port` (mirrors Go's `AddrError`).
+#[derive(Debug, PartialEq, Eq)]
+enum HostPortError {
+    MissingPort,
+    TooManyColons,
+    MissingRBracket,
+    UnexpectedLBracket,
+    UnexpectedRBracket,
+}
+
+/// Extract just the host from a Host header / `:authority`, dropping any `:port`
+/// and unbracketing an IPv6 literal. Unlike [`split_host_port`], a bare host with
+/// no port is valid here (a Host header usually omits the port) — that's the only
+/// "error" we tolerate. Any genuinely malformed authority (too many colons,
+/// unbalanced brackets) yields `None`, so we route it to a 404 / empty host rather
+/// than forwarding garbage as `X-Forwarded-Host`.
+fn host_from_authority(authority: &str) -> Option<&str> {
+    match split_host_port(authority) {
+        Ok((host, _)) => Some(host),
+        // No port: the whole string is the host. Unbracket a bare IPv6 literal
+        // (`[::1]`), but reject an unterminated bracket as malformed.
+        Err(HostPortError::MissingPort) => match authority.strip_prefix('[') {
+            None => Some(authority),
+            Some(rest) => rest.strip_suffix(']'),
+        },
+        // Too many colons / stray brackets → malformed.
+        Err(_) => None,
+    }
 }
 
 /// Find `proto` in the client's wire-format ALPN list, returning a sub-slice of
@@ -1244,5 +1323,62 @@ mod tests {
             .await
             .expect_err("must time out");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    // split_host_port matches Go's net.SplitHostPort: it unbrackets IPv6 literals
+    // and REQUIRES a port. These cases mirror the stdlib's own test table.
+    #[test]
+    fn split_host_port_ok() {
+        assert_eq!(split_host_port("example.com:443"), Ok(("example.com", "443")));
+        assert_eq!(split_host_port("10.0.0.1:8080"), Ok(("10.0.0.1", "8080")));
+        assert_eq!(split_host_port("[::1]:443"), Ok(("::1", "443")));
+        assert_eq!(split_host_port("[2001:db8::1]:8443"), Ok(("2001:db8::1", "8443")));
+        assert_eq!(split_host_port("[fe80::1%lo0]:53"), Ok(("fe80::1%lo0", "53")));
+        // Empty host or port halves are allowed by Go (it only checks structure).
+        assert_eq!(split_host_port(":80"), Ok(("", "80")));
+        assert_eq!(split_host_port("example.com:"), Ok(("example.com", "")));
+    }
+
+    #[test]
+    fn split_host_port_errors() {
+        use HostPortError::*;
+        // No colon at all → missing port.
+        assert_eq!(split_host_port("example.com"), Err(MissingPort));
+        // Bare IPv6 (multiple colons, no brackets) → too many colons.
+        assert_eq!(split_host_port("::1"), Err(TooManyColons));
+        assert_eq!(split_host_port("2001:db8::1"), Err(TooManyColons));
+        // Bracketed literal with no port → missing port.
+        assert_eq!(split_host_port("[::1]"), Err(MissingPort));
+        // Unterminated bracket.
+        assert_eq!(split_host_port("[::1:80"), Err(MissingRBracket));
+        // ']' not immediately followed by the final ':' → too many / missing port.
+        assert_eq!(split_host_port("[::1]extra:80"), Err(MissingPort));
+        // Stray brackets in a non-bracketed host.
+        assert_eq!(split_host_port("a]b:80"), Err(UnexpectedRBracket));
+    }
+
+    // host_from_authority is the caller-side adapter: a bare host (no port) is fine,
+    // IPv6 literals are unbracketed, genuine garbage is rejected (None → 404).
+    #[test]
+    fn host_from_authority_extracts_host() {
+        // With a port.
+        assert_eq!(host_from_authority("example.com:443"), Some("example.com"));
+        assert_eq!(host_from_authority("[::1]:443"), Some("::1"));
+        // Without a port (the common Host-header case).
+        assert_eq!(host_from_authority("example.com"), Some("example.com"));
+        assert_eq!(host_from_authority("10.0.0.1"), Some("10.0.0.1"));
+        // Bare bracketed IPv6, no port → unbracketed.
+        assert_eq!(host_from_authority("[::1]"), Some("::1"));
+        assert_eq!(host_from_authority("[2001:db8::1]"), Some("2001:db8::1"));
+    }
+
+    #[test]
+    fn host_from_authority_rejects_garbage() {
+        // Bare (unbracketed) IPv6 is malformed as an authority.
+        assert_eq!(host_from_authority("::1"), None);
+        assert_eq!(host_from_authority("2001:db8::1"), None);
+        // Unterminated / stray brackets.
+        assert_eq!(host_from_authority("[::1"), None);
+        assert_eq!(host_from_authority("[::1]extra:80"), None);
     }
 }
