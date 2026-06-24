@@ -742,6 +742,14 @@ const MAX_CLIENT_HELLO: usize = 16 * 1024;
 /// would hang the per-connection task.
 const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Idle timeout for the raw L4 byte pipe (TLSRoute passthrough / terminate-to-TCP).
+/// If no bytes flow in EITHER direction for this long, the connection is torn down.
+/// Unlike a fixed total cap, an idle bound doesn't kill legitimately long-lived but
+/// active connections (large transfers, long-poll). Without it, a client that
+/// completes the handshake then stalls would pin a task + its upstream socket
+/// indefinitely (no keepalive/read timeout applies on this custom L4 path).
+const PIPE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// The TLS data-plane application for a port that may carry TLSRoutes.
 ///
 /// On a **plain-TCP** listener (so Pingora does NOT terminate TLS for us), this
@@ -793,8 +801,9 @@ impl pingora_core::apps::ServerApp for GatewayTlsApp {
                     tracing::debug!(ip = %ep.ip, "passthrough backend connect failed");
                     return None;
                 };
-                // True bidirectional pipe: the backend may speak first.
-                let _ = tokio::io::copy_bidirectional(&mut stream, &mut upstream).await;
+                // True bidirectional pipe: the backend may speak first. Bounded by an
+                // idle timeout so a stalled connection can't pin the task forever.
+                let _ = copy_bidirectional_idle(&mut stream, &mut upstream, PIPE_IDLE_TIMEOUT).await;
                 None
             }
             TlsDecision::Terminate(ep) => {
@@ -819,7 +828,7 @@ impl pingora_core::apps::ServerApp for GatewayTlsApp {
                     return None;
                 };
                 let mut tls_stream = tls_stream;
-                let _ = tokio::io::copy_bidirectional(&mut tls_stream, &mut upstream).await;
+                let _ = copy_bidirectional_idle(&mut tls_stream, &mut upstream, PIPE_IDLE_TIMEOUT).await;
                 None
             }
             TlsDecision::NoBackend => {
@@ -944,6 +953,123 @@ impl GatewayTlsApp {
                 }
             }
         }
+    }
+}
+
+/// Bidirectional byte pipe with an **idle timeout**: if no bytes flow in EITHER
+/// direction for `idle`, the connection is torn down. Without it, a client that
+/// completes the handshake then stalls would pin a task + its upstream socket
+/// indefinitely (no keepalive/read timeout applies on this custom L4 path).
+///
+/// We keep the proven [`tokio::io::copy_bidirectional`] engine — which gets the
+/// half-close / "backend speaks first" semantics right (the conformance TCP backend
+/// sends a welcome line before reading) — and wrap each stream in an [`ActivityIo`]
+/// that stamps a shared `last_active` instant on every successful read/write. A
+/// watchdog races the copy and fires only after a full `idle` window with no
+/// activity. Returns the per-direction byte counts, or an idle-timeout error.
+async fn copy_bidirectional_idle<A, B>(
+    a: &mut A,
+    b: &mut B,
+    idle: std::time::Duration,
+) -> std::io::Result<(u64, u64)>
+where
+    A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
+    B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
+{
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    // Shared "millis since start of last I/O activity", updated by both wrappers.
+    let start = tokio::time::Instant::now();
+    let last_active = Arc::new(AtomicU64::new(0));
+    let mut wa = ActivityIo { inner: a, start, last_active: last_active.clone() };
+    let mut wb = ActivityIo { inner: b, start, last_active: last_active.clone() };
+
+    let copy = tokio::io::copy_bidirectional(&mut wa, &mut wb);
+    tokio::pin!(copy);
+
+    loop {
+        // Sleep until the deadline implied by the most recent activity, then re-check;
+        // if activity advanced in the meantime, sleep again. Only a full idle window
+        // with zero progress trips the timeout.
+        let deadline = start
+            + std::time::Duration::from_millis(last_active.load(Ordering::Relaxed))
+            + idle;
+        tokio::select! {
+            res = &mut copy => return res,
+            _ = tokio::time::sleep_until(deadline) => {
+                let idle_for = start.elapsed().as_millis() as u64
+                    - last_active.load(Ordering::Relaxed);
+                if idle_for >= idle.as_millis() as u64 {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "idle timeout on L4 pipe",
+                    ));
+                }
+                // Activity happened while we slept; loop and recompute the deadline.
+            }
+        }
+    }
+}
+
+/// An `AsyncRead`/`AsyncWrite` wrapper that records the time of the last successful
+/// (non-zero, non-pending) I/O into a shared atomic, so [`copy_bidirectional_idle`]
+/// can enforce an idle timeout without reimplementing the copy itself.
+struct ActivityIo<'a, T: ?Sized> {
+    inner: &'a mut T,
+    start: tokio::time::Instant,
+    last_active: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl<T: ?Sized> ActivityIo<'_, T> {
+    fn mark(&self) {
+        let ms = self.start.elapsed().as_millis() as u64;
+        self.last_active
+            .store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+impl<T: tokio::io::AsyncRead + Unpin + ?Sized> tokio::io::AsyncRead for ActivityIo<'_, T> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let before = buf.filled().len();
+        let r = std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf);
+        if let std::task::Poll::Ready(Ok(())) = &r {
+            if buf.filled().len() != before {
+                self.mark();
+            }
+        }
+        r
+    }
+}
+
+impl<T: tokio::io::AsyncWrite + Unpin + ?Sized> tokio::io::AsyncWrite for ActivityIo<'_, T> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let r = std::pin::Pin::new(&mut *self.inner).poll_write(cx, buf);
+        if let std::task::Poll::Ready(Ok(n)) = &r {
+            if *n > 0 {
+                self.mark();
+            }
+        }
+        r
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.inner).poll_shutdown(cx)
     }
 }
 
@@ -1072,4 +1198,51 @@ pub fn run(
 
     tracing::info!(bind_ip, ?http_ports, ?tls_ports, "data plane listening");
     server.run_forever();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // copy_bidirectional_idle relays bytes both ways and ends cleanly on EOF.
+    #[tokio::test]
+    async fn idle_copy_relays_both_directions() {
+        let (mut a_ext, mut a_int) = tokio::io::duplex(64);
+        let (mut b_ext, mut b_int) = tokio::io::duplex(64);
+
+        let pipe = tokio::spawn(async move {
+            copy_bidirectional_idle(&mut a_int, &mut b_int, Duration::from_secs(5)).await
+        });
+
+        // a → b
+        a_ext.write_all(b"ping").await.unwrap();
+        let mut buf = [0u8; 4];
+        b_ext.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+
+        // b → a (the backend may speak too)
+        b_ext.write_all(b"pong").await.unwrap();
+        a_ext.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"pong");
+
+        // Close both external ends → both directions EOF → copy returns counts.
+        drop(a_ext);
+        drop(b_ext);
+        let (a2b, b2a) = pipe.await.unwrap().expect("clean close");
+        assert_eq!((a2b, b2a), (4, 4));
+    }
+
+    // A stalled connection (no bytes either way) is torn down at the idle deadline.
+    #[tokio::test]
+    async fn idle_copy_times_out_when_stalled() {
+        let (_a_ext, mut a_int) = tokio::io::duplex(64);
+        let (_b_ext, mut b_int) = tokio::io::duplex(64);
+        // Hold the external ends open but send nothing.
+        let err = copy_bidirectional_idle(&mut a_int, &mut b_int, Duration::from_millis(80))
+            .await
+            .expect_err("must time out");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
 }
