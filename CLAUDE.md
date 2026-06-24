@@ -1,4 +1,4 @@
-# lolgateway
+# torii
 
 A [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) controller implemented in
 Rust, with a data plane built on [Pingora](https://github.com/cloudflare/pingora). The
@@ -14,7 +14,7 @@ the workspace; see **Building from here** below.
 ## Repository layout
 
 ```
-lolgateway/
+torii/
 ├── CLAUDE.md            # this file
 ├── pingora/             # vendored Pingora source — depend on via path, do NOT edit
 ├── gateway-api/         # vendored Gateway API v1.5 — CRDs, docs, conformance suite (Go)
@@ -111,7 +111,7 @@ This is **Gateway API v1.5** (`CHANGELOG/1.5-CHANGELOG.md`).
   GatewayClass's `Accepted` condition** (`suite.go:374`,
   `GWCMustHaveAcceptedConditionTrue`). So: we must install a `GatewayClass` whose
   `spec.controllerName` is ours, and our controller must set its `Accepted=True`
-  condition. Pick a stable controller name like `lolgateway.dev/controller`.
+  condition. Pick a stable controller name like `torii.dirba.io/controller`.
 
 ### The echo backend / response assertions
 
@@ -125,7 +125,7 @@ check `Namespace`, `Pod` (must start with the expected backend service name), ec
 
 You need a cluster (kind/k3d). High level:
 1. `kubectl apply` the CRDs from `gateway-api/config/crd/` (standard channel).
-2. Run lolgateway against the cluster (in-cluster or out-of-cluster via kubeconfig).
+2. Run torii against the cluster (in-cluster or out-of-cluster via kubeconfig).
 3. From `gateway-api/`, run the suite, scoping to one test while iterating, e.g.:
    ```
    go test ./conformance -run TestConformance \
@@ -140,7 +140,7 @@ Iterate one test at a time. `HTTPRouteSimpleSameNamespace`
 
 ## Building from here
 
-1. Scaffold a Cargo workspace at the repo root. Suggested members: `lolgateway`
+1. Scaffold a Cargo workspace at the repo root. Suggested members: `torii`
    (binary), plus crates for control plane and data plane if it helps separation.
 2. Add **path** dependencies on Pingora, e.g.:
    ```toml

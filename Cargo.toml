@@ -1,5 +1,5 @@
 [package]
-name = "lolgateway"
+name = "torii"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.84"
@@ -10,7 +10,7 @@ description = "A Kubernetes Gateway API controller built on Pingora"
 # We depend on pingora via path (below); they are NOT part of this package.
 
 [[bin]]
-name = "lolgateway"
+name = "torii"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,4 +1,4 @@
-# Build lolgateway. Multi-stage: a Debian-based Rust builder (so the binary's
+# Build torii. Multi-stage: a Debian-based Rust builder (so the binary's
 # glibc/OpenSSL ABI matches the Debian runtime + the kind node), then a slim
 # runtime image with just the shared libs Pingora's OpenSSL backend needs.
 #
@@ -17,8 +17,8 @@ WORKDIR /src
 COPY . .
 
 # Build only our binary (pingora/gateway-api are path/vendored, not members).
-RUN cargo build --release --bin lolgateway \
-    && cp target/release/lolgateway /lolgateway
+RUN cargo build --release --bin torii \
+    && cp target/release/torii /torii
 
 FROM debian:bookworm-slim AS runtime
 
@@ -27,6 +27,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libssl3 ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-COPY --from=builder /lolgateway /usr/local/bin/lolgateway
+COPY --from=builder /torii /usr/local/bin/torii
 
-ENTRYPOINT ["/usr/local/bin/lolgateway"]
+ENTRYPOINT ["/usr/local/bin/torii"]

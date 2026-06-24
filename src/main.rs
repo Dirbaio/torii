@@ -1,4 +1,4 @@
-//! lolgateway — a Kubernetes Gateway API controller built on Pingora.
+//! torii — a Kubernetes Gateway API controller built on Pingora.
 //!
 //! This is the scaffolding entrypoint. Right now it only proves we can talk to
 //! the Kubernetes API server; the controller and data plane come later.
@@ -18,12 +18,12 @@ mod snapshot;
 mod tls_sni;
 mod tls_table;
 
-/// lolgateway: a Kubernetes Gateway API controller built on Pingora.
+/// torii: a Kubernetes Gateway API controller built on Pingora.
 #[derive(Parser, Debug)]
-#[command(name = "lolgateway", version, about)]
+#[command(name = "torii", version, about)]
 struct Cli {
-    /// Log filter, e.g. `info`, `debug`, `lolgateway=debug,kube=info`.
-    #[arg(long, env = "LOLGATEWAY_LOG", default_value = "info")]
+    /// Log filter, e.g. `info`, `debug`, `torii=debug,kube=info`.
+    #[arg(long, env = "TORII_LOG", default_value = "info")]
     log: String,
 
     #[command(subcommand)]
@@ -41,13 +41,13 @@ enum Command {
 #[derive(clap::Args, Debug)]
 struct RunArgs {
     /// IP the data-plane proxy binds to.
-    #[arg(long, env = "LOLGATEWAY_BIND_IP", default_value = "0.0.0.0")]
+    #[arg(long, env = "TORII_BIND_IP", default_value = "0.0.0.0")]
     bind_ip: String,
 
     /// Plain-HTTP listener ports. The proxy routes per-port via the local socket.
     #[arg(
         long,
-        env = "LOLGATEWAY_HTTP_PORTS",
+        env = "TORII_HTTP_PORTS",
         value_delimiter = ',',
         default_value = "80,8080,8090"
     )]
@@ -59,7 +59,7 @@ struct RunArgs {
     /// ports (8443, 8883) alongside the standard 443.
     #[arg(
         long,
-        env = "LOLGATEWAY_TLS_PORTS",
+        env = "TORII_TLS_PORTS",
         value_delimiter = ',',
         default_value = "443,8443,8883"
     )]
@@ -67,30 +67,30 @@ struct RunArgs {
 
     /// IP advertised in Gateway.status.addresses — must be reachable by the
     /// conformance suite. Defaults to the loopback address.
-    #[arg(long, env = "LOLGATEWAY_ADVERTISE", default_value = "127.0.0.1")]
+    #[arg(long, env = "TORII_ADVERTISE", default_value = "127.0.0.1")]
     advertise: String,
 
     /// Enable automatic TLS certificate issuance via ACME (TLS-ALPN-01).
     /// OFF by default; even when on, a Gateway must opt in with the
-    /// `lolgateway.dev/acme-issuer` annotation. Requires a TLS listener port.
-    #[arg(long, env = "LOLGATEWAY_ACME")]
+    /// `torii.dirba.io/acme-issuer` annotation. Requires a TLS listener port.
+    #[arg(long, env = "TORII_ACME")]
     acme: bool,
 
     /// Namespace where ACME state Secrets are stored (account key, in-flight
     /// challenge cert). The issued certs go into each listener's own
     /// certificateRefs Secret, not here.
-    #[arg(long, env = "LOLGATEWAY_ACME_NAMESPACE", default_value = "lolgateway-system")]
+    #[arg(long, env = "TORII_ACME_NAMESPACE", default_value = "torii-system")]
     acme_namespace: String,
 
     /// Contact email for the ACME account (used if a Gateway's
-    /// `lolgateway.dev/acme-email` annotation is absent). Optional.
-    #[arg(long, env = "LOLGATEWAY_ACME_EMAIL")]
+    /// `torii.dirba.io/acme-email` annotation is absent). Optional.
+    #[arg(long, env = "TORII_ACME_EMAIL")]
     acme_email: Option<String>,
 
     /// Path to a PEM root CA the ACME client should trust. Only needed for ACME
     /// servers with a testing PKI (e.g. pebble); production CAs are publicly
     /// trusted. Optional.
-    #[arg(long, env = "LOLGATEWAY_ACME_CA_CERT")]
+    #[arg(long, env = "TORII_ACME_CA_CERT")]
     acme_ca_cert: Option<String>,
 }
 
@@ -160,7 +160,7 @@ async fn run(args: RunArgs) -> Result<()> {
 fn acme_holder_id() -> String {
     std::env::var("POD_NAME")
         .or_else(|_| std::env::var("HOSTNAME"))
-        .unwrap_or_else(|_| format!("lolgateway-{}", std::process::id()))
+        .unwrap_or_else(|_| format!("torii-{}", std::process::id()))
 }
 
 fn init_tracing(filter: &str) {

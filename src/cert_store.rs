@@ -25,10 +25,10 @@ impl CertKey {
     pub fn generate_self_signed() -> Result<CertKey, rcgen::Error> {
         let key = rcgen::KeyPair::generate()?;
         let mut params =
-            rcgen::CertificateParams::new(vec!["lolgateway-fallback.invalid".to_string()])?;
+            rcgen::CertificateParams::new(vec!["torii-fallback.invalid".to_string()])?;
         let mut dn = rcgen::DistinguishedName::new();
-        dn.push(rcgen::DnType::CommonName, "lolgateway fallback certificate");
-        dn.push(rcgen::DnType::OrganizationName, "lolgateway");
+        dn.push(rcgen::DnType::CommonName, "torii fallback certificate");
+        dn.push(rcgen::DnType::OrganizationName, "torii");
         params.distinguished_name = dn;
         let cert = params.self_signed(&key)?;
         Ok(CertKey {

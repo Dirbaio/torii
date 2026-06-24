@@ -1,40 +1,40 @@
 #!/usr/bin/env bash
-# End-to-end test of lolgateway's ACME TLS-ALPN-01 issuance, fully in-cluster.
+# End-to-end test of torii's ACME TLS-ALPN-01 issuance, fully in-cluster.
 #
 # Everything runs inside the kind cluster, so there are no host<->cluster DNS or
 # routing problems:
 #
 #   pebble              - a tiny ACME test CA (issues real certs from a test PKI).
 #   pebble-challtestsrv - a mock DNS server pebble uses to resolve the challenge
-#                         hostname; we point that name at lolgateway's Service so
-#                         pebble's TLS-ALPN-01 validator reaches lolgateway:443.
-#   lolgateway          - the controller under test, run with --acme and told to
+#                         hostname; we point that name at torii's Service so
+#                         pebble's TLS-ALPN-01 validator reaches torii:443.
+#   torii          - the controller under test, run with --acme and told to
 #                         trust pebble's test CA (--acme-ca-cert).
 #
 # Flow:
 #   1. (re)create the test namespace.
-#   2. RBAC for lolgateway (watch gateway resources, write status, manage Secrets,
+#   2. RBAC for torii (watch gateway resources, write status, manage Secrets,
 #      coordinate via Leases).
 #   3. deploy challtestsrv + pebble (pebble validates TLS-ALPN-01 on :443 and
 #      resolves names via challtestsrv).
-#   4. fetch pebble's test CA, hand it to lolgateway (--acme-ca-cert) and curl.
-#   5. deploy lolgateway with --acme.
+#   4. fetch pebble's test CA, hand it to torii (--acme-ca-cert) and curl.
+#   5. deploy torii with --acme.
 #   6. an echo backend + a Gateway opted into ACME (annotation) with an HTTPS
 #      listener for the test host, whose cert Secret does NOT exist yet.
-#   7. point the test host at lolgateway's Service via challtestsrv.
+#   7. point the test host at torii's Service via challtestsrv.
 #   8. assert: the cert Secret gets populated by an ACME-issued cert, and the
 #      gateway serves HTTPS for the test host validating against pebble's CA.
 #
 # Prereqs: a kind cluster named "lol" (`just cluster-up`), kubectl pointed at it,
-# docker (to build the lolgateway image), and `kind`. The lolgateway image is
+# docker (to build the torii image), and `kind`. The torii image is
 # built + loaded by this script.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-NS=lolgateway-acme-e2e
+NS=torii-acme-e2e
 HOST=acme-test.lol.example
-IMAGE=lolgateway:e2e
+IMAGE=torii:e2e
 KIND_CLUSTER=lol
 KUBECONFIG=${KUBECONFIG:-./kubeconfig}
 export KUBECONFIG
@@ -42,7 +42,7 @@ export KUBECONFIG
 k() { kubectl -n "$NS" "$@"; }
 
 # ---------------------------------------------------------------------------
-echo "==> build + load lolgateway image ($IMAGE)"
+echo "==> build + load torii image ($IMAGE)"
 docker build -t "$IMAGE" .
 kind load docker-image "$IMAGE" --name "$KIND_CLUSTER"
 
@@ -52,15 +52,15 @@ kubectl delete namespace "$NS" --ignore-not-found --wait=true
 kubectl create namespace "$NS"
 
 # ---------------------------------------------------------------------------
-echo "==> RBAC for lolgateway"
+echo "==> RBAC for torii"
 kubectl apply -f - <<YAML
 apiVersion: v1
 kind: ServiceAccount
-metadata: { name: lolgateway, namespace: $NS }
+metadata: { name: torii, namespace: $NS }
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
-metadata: { name: lolgateway-$NS }
+metadata: { name: torii-$NS }
 rules:
   - apiGroups: ["gateway.networking.k8s.io"]
     resources: ["gatewayclasses","gateways","httproutes","referencegrants","backendtlspolicies"]
@@ -83,10 +83,10 @@ rules:
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
-metadata: { name: lolgateway-$NS }
-roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: lolgateway-$NS }
+metadata: { name: torii-$NS }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: torii-$NS }
 subjects:
-  - { kind: ServiceAccount, name: lolgateway, namespace: $NS }
+  - { kind: ServiceAccount, name: torii, namespace: $NS }
 YAML
 
 # ---------------------------------------------------------------------------
@@ -131,8 +131,8 @@ YAML
 
 echo "==> mint pebble's ACME-API cert for its in-cluster FQDN (signed by minica)"
 # Pebble's stock API cert (CN=localhost) is only valid for localhost/pebble/127.0.0.1,
-# but lolgateway connects to pebble.$NS.svc:14000 — so we mint a replacement cert
-# covering that FQDN, signed by pebble's baked-in minica root. lolgateway trusts
+# but torii connects to pebble.$NS.svc:14000 — so we mint a replacement cert
+# covering that FQDN, signed by pebble's baked-in minica root. torii trusts
 # the minica via --acme-ca-cert, so the in-cluster TLS connection to pebble verifies.
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
@@ -153,7 +153,7 @@ openssl x509 -req -in "$TMP/pebble.csr" \
 k create secret tls pebble-api-tls --cert="$TMP/pebble.crt" --key="$TMP/pebble.key.pem"
 
 echo "==> deploy pebble (ACME test CA; validates TLS-ALPN-01 on :443)"
-# Custom config: tlsPort 443 so the validator connects to lolgateway's :443, and
+# Custom config: tlsPort 443 so the validator connects to torii's :443, and
 # the minted FQDN cert above for the ACME API endpoint.
 k create configmap pebble-config --from-literal=pebble-config.json='{
   "pebble": {
@@ -182,7 +182,7 @@ spec:
           image: ghcr.io/letsencrypt/pebble:latest
           imagePullPolicy: IfNotPresent
           # Resolve challenge hostnames via challtestsrv so TLS-ALPN-01 validation
-          # reaches lolgateway's Service. Real PKI validation (not ALWAYS_VALID).
+          # reaches torii's Service. Real PKI validation (not ALWAYS_VALID).
           # The image is distroless; its entrypoint binary is /app.
           command: ["/app"]
           args: ["-config", "/cfg/pebble-config.json", "-dnsserver", "challtestsrv.$NS.svc:8053"]
@@ -214,12 +214,12 @@ k rollout status deploy/pebble --timeout=120s
 #
 #  (a) The ACME *API* endpoint (:14000) is served with a static cert (CN=localhost)
 #      signed by pebble's baked-in "minica" root (test/certs/pebble.minica.pem).
-#      lolgateway's ACME HTTP client must trust THIS to connect — that's what
+#      torii's ACME HTTP client must trust THIS to connect — that's what
 #      --acme-ca-cert points at.
 #
 #  (b) The *issuance* root is generated fresh on each pebble start and served at
 #      https://<mgmt>:15000/roots/0. It signs the certs pebble ISSUES, so curl
-#      must trust THIS to validate the cert lolgateway gets and serves.
+#      must trust THIS to validate the cert torii gets and serves.
 #
 # (a) and (b) are different CAs; conflating them gives "UnknownIssuer".
 echo "==> publish minica as the --acme-ca-cert (trusts pebble's ACME API TLS)"
@@ -264,26 +264,26 @@ spec:
 YAML
 
 # ---------------------------------------------------------------------------
-# lolgateway's ACME leader scans for work every SCAN_INTERVAL (300s) and at
+# torii's ACME leader scans for work every SCAN_INTERVAL (300s) and at
 # startup. To keep the test fast and realistic (the common case is "Gateway
 # already exists, controller starts"), we create the Service, seed DNS, and
-# create the opted-in Gateway FIRST, then deploy lolgateway LAST so its startup
+# create the opted-in Gateway FIRST, then deploy torii LAST so its startup
 # scan issues immediately rather than waiting for the next poll.
-echo "==> lolgateway Service (created early so we can resolve its ClusterIP)"
+echo "==> torii Service (created early so we can resolve its ClusterIP)"
 k apply -f - <<YAML
 apiVersion: v1
 kind: Service
-metadata: { name: lolgateway }
+metadata: { name: torii }
 spec:
-  selector: { app: lolgateway }
+  selector: { app: torii }
   ports:
     - { name: http, port: 80, targetPort: 80 }
     - { name: https, port: 443, targetPort: 443 }
 YAML
 
 # ---------------------------------------------------------------------------
-echo "==> point the challenge host at lolgateway's Service (via challtestsrv)"
-LOLGW_IP=$(k get svc lolgateway -o jsonpath='{.spec.clusterIP}')
+echo "==> point the challenge host at torii's Service (via challtestsrv)"
+LOLGW_IP=$(k get svc torii -o jsonpath='{.spec.clusterIP}')
 echo "    $HOST -> $LOLGW_IP"
 # challtestsrv is distroless; POST to its management API from a throwaway pod.
 # Body: {"host":"<fqdn-with-trailing-dot>","addresses":["<ip>"]}.
@@ -302,8 +302,8 @@ metadata:
   name: acme-test
   namespace: $NS
   annotations:
-    lolgateway.dev/acme-issuer: "$PEBBLE_DIR"
-    lolgateway.dev/acme-email: "test@lol.example"
+    torii.dirba.io/acme-issuer: "$PEBBLE_DIR"
+    torii.dirba.io/acme-email: "test@lol.example"
 spec:
   gatewayClassName: gateway-conformance
   listeners:
@@ -328,21 +328,21 @@ spec:
 YAML
 
 # ---------------------------------------------------------------------------
-echo "==> deploy lolgateway (--acme, trusting pebble's CA) — its startup scan"
+echo "==> deploy torii (--acme, trusting pebble's CA) — its startup scan"
 echo "    finds the already-existing opted-in Gateway and issues immediately"
 k apply -f - <<YAML
 apiVersion: apps/v1
 kind: Deployment
-metadata: { name: lolgateway, labels: { app: lolgateway } }
+metadata: { name: torii, labels: { app: torii } }
 spec:
   replicas: 1
-  selector: { matchLabels: { app: lolgateway } }
+  selector: { matchLabels: { app: torii } }
   template:
-    metadata: { labels: { app: lolgateway } }
+    metadata: { labels: { app: torii } }
     spec:
-      serviceAccountName: lolgateway
+      serviceAccountName: torii
       containers:
-        - name: lolgateway
+        - name: torii
           image: $IMAGE
           imagePullPolicy: Never
           args:
@@ -355,7 +355,7 @@ spec:
             - --acme-ca-cert=/pebble-ca/ca.pem
           env:
             # --log is a global flag (before the subcommand); set it via env instead.
-            - { name: LOLGATEWAY_LOG, value: "info,lolgateway=debug" }
+            - { name: TORII_LOG, value: "info,torii=debug" }
             - { name: POD_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
           volumeMounts: [{ name: pebble-ca, mountPath: /pebble-ca, readOnly: true }]
           ports: [{ containerPort: 80 }, { containerPort: 443 }]
@@ -363,7 +363,7 @@ spec:
         - name: pebble-ca
           configMap: { name: pebble-api-ca }
 YAML
-k rollout status deploy/lolgateway --timeout=120s
+k rollout status deploy/torii --timeout=120s
 
 # ---------------------------------------------------------------------------
 echo "==> wait for the ACME-issued cert Secret ($NS/acme-test-cert)"
@@ -375,7 +375,7 @@ while :; do
   fi
   if [ "$(date +%s)" -ge "$deadline" ]; then
     echo "FAIL: cert Secret not issued within timeout"
-    echo "----- lolgateway logs -----"; k logs deploy/lolgateway --tail=80 || true
+    echo "----- torii logs -----"; k logs deploy/torii --tail=80 || true
     echo "----- pebble logs -----";     k logs deploy/pebble --tail=40 || true
     exit 1
   fi
@@ -389,7 +389,7 @@ k get secret acme-test-cert -o jsonpath='{.data.tls\.crt}' | base64 -d \
 # ---------------------------------------------------------------------------
 echo "==> curl the gateway over HTTPS, validating against pebble's issuance root"
 # The host routes the cluster Service CIDR (see README), so curl straight from
-# here. --resolve maps $HOST:443 to lolgateway's ClusterIP; --cacert is pebble's
+# here. --resolve maps $HOST:443 to torii's ClusterIP; --cacert is pebble's
 # issuance root, so this validates the full chain (leaf + intermediate served by
 # the gateway) up to that root.
 RESULT=$(curl -sS --fail-with-body \
@@ -405,6 +405,6 @@ echo "    echo backend response verified (namespace=$NS, served over TLS)"
 
 echo
 echo "============================================================"
-echo " PASS: lolgateway issued a cert via ACME TLS-ALPN-01 and"
+echo " PASS: torii issued a cert via ACME TLS-ALPN-01 and"
 echo "       served HTTPS for $HOST, validated against pebble's CA."
 echo "============================================================"
