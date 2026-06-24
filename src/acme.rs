@@ -63,6 +63,14 @@ const LEASE_RENEW: Duration = Duration::from_secs(5);
 /// so the challenge Secret can propagate to followers (the validator may hit any).
 const CHALLENGE_SETTLE: Duration = Duration::from_secs(2);
 
+/// Failure backoff: after a failed issuance, wait at least this long before
+/// retrying that host, doubling per consecutive failure up to [`BACKOFF_MAX`].
+/// Without this, a host that can never validate (bad DNS, unreachable :443, typo'd
+/// hostname) is re-ordered every [`SCAN_INTERVAL`] forever — unbounded CA churn that
+/// burns the account's failed-validation budget. The backoff is reset on success.
+const BACKOFF_BASE: Duration = Duration::from_secs(300);
+const BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
+
 /// Runtime config for the ACME subsystem.
 #[derive(Clone)]
 pub struct AcmeConfig {
@@ -98,6 +106,8 @@ pub async fn run(client: Client, data_plane: DataPlane, config: AcmeConfig) -> R
     let mut last_scan = std::time::Instant::now()
         .checked_sub(SCAN_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
+    // Per-host failure backoff, persisted across scans for as long as we stay leader.
+    let mut backoff = Backoff::default();
 
     loop {
         // Renew/acquire the lease on a tight cadence so leadership is fresh.
@@ -112,7 +122,7 @@ pub async fn run(client: Client, data_plane: DataPlane, config: AcmeConfig) -> R
 
         if is_leader && last_scan.elapsed() >= SCAN_INTERVAL {
             last_scan = std::time::Instant::now();
-            if let Err(e) = scan_and_issue(&client, &gw_api, &config).await {
+            if let Err(e) = scan_and_issue(&client, &gw_api, &config, &mut backoff).await {
                 tracing::warn!(error = format!("{e:#}"), "ACME scan/issue failed");
             }
         }
@@ -133,11 +143,72 @@ struct CertNeed {
     secret_name: String,
 }
 
-/// Leader pass: find listeners needing a cert and issue/renew each.
+impl CertNeed {
+    /// Backoff key: the issuance target. Distinct listeners back off independently.
+    fn key(&self) -> (String, String, String) {
+        (self.secret_ns.clone(), self.secret_name.clone(), self.hostname.clone())
+    }
+}
+
+/// Per-host issuance-failure backoff (leader-local, in memory). On leader change the
+/// new leader starts fresh — it then makes at most one attempt per host before the
+/// backoff re-engages, so churn stays bounded across failovers too.
+#[derive(Default)]
+struct Backoff {
+    entries: HashMap<(String, String, String), BackoffEntry>,
+}
+
+struct BackoffEntry {
+    /// Consecutive failures so far (drives the exponential delay).
+    fails: u32,
+    /// Earliest instant at which this host may be attempted again.
+    next_attempt: std::time::Instant,
+}
+
+impl Backoff {
+    /// Should we attempt this need now, or is it still inside its backoff window?
+    fn ready(&self, need: &CertNeed) -> bool {
+        match self.entries.get(&need.key()) {
+            Some(e) => std::time::Instant::now() >= e.next_attempt,
+            None => true,
+        }
+    }
+
+    /// Record a successful issuance — clear any backoff for this host.
+    fn record_success(&mut self, need: &CertNeed) {
+        self.entries.remove(&need.key());
+    }
+
+    /// Record a failure — bump the counter and schedule the next attempt with an
+    /// exponential delay (BACKOFF_BASE * 2^(fails-1), capped at BACKOFF_MAX).
+    fn record_failure(&mut self, need: &CertNeed) -> Duration {
+        let e = self.entries.entry(need.key()).or_insert(BackoffEntry {
+            fails: 0,
+            next_attempt: std::time::Instant::now(),
+        });
+        e.fails = e.fails.saturating_add(1);
+        let delay = backoff_delay(e.fails);
+        e.next_attempt = std::time::Instant::now() + delay;
+        delay
+    }
+}
+
+/// Exponential backoff delay for the n-th consecutive failure (n >= 1):
+/// BACKOFF_BASE * 2^(n-1), saturating at BACKOFF_MAX.
+fn backoff_delay(fails: u32) -> Duration {
+    let shift = fails.saturating_sub(1).min(16); // cap the shift to avoid overflow
+    let mult = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let secs = BACKOFF_BASE.as_secs().saturating_mul(mult);
+    Duration::from_secs(secs).min(BACKOFF_MAX)
+}
+
+/// Leader pass: find listeners needing a cert and issue/renew each, honoring the
+/// per-host failure backoff so a permanently-failing host doesn't churn the CA.
 async fn scan_and_issue(
     client: &Client,
     gw_api: &Api<Gateway>,
     config: &AcmeConfig,
+    backoff: &mut Backoff,
 ) -> Result<()> {
     let needs = self::needs(client, gw_api, config).await?;
     if needs.is_empty() {
@@ -145,8 +216,20 @@ async fn scan_and_issue(
     }
     tracing::info!(count = needs.len(), "ACME: certs to issue/renew");
     for need in needs {
-        if let Err(e) = issue(client, config, &need).await {
-            tracing::warn!(host = %need.hostname, error = format!("{e:#}"), "ACME issuance failed");
+        // Skip hosts still inside their failure-backoff window.
+        if !backoff.ready(&need) {
+            tracing::debug!(host = %need.hostname, "ACME: in failure backoff, skipping this scan");
+            continue;
+        }
+        match issue(client, config, &need).await {
+            Ok(()) => backoff.record_success(&need),
+            Err(e) => {
+                let delay = backoff.record_failure(&need);
+                tracing::warn!(
+                    host = %need.hostname, error = format!("{e:#}"),
+                    retry_in_s = delay.as_secs(), "ACME issuance failed; backing off",
+                );
+            }
         }
     }
     Ok(())
@@ -566,5 +649,50 @@ mod tests {
     #[test]
     fn cert_not_after_rejects_garbage() {
         assert!(cert_not_after(b"not a pem").is_none());
+    }
+
+    fn need(host: &str) -> CertNeed {
+        CertNeed {
+            directory: "https://acme.example/dir".into(),
+            email: None,
+            hostname: host.into(),
+            secret_ns: "default".into(),
+            secret_name: format!("{host}-tls"),
+        }
+    }
+
+    #[test]
+    fn backoff_delay_is_exponential_and_capped() {
+        assert_eq!(backoff_delay(1), BACKOFF_BASE); // 5m
+        assert_eq!(backoff_delay(2), BACKOFF_BASE * 2); // 10m
+        assert_eq!(backoff_delay(3), BACKOFF_BASE * 4); // 20m
+        assert_eq!(backoff_delay(8), BACKOFF_MAX); // saturates at the cap
+        assert_eq!(backoff_delay(100), BACKOFF_MAX); // no overflow at large n
+    }
+
+    #[test]
+    fn backoff_blocks_then_success_resets() {
+        let mut b = Backoff::default();
+        let n = need("a.example.com");
+        // First attempt is always allowed.
+        assert!(b.ready(&n));
+        // After a failure, the host is blocked (next_attempt is in the future).
+        let delay = b.record_failure(&n);
+        assert_eq!(delay, BACKOFF_BASE);
+        assert!(!b.ready(&n), "must back off after a failure");
+        // A second failure doubles the delay.
+        assert_eq!(b.record_failure(&n), BACKOFF_BASE * 2);
+        // Success clears the backoff entirely.
+        b.record_success(&n);
+        assert!(b.ready(&n), "success must reset backoff");
+    }
+
+    #[test]
+    fn backoff_is_per_host() {
+        let mut b = Backoff::default();
+        let (a, c) = (need("a.example.com"), need("c.example.com"));
+        b.record_failure(&a);
+        assert!(!b.ready(&a), "a is backed off");
+        assert!(b.ready(&c), "c is independent and still ready");
     }
 }
