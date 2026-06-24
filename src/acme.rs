@@ -218,25 +218,35 @@ async fn cert_needs_work(client: &Client, ns: &str, name: &str) -> bool {
 
 /// Drive one ACME order to completion and write the issued cert into its Secret.
 async fn issue(client: &Client, config: &AcmeConfig, need: &CertNeed) -> Result<()> {
+    tracing::info!(
+        host = %need.hostname, directory = %need.directory, secret = %need.secret_name,
+        "ACME: starting issuance"
+    );
     let account = load_or_create_account(client, config, &need.directory, need.email.as_deref())
         .await
         .context("ACME account")?;
+    tracing::debug!(host = %need.hostname, "ACME: account ready");
 
     let ids = [Identifier::Dns(need.hostname.clone())];
     let mut order = account
         .new_order(&NewOrder::new(&ids))
         .await
         .context("new_order")?;
+    let order_url = order.url().to_string();
+    tracing::info!(host = %need.hostname, status = ?order.state().status, url = %order_url, "ACME: order created");
 
     // Walk authorizations; for each, publish a TLS-ALPN-01 challenge cert and arm it.
+    let mut armed = 0u32;
     let mut authorizations = order.authorizations();
     while let Some(authz) = authorizations.next().await {
         let mut authz = authz?;
+        let identifier = authz.identifier().to_string();
         // Skip already-valid authorizations (e.g. reused account).
         if matches!(authz.status, instant_acme::AuthorizationStatus::Valid) {
+            tracing::debug!(host = %need.hostname, %identifier, "ACME: authorization already valid, skipping");
             continue;
         }
-        let identifier = authz.identifier().to_string();
+        tracing::info!(host = %need.hostname, %identifier, status = ?authz.status, "ACME: arming tls-alpn-01 challenge");
         let mut challenge = authz
             .challenge(ChallengeType::TlsAlpn01)
             .ok_or_else(|| anyhow!("ACME directory offers no tls-alpn-01 challenge"))?;
@@ -244,16 +254,33 @@ async fn issue(client: &Client, config: &AcmeConfig, need: &CertNeed) -> Result<
         let (cert_pem, key_pem) = crate::acme_cert::alpn_cert(&identifier, digest.as_ref())
             .context("build challenge cert")?;
         publish_challenge(client, &config.namespace, &identifier, &cert_pem, &key_pem).await?;
+        tracing::debug!(
+            host = %need.hostname, %identifier, settle_ms = CHALLENGE_SETTLE.as_millis(),
+            "ACME: published challenge cert, waiting for it to settle then signaling ready"
+        );
         // Give the challenge Secret time to reach followers (validator may hit any).
         tokio::time::sleep(CHALLENGE_SETTLE).await;
         challenge.set_ready().await.context("set_ready")?;
+        armed += 1;
     }
+    tracing::info!(host = %need.hostname, armed, "ACME: challenges armed, polling order for validation");
 
     // Wait for the order to be ready, finalize with our own key, fetch the cert.
-    let status = order.poll_ready(&RetryPolicy::default()).await.context("poll_ready")?;
+    let status = match order.poll_ready(&RetryPolicy::default()).await {
+        Ok(s) => s,
+        Err(e) => {
+            // The order never reached Ready — almost always a challenge-validation
+            // failure (CA couldn't reach :443 / got the wrong cert). Surface the
+            // per-challenge error detail the CA recorded, which the bare timeout hides.
+            log_authorization_failures(&mut order, &need.hostname).await;
+            return Err(e).context("poll_ready");
+        }
+    };
     if status != OrderStatus::Ready {
+        log_authorization_failures(&mut order, &need.hostname).await;
         return Err(anyhow!("ACME order not ready: {status:?}"));
     }
+    tracing::info!(host = %need.hostname, "ACME: order validated, finalizing");
     let key_pair = rcgen::KeyPair::generate().context("gen cert key")?;
     let csr_der = crate::acme_cert::csr_der(&key_pair, &need.hostname).context("build CSR")?;
     order.finalize_csr(&csr_der).await.context("finalize_csr")?;
@@ -261,6 +288,7 @@ async fn issue(client: &Client, config: &AcmeConfig, need: &CertNeed) -> Result<
         .poll_certificate(&RetryPolicy::default())
         .await
         .context("poll_certificate")?;
+    tracing::debug!(host = %need.hostname, "ACME: certificate fetched");
 
     // Write the issued cert into the listener's certificateRefs Secret. The
     // controller's Secret watcher picks it up and the data plane serves it.
@@ -279,6 +307,37 @@ async fn issue(client: &Client, config: &AcmeConfig, need: &CertNeed) -> Result<
 
     tracing::info!(host = %need.hostname, secret = %need.secret_name, "ACME: issued certificate");
     Ok(())
+}
+
+/// On a failed/stuck order, re-walk its authorizations and log each one's status
+/// plus any per-challenge error the CA recorded. This is what turns an opaque
+/// "poll_ready timed out" into the actual reason (e.g. connection refused on :443,
+/// "Incorrect validation certificate"), which is otherwise lost.
+async fn log_authorization_failures(order: &mut instant_acme::Order, host: &str) {
+    let mut authorizations = order.authorizations();
+    while let Some(authz) = authorizations.next().await {
+        let authz = match authz {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(%host, error = %e, "ACME: failed to fetch authorization for diagnostics");
+                continue;
+            }
+        };
+        let identifier = authz.identifier().to_string();
+        tracing::warn!(%host, %identifier, status = ?authz.status, "ACME: authorization not valid");
+        for ch in &authz.challenges {
+            match &ch.error {
+                Some(problem) => tracing::warn!(
+                    %host, %identifier, kind = ?ch.r#type, status = ?ch.status,
+                    problem = %problem, "ACME: challenge failed"
+                ),
+                None => tracing::warn!(
+                    %host, %identifier, kind = ?ch.r#type, status = ?ch.status,
+                    "ACME: challenge incomplete (no error reported)"
+                ),
+            }
+        }
+    }
 }
 
 /// Build an ACME account builder, trusting a custom root CA when configured (for
