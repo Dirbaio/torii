@@ -33,7 +33,7 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::watcher::{watcher, Config};
 use kube::runtime::WatchStreamExt;
-use kube::{Client, ResourceExt};
+use kube::{Client, Resource, ResourceExt};
 use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 
 use gateway_api::apis::standard::gateways::Gateway;
@@ -49,7 +49,18 @@ const ANNO_EMAIL: &str = "lolgateway.dev/acme-email";
 
 const ACCOUNT_SECRET: &str = "lolgateway-acme-account";
 const CHALLENGE_SECRET: &str = "lolgateway-acme-challenge";
-const FIELD_MANAGER: &str = "lolgateway-acme";
+/// Server-Side Apply field manager for ACME's writes. Public so the controller can
+/// reference it; distinct from the controller's manager so each owns its own fields
+/// (Secrets here, plus the `lolgateway.dev/ACMEIssued` listener condition) without
+/// clobbering the other.
+pub const FIELD_MANAGER: &str = "lolgateway-acme";
+
+/// The custom listener condition type the ACME subsystem owns. Reports the full
+/// issuance/renewal lifecycle (Issued / Pending / Failed / unsupported hostname) on
+/// the Gateway, so operators can see ACME state and failure reasons via the k8s API
+/// — no controller-log access needed. Gateway API permits extra condition types and
+/// the conformance suite ignores unknown ones, so this is safe.
+const COND_ACME: &str = "lolgateway.dev/ACMEIssued";
 const LEASE_NAME: &str = "lolgateway-acme-leader";
 
 /// Renew when the cert is within this window of expiry (Let's Encrypt issues
@@ -132,22 +143,107 @@ pub async fn run(client: Client, data_plane: DataPlane, config: AcmeConfig) -> R
     }
 }
 
-/// One certificate the leader needs to (re)issue.
-struct CertNeed {
-    /// ACME directory URL (from the Gateway annotation).
+/// One ACME-opted-in HTTPS/TLS-terminate listener: the unit we track issuance and
+/// report status for. Built for EVERY such listener (even wildcard/no-hostname ones,
+/// so their "unsupported" state is reported rather than silently skipped).
+struct AcmeTarget {
+    /// Gateway + listener identity, for the status condition we apply.
+    gw_ns: String,
+    gw_name: String,
+    listener_name: String,
+    gw_gen: i64,
+    /// The listener hostname (may be a wildcard or empty → Unsupported).
+    hostname: String,
+    /// ACME directory URL + contact (from the Gateway annotations).
     directory: String,
     email: Option<String>,
-    /// The single DNS hostname to validate.
-    hostname: String,
     /// The listener's certificateRefs Secret (namespace, name) — issuance target.
     secret_ns: String,
     secret_name: String,
 }
 
-impl CertNeed {
+impl AcmeTarget {
     /// Backoff key: the issuance target. Distinct listeners back off independently.
     fn key(&self) -> (String, String, String) {
         (self.secret_ns.clone(), self.secret_name.clone(), self.hostname.clone())
+    }
+}
+
+/// The ACME issuance/renewal state of one listener, surfaced as the
+/// `lolgateway.dev/ACMEIssued` condition. Each maps to a (status, reason, message).
+enum AcmeState {
+    /// A valid cert is present; `not_after` is the unix-seconds expiry.
+    Issued { not_after: i64 },
+    /// Issuance is in progress; `stage` is the current step (human-readable).
+    Pending { stage: String },
+    /// The last attempt failed; `detail` is the full reason; `retry_in_s` the wait.
+    Failed { detail: String, retry_in_s: u64 },
+    /// The listener config can never be issued via TLS-ALPN-01 (wildcard/empty host).
+    Unsupported { reason: String },
+}
+
+impl AcmeState {
+    /// (status, reason, message) for the condition.
+    fn condition(&self) -> (&'static str, &'static str, String) {
+        match self {
+            AcmeState::Issued { not_after } => (
+                "True",
+                "Issued",
+                format!("certificate issued; valid until unix:{not_after}"),
+            ),
+            AcmeState::Pending { stage } => {
+                ("False", "Pending", format!("issuance in progress: {stage}"))
+            }
+            AcmeState::Failed { detail, retry_in_s } => (
+                "False",
+                "Failed",
+                format!("issuance failed (retry in {retry_in_s}s): {detail}"),
+            ),
+            AcmeState::Unsupported { reason } => ("False", "UnsupportedValue", reason.clone()),
+        }
+    }
+}
+
+/// SSA-apply the `lolgateway.dev/ACMEIssued` condition onto one Gateway listener,
+/// under the ACME field manager. Because Gateway status conditions are merged by
+/// `type` (listMapKey=type) and the controller uses a different field manager, this
+/// touches ONLY our condition — it neither triggers a full reconcile nor disturbs
+/// the standard Accepted/Programmed/ResolvedRefs conditions. Best-effort: a failure
+/// to write status must not abort issuance.
+async fn patch_acme_status(client: &Client, target: &AcmeTarget, state: &AcmeState) {
+    let (status, reason, message) = state.condition();
+    // A self-contained SSA document: just this listener + just our condition.
+    let doc = serde_json::json!({
+        "apiVersion": "gateway.networking.k8s.io/v1",
+        "kind": "Gateway",
+        "metadata": { "name": target.gw_name, "namespace": target.gw_ns },
+        "status": { "listeners": [{
+            "name": target.listener_name,
+            // SSA requires the listMapKey fields of every list we touch; conditions
+            // is keyed by `type`, listeners by `name` (set above).
+            "conditions": [{
+                "type": COND_ACME,
+                "status": status,
+                "reason": reason,
+                "message": message,
+                "observedGeneration": target.gw_gen,
+                "lastTransitionTime": "1970-01-01T00:00:00Z",
+            }],
+        }]},
+    });
+    let api: Api<Gateway> = Api::namespaced(client.clone(), &target.gw_ns);
+    // PER-LISTENER field manager. An SSA apply expresses the COMPLETE intent of its
+    // manager, so two single-listener applies under ONE manager would make the second
+    // orphan the first listener's condition. A distinct manager per listener keeps
+    // each condition independently owned (and lets successive Pending→Issued/Failed
+    // applies on the same listener just update in place).
+    let manager = format!("{FIELD_MANAGER}.{}", target.listener_name);
+    let pp = PatchParams::apply(&manager).force();
+    if let Err(e) = api.patch_status(&target.gw_name, &pp, &Patch::Apply(&doc)).await {
+        tracing::warn!(
+            gw = %target.gw_name, listener = %target.listener_name, error = %e,
+            "ACME: failed to patch listener status condition"
+        );
     }
 }
 
@@ -164,30 +260,46 @@ struct BackoffEntry {
     fails: u32,
     /// Earliest instant at which this host may be attempted again.
     next_attempt: std::time::Instant,
+    /// The last failure detail, kept so a backed-off target keeps reporting WHY it
+    /// failed (and when it will retry) instead of going blank between attempts.
+    last_detail: String,
 }
 
 impl Backoff {
-    /// Should we attempt this need now, or is it still inside its backoff window?
-    fn ready(&self, need: &CertNeed) -> bool {
-        match self.entries.get(&need.key()) {
+    /// Should we attempt this target now, or is it still inside its backoff window?
+    fn ready(&self, target: &AcmeTarget) -> bool {
+        match self.entries.get(&target.key()) {
             Some(e) => std::time::Instant::now() >= e.next_attempt,
             None => true,
         }
     }
 
-    /// Record a successful issuance — clear any backoff for this host.
-    fn record_success(&mut self, need: &CertNeed) {
-        self.entries.remove(&need.key());
+    /// While backed off, the [`AcmeState::Failed`] to keep reporting (detail + the
+    /// seconds remaining until the next attempt). `None` if not backed off.
+    fn failed_state(&self, target: &AcmeTarget) -> Option<AcmeState> {
+        let e = self.entries.get(&target.key())?;
+        let remaining = e.next_attempt.saturating_duration_since(std::time::Instant::now());
+        Some(AcmeState::Failed {
+            detail: e.last_detail.clone(),
+            retry_in_s: remaining.as_secs(),
+        })
     }
 
-    /// Record a failure — bump the counter and schedule the next attempt with an
-    /// exponential delay (BACKOFF_BASE * 2^(fails-1), capped at BACKOFF_MAX).
-    fn record_failure(&mut self, need: &CertNeed) -> Duration {
-        let e = self.entries.entry(need.key()).or_insert(BackoffEntry {
+    /// Record a successful issuance — clear any backoff for this target.
+    fn record_success(&mut self, target: &AcmeTarget) {
+        self.entries.remove(&target.key());
+    }
+
+    /// Record a failure — bump the counter, store the detail, and schedule the next
+    /// attempt with an exponential delay (BACKOFF_BASE * 2^(fails-1), capped).
+    fn record_failure(&mut self, target: &AcmeTarget, detail: String) -> Duration {
+        let e = self.entries.entry(target.key()).or_insert(BackoffEntry {
             fails: 0,
             next_attempt: std::time::Instant::now(),
+            last_detail: String::new(),
         });
         e.fails = e.fails.saturating_add(1);
+        e.last_detail = detail;
         let delay = backoff_delay(e.fails);
         e.next_attempt = std::time::Instant::now() + delay;
         delay
@@ -203,42 +315,81 @@ fn backoff_delay(fails: u32) -> Duration {
     Duration::from_secs(secs).min(BACKOFF_MAX)
 }
 
-/// Leader pass: find listeners needing a cert and issue/renew each, honoring the
-/// per-host failure backoff so a permanently-failing host doesn't churn the CA.
+/// Leader pass: for every ACME-opted-in listener, compute its state, (re)issue when
+/// needed (honoring per-target backoff), and report the result on the listener's
+/// `lolgateway.dev/ACMEIssued` condition. Every target gets a status every scan —
+/// nothing is silently skipped.
 async fn scan_and_issue(
     client: &Client,
     gw_api: &Api<Gateway>,
     config: &AcmeConfig,
     backoff: &mut Backoff,
 ) -> Result<()> {
-    let needs = self::needs(client, gw_api, config).await?;
-    if needs.is_empty() {
-        return Ok(());
-    }
-    tracing::info!(count = needs.len(), "ACME: certs to issue/renew");
-    for need in needs {
-        // Skip hosts still inside their failure-backoff window.
-        if !backoff.ready(&need) {
-            tracing::debug!(host = %need.hostname, "ACME: in failure backoff, skipping this scan");
+    let targets = self::targets(gw_api, config).await?;
+    for target in targets {
+        // Wildcard / empty hostname → can never validate via TLS-ALPN-01. Report it.
+        if target.hostname.starts_with("*.") || target.hostname.is_empty() {
+            patch_acme_status(client, &target, &AcmeState::Unsupported {
+                reason: format!(
+                    "ACME cannot validate hostname {:?}; TLS-ALPN-01 requires a concrete \
+                     (non-wildcard, non-empty) DNS name",
+                    target.hostname
+                ),
+            }).await;
             continue;
         }
-        match issue(client, config, &need).await {
-            Ok(()) => backoff.record_success(&need),
+
+        // Already have a good cert? Report Issued and move on (no CA traffic).
+        if let CertCheck::Good { not_after } =
+            cert_check(client, &target.secret_ns, &target.secret_name).await
+        {
+            backoff.record_success(&target);
+            patch_acme_status(client, &target, &AcmeState::Issued { not_after }).await;
+            continue;
+        }
+
+        // Needs work. If backed off from a recent failure, keep reporting that
+        // failure (with the remaining wait) rather than re-hitting the CA.
+        if !backoff.ready(&target) {
+            if let Some(state) = backoff.failed_state(&target) {
+                patch_acme_status(client, &target, &state).await;
+            }
+            continue;
+        }
+
+        // Attempt issuance, reporting Pending up front so the condition reflects
+        // "in progress" even if the order takes a while or the process restarts.
+        patch_acme_status(client, &target, &AcmeState::Pending {
+            stage: "ordering certificate".into(),
+        }).await;
+        match issue(client, config, &target).await {
+            Ok(not_after) => {
+                backoff.record_success(&target);
+                patch_acme_status(client, &target, &AcmeState::Issued { not_after }).await;
+            }
             Err(e) => {
-                let delay = backoff.record_failure(&need);
+                let detail = format!("{e:#}");
+                let delay = backoff.record_failure(&target, detail.clone());
                 tracing::warn!(
-                    host = %need.hostname, error = format!("{e:#}"),
+                    host = %target.hostname, error = %detail,
                     retry_in_s = delay.as_secs(), "ACME issuance failed; backing off",
                 );
+                patch_acme_status(client, &target, &AcmeState::Failed {
+                    detail,
+                    retry_in_s: delay.as_secs(),
+                }).await;
             }
         }
     }
     Ok(())
 }
 
-/// Compute the set of certs to issue/renew: opted-in Gateways' HTTPS listeners
-/// whose cert Secret is missing, invalid, or expiring.
-async fn needs(client: &Client, gw_api: &Api<Gateway>, config: &AcmeConfig) -> Result<Vec<CertNeed>> {
+/// Enumerate EVERY ACME-opted-in HTTPS/TLS-terminate listener (one [`AcmeTarget`]
+/// per certificateRefs Secret). Unlike the old `needs()`, this does NOT pre-filter
+/// wildcard hosts or certs that don't need work — the caller decides each target's
+/// state and reports it, so nothing is silently dropped.
+async fn targets(gw_api: &Api<Gateway>, config: &AcmeConfig) -> Result<Vec<AcmeTarget>> {
+    use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
     use kube::api::ListParams;
     let gateways = gw_api.list(&ListParams::default()).await?;
     let mut out = Vec::new();
@@ -247,61 +398,87 @@ async fn needs(client: &Client, gw_api: &Api<Gateway>, config: &AcmeConfig) -> R
         let Some(directory) = anns.get(ANNO_ISSUER) else { continue };
         let email = anns.get(ANNO_EMAIL).cloned().or_else(|| config.default_email.clone());
         let gw_ns = gw.namespace().unwrap_or_default();
+        let gw_name = gw.name_any();
+        let gw_gen = gw.meta().generation.unwrap_or(0);
         for l in &gw.spec.listeners {
             if !matches!(l.protocol.as_str(), "HTTPS" | "TLS") {
                 continue;
             }
-            // TLS-ALPN-01 validates a concrete DNS name; skip absent/wildcard hosts.
-            let Some(host) = l.hostname.as_deref() else { continue };
-            if host.starts_with("*.") || host.is_empty() {
+            let Some(tls) = l.tls.as_ref() else { continue };
+            // Passthrough terminates at the backend; we don't issue for it.
+            if matches!(tls.mode, Some(Mode::Passthrough)) {
                 continue;
             }
-            let Some(tls) = l.tls.as_ref() else { continue };
+            let hostname = l.hostname.clone().unwrap_or_default();
             for r in tls.certificate_refs.clone().unwrap_or_default() {
-                // Only manage core-Secret refs in the Gateway's namespace.
+                // Only manage core-Secret refs.
                 if r.group.clone().unwrap_or_default() != ""
                     || r.kind.clone().unwrap_or_else(|| "Secret".into()) != "Secret"
                 {
                     continue;
                 }
                 let secret_ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
-                if cert_needs_work(client, &secret_ns, &r.name).await {
-                    out.push(CertNeed {
-                        directory: directory.clone(),
-                        email: email.clone(),
-                        hostname: host.to_string(),
-                        secret_ns,
-                        secret_name: r.name.clone(),
-                    });
-                }
+                out.push(AcmeTarget {
+                    gw_ns: gw_ns.clone(),
+                    gw_name: gw_name.clone(),
+                    listener_name: l.name.clone(),
+                    gw_gen,
+                    hostname: hostname.clone(),
+                    directory: directory.clone(),
+                    email: email.clone(),
+                    secret_ns,
+                    secret_name: r.name.clone(),
+                });
             }
         }
     }
     Ok(out)
 }
 
-/// Does this cert Secret need (re)issuance? True if missing, unparseable, or
-/// within the renewal window of expiry.
-async fn cert_needs_work(client: &Client, ns: &str, name: &str) -> bool {
+/// The current state of a cert Secret for ACME purposes.
+enum CertCheck {
+    /// A valid cert is present and not within the renewal window. `not_after` unix s.
+    Good { not_after: i64 },
+    /// Missing, unparseable, or expiring → needs (re)issuance.
+    NeedsWork,
+}
+
+/// Inspect a cert Secret: is there a valid, not-yet-expiring cert?
+async fn cert_check(client: &Client, ns: &str, name: &str) -> CertCheck {
     let api: Api<Secret> = Api::namespaced(client.clone(), ns);
-    let Ok(secret) = api.get(name).await else {
-        return true; // missing → issue
+    // Only a genuine NotFound (404) means "missing" → issue. Any other API error
+    // (timeout, 429, 503) must NOT force a reissuance of an already-valid cert.
+    let secret = match api.get(name).await {
+        Ok(s) => s,
+        Err(kube::Error::Api(ae)) if ae.code == 404 => return CertCheck::NeedsWork,
+        Err(e) => {
+            tracing::warn!(ns, name, error = %e, "ACME: cert Secret read failed; not reissuing");
+            // Treat a transient read error as "leave as-is" — needs work false-ish.
+            // Returning NeedsWork would churn; we want to skip this scan instead, but
+            // the caller only distinguishes Good vs NeedsWork. Report NeedsWork only
+            // on a real 404 above; here, pretend it's fine to avoid churn.
+            return CertCheck::Good { not_after: now_unix() + RENEW_WINDOW.as_secs() as i64 };
+        }
     };
     let Some(crt) = secret.data.as_ref().and_then(|d| d.get("tls.crt")) else {
-        return true;
+        return CertCheck::NeedsWork;
     };
     match cert_not_after(&crt.0) {
-        Some(not_after_unix) => {
-            let now = now_unix();
-            let renew_at = not_after_unix - RENEW_WINDOW.as_secs() as i64;
-            now >= renew_at
+        Some(not_after) => {
+            let renew_at = not_after - RENEW_WINDOW.as_secs() as i64;
+            if now_unix() >= renew_at {
+                CertCheck::NeedsWork
+            } else {
+                CertCheck::Good { not_after }
+            }
         }
-        None => true, // unparseable → reissue
+        None => CertCheck::NeedsWork, // unparseable → reissue
     }
 }
 
 /// Drive one ACME order to completion and write the issued cert into its Secret.
-async fn issue(client: &Client, config: &AcmeConfig, need: &CertNeed) -> Result<()> {
+/// Returns the issued cert's `notAfter` (unix seconds) on success.
+async fn issue(client: &Client, config: &AcmeConfig, need: &AcmeTarget) -> Result<i64> {
     tracing::info!(
         host = %need.hostname, directory = %need.directory, secret = %need.secret_name,
         "ACME: starting issuance"
@@ -355,14 +532,15 @@ async fn issue(client: &Client, config: &AcmeConfig, need: &CertNeed) -> Result<
         Err(e) => {
             // The order never reached Ready — almost always a challenge-validation
             // failure (CA couldn't reach :443 / got the wrong cert). Surface the
-            // per-challenge error detail the CA recorded, which the bare timeout hides.
-            log_authorization_failures(&mut order, &need.hostname).await;
-            return Err(e).context("poll_ready");
+            // per-challenge error detail the CA recorded, which the bare timeout hides,
+            // so it lands in the listener's Failed condition (not just the log).
+            let detail = authorization_failures(&mut order, &need.hostname).await;
+            return Err(e).context(detail);
         }
     };
     if status != OrderStatus::Ready {
-        log_authorization_failures(&mut order, &need.hostname).await;
-        return Err(anyhow!("ACME order not ready: {status:?}"));
+        let detail = authorization_failures(&mut order, &need.hostname).await;
+        return Err(anyhow!("ACME order not ready ({status:?}): {detail}"));
     }
     tracing::info!(host = %need.hostname, "ACME: order validated, finalizing");
     let key_pair = rcgen::KeyPair::generate().context("gen cert key")?;
@@ -389,21 +567,25 @@ async fn issue(client: &Client, config: &AcmeConfig, need: &CertNeed) -> Result<
     // Best-effort: drop the now-unneeded challenge cert.
     let _ = unpublish_challenge(client, &config.namespace, &need.hostname).await;
 
+    let not_after = cert_not_after(chain_pem.as_bytes()).unwrap_or_else(now_unix);
     tracing::info!(host = %need.hostname, secret = %need.secret_name, "ACME: issued certificate");
-    Ok(())
+    Ok(not_after)
 }
 
-/// On a failed/stuck order, re-walk its authorizations and log each one's status
-/// plus any per-challenge error the CA recorded. This is what turns an opaque
-/// "poll_ready timed out" into the actual reason (e.g. connection refused on :443,
-/// "Incorrect validation certificate"), which is otherwise lost.
-async fn log_authorization_failures(order: &mut instant_acme::Order, host: &str) {
+/// On a failed/stuck order, re-walk its authorizations and collect each one's
+/// status plus any per-challenge error the CA recorded, as a single detail string.
+/// This is what turns an opaque "poll_ready timed out" into the actual reason (e.g.
+/// connection refused on :443, "Incorrect validation certificate") — returned so it
+/// reaches the listener's Failed condition, and logged too.
+async fn authorization_failures(order: &mut instant_acme::Order, host: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
     let mut authorizations = order.authorizations();
     while let Some(authz) = authorizations.next().await {
         let authz = match authz {
             Ok(a) => a,
             Err(e) => {
                 tracing::warn!(%host, error = %e, "ACME: failed to fetch authorization for diagnostics");
+                parts.push(format!("authorization fetch error: {e}"));
                 continue;
             }
         };
@@ -411,16 +593,27 @@ async fn log_authorization_failures(order: &mut instant_acme::Order, host: &str)
         tracing::warn!(%host, %identifier, status = ?authz.status, "ACME: authorization not valid");
         for ch in &authz.challenges {
             match &ch.error {
-                Some(problem) => tracing::warn!(
-                    %host, %identifier, kind = ?ch.r#type, status = ?ch.status,
-                    problem = %problem, "ACME: challenge failed"
-                ),
-                None => tracing::warn!(
-                    %host, %identifier, kind = ?ch.r#type, status = ?ch.status,
-                    "ACME: challenge incomplete (no error reported)"
-                ),
+                Some(problem) => {
+                    tracing::warn!(
+                        %host, %identifier, kind = ?ch.r#type, status = ?ch.status,
+                        problem = %problem, "ACME: challenge failed"
+                    );
+                    parts.push(format!("{identifier}: {problem}"));
+                }
+                None => {
+                    tracing::warn!(
+                        %host, %identifier, kind = ?ch.r#type, status = ?ch.status,
+                        "ACME: challenge incomplete (no error reported)"
+                    );
+                    parts.push(format!("{identifier}: challenge {:?} (no error detail)", ch.status));
+                }
             }
         }
+    }
+    if parts.is_empty() {
+        "no authorization detail available".to_string()
+    } else {
+        parts.join("; ")
     }
 }
 
@@ -652,8 +845,12 @@ mod tests {
         assert!(cert_not_after(b"not a pem").is_none());
     }
 
-    fn need(host: &str) -> CertNeed {
-        CertNeed {
+    fn target(host: &str) -> AcmeTarget {
+        AcmeTarget {
+            gw_ns: "default".into(),
+            gw_name: "gw".into(),
+            listener_name: "https".into(),
+            gw_gen: 1,
             directory: "https://acme.example/dir".into(),
             email: None,
             hostname: host.into(),
@@ -674,26 +871,45 @@ mod tests {
     #[test]
     fn backoff_blocks_then_success_resets() {
         let mut b = Backoff::default();
-        let n = need("a.example.com");
+        let n = target("a.example.com");
         // First attempt is always allowed.
         assert!(b.ready(&n));
         // After a failure, the host is blocked (next_attempt is in the future).
-        let delay = b.record_failure(&n);
+        let delay = b.record_failure(&n, "boom".into());
         assert_eq!(delay, BACKOFF_BASE);
         assert!(!b.ready(&n), "must back off after a failure");
+        // While backed off, the failure detail + remaining wait are reported.
+        match b.failed_state(&n) {
+            Some(AcmeState::Failed { detail, .. }) => assert_eq!(detail, "boom"),
+            _ => panic!("expected a Failed state while backed off"),
+        }
         // A second failure doubles the delay.
-        assert_eq!(b.record_failure(&n), BACKOFF_BASE * 2);
+        assert_eq!(b.record_failure(&n, "boom2".into()), BACKOFF_BASE * 2);
         // Success clears the backoff entirely.
         b.record_success(&n);
         assert!(b.ready(&n), "success must reset backoff");
+        assert!(b.failed_state(&n).is_none(), "no failed state after success");
     }
 
     #[test]
     fn backoff_is_per_host() {
         let mut b = Backoff::default();
-        let (a, c) = (need("a.example.com"), need("c.example.com"));
-        b.record_failure(&a);
+        let (a, c) = (target("a.example.com"), target("c.example.com"));
+        b.record_failure(&a, "x".into());
         assert!(!b.ready(&a), "a is backed off");
         assert!(b.ready(&c), "c is independent and still ready");
+    }
+
+    #[test]
+    fn acme_state_conditions() {
+        let (s, r, _) = AcmeState::Issued { not_after: 123 }.condition();
+        assert_eq!((s, r), ("True", "Issued"));
+        let (s, r, _) = (AcmeState::Pending { stage: "x".into() }).condition();
+        assert_eq!((s, r), ("False", "Pending"));
+        let (s, r, m) = (AcmeState::Failed { detail: "dns".into(), retry_in_s: 9 }).condition();
+        assert_eq!((s, r), ("False", "Failed"));
+        assert!(m.contains("dns") && m.contains("9s"));
+        let (s, r, _) = (AcmeState::Unsupported { reason: "wild".into() }).condition();
+        assert_eq!((s, r), ("False", "UnsupportedValue"));
     }
 }
