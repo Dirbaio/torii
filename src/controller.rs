@@ -50,6 +50,11 @@ use crate::tls_table::{TlsAction, TlsBackend, TlsBackends, TlsTable};
 /// Our controller name. Must be DOMAIN/PATH and match GatewayClass.spec.controllerName.
 pub const CONTROLLER_NAME: &str = "lolgateway.dev/controller";
 
+/// Server-Side Apply field manager for the controller's status writes. Distinct
+/// from the ACME subsystem's manager ([`crate::acme::FIELD_MANAGER`]) so the two
+/// can own different conditions on the same object without clobbering each other.
+const FIELD_MANAGER: &str = "lolgateway-controller";
+
 /// Features we report in GatewayClass.status.supportedFeatures. The conformance
 /// suite uses this to decide which tests apply when running a whole profile
 /// (without an explicit --supported-features flag). Grow this as features land.
@@ -482,27 +487,29 @@ impl ReconcileCtx {
     }
 
     /// Apply one deferred status patch, building the right typed `Api` for its kind.
+    /// Each kind supplies its apiVersion+kind so the patch is a self-contained
+    /// Server-Side Apply document (see [`Self::patch_status`]).
     async fn apply_patch(&self, p: StatusPatch) -> Result<()> {
         let ns = p.ns.unwrap_or_default();
         match p.target {
             PatchTarget::GatewayClass => {
-                self.patch_status(&self.gc_api, &p.name, p.json).await
+                self.patch_status(&self.gc_api, &p.name, "GatewayClass", p.json).await
             }
             PatchTarget::Gateway => {
                 let api: Api<Gateway> = Api::namespaced(self.client.clone(), &ns);
-                self.patch_status(&api, &p.name, p.json).await
+                self.patch_status(&api, &p.name, "Gateway", p.json).await
             }
             PatchTarget::HttpRoute => {
                 let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), &ns);
-                self.patch_status(&api, &p.name, p.json).await
+                self.patch_status(&api, &p.name, "HTTPRoute", p.json).await
             }
             PatchTarget::TlsRoute => {
                 let api: Api<TLSRoute> = Api::namespaced(self.client.clone(), &ns);
-                self.patch_status(&api, &p.name, p.json).await
+                self.patch_status(&api, &p.name, "TLSRoute", p.json).await
             }
             PatchTarget::BackendTlsPolicy => {
                 let api: Api<BackendTLSPolicy> = Api::namespaced(self.client.clone(), &ns);
-                self.patch_status(&api, &p.name, p.json).await
+                self.patch_status(&api, &p.name, "BackendTLSPolicy", p.json).await
             }
         }
     }
@@ -1854,13 +1861,41 @@ impl ReconcileCtx {
         Some(endpoints)
     }
 
-    async fn patch_status<K>(&self, api: &Api<K>, name: &str, status: serde_json::Value) -> Result<()>
+    /// Write an object's status via **Server-Side Apply** under our field manager.
+    /// SSA (not a merge patch) is what lets a second writer — the ACME subsystem —
+    /// own its own `lolgateway.dev/ACMEIssued` listener condition without our
+    /// reconcile clobbering it: k8s merges the conditions list by `type`
+    /// (listMapKey=type), so each manager's fields are preserved independently.
+    /// `force` takes ownership of any field a previous manager held (e.g. after an
+    /// upgrade), which is safe because the controller is the authoritative source
+    /// for the standard conditions.
+    ///
+    /// `json` is the `{"status": {...}}` we computed; we wrap it into a full apply
+    /// document (apiVersion/kind/metadata.name) as SSA requires.
+    async fn patch_status<K>(
+        &self,
+        api: &Api<K>,
+        name: &str,
+        kind: &str,
+        json: serde_json::Value,
+    ) -> Result<()>
     where
         K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
         K::DynamicType: Default,
     {
-        let pp = PatchParams::default();
-        match api.patch_status(name, &pp, &Patch::Merge(&status)).await {
+        let mut doc = serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": kind,
+            "metadata": { "name": name },
+        });
+        // Merge the computed `{"status": ...}` into the apply document.
+        if let (Some(obj), Some(extra)) = (doc.as_object_mut(), json.as_object()) {
+            for (k, v) in extra {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+        let pp = PatchParams::apply(FIELD_MANAGER).force();
+        match api.patch_status(name, &pp, &Patch::Apply(&doc)).await {
             Ok(_) => Ok(()),
             // The object was deleted between our cache snapshot and this write —
             // there's nothing to update. Don't abort the whole reconcile pass.
