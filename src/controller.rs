@@ -250,7 +250,18 @@ struct ListenerOutcome {
     /// *different* mode (Terminate vs Passthrough) and we don't support mixed
     /// termination → Accepted=False/ProtocolConflict. Computed across the port.
     protocol_conflict: bool,
+    /// For a listener that opted into ACME (`lolgateway.dev/acme-issuer`): a problem
+    /// that makes automatic issuance impossible from the spec alone (e.g. a wildcard
+    /// or absent hostname, which TLS-ALPN-01 can't validate). `None` if not opted in
+    /// or no such problem. Surfaced as the `lolgateway.dev/ACMEIssued` listener
+    /// condition so users see WHY no cert appears — without controller-log access.
+    acme_problem: Option<String>,
 }
+
+/// Custom (lolgateway-namespaced) listener condition type reporting ACME issuance
+/// state. Gateway API allows extra condition types — the conformance suite only
+/// checks the standard ones and ignores unknown types (helpers.go).
+const COND_ACME: &str = "lolgateway.dev/ACMEIssued";
 
 /// A `protocol: TLS` listener's mode, which decides the TLSRoute data path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -629,6 +640,31 @@ impl ReconcileCtx {
             None
         };
 
+        // ACME: if this Gateway opted in, flag listeners whose hostname can't be
+        // validated by TLS-ALPN-01 (wildcard or absent) — issuance would silently
+        // never happen, so surface it. Derivable from spec alone (no ACME runtime
+        // state needed), so it reconciles on Gateway changes.
+        let acme_problem = if gw.annotations().contains_key(crate::acme::ANNO_ISSUER)
+            && matches!(l.protocol.as_str(), "HTTPS" | "TLS")
+            && !matches!(l.tls.as_ref().and_then(|t| t.mode.as_ref()),
+                Some(gateway_api::apis::standard::gateways::GatewayListenersTlsMode::Passthrough))
+        {
+            match l.hostname.as_deref() {
+                None | Some("") => Some(
+                    "ACME issuance requires a concrete listener hostname; TLS-ALPN-01 \
+                     cannot validate a listener with no hostname"
+                        .to_string(),
+                ),
+                Some(h) if h.starts_with("*.") => Some(format!(
+                    "ACME issuance cannot validate the wildcard hostname {h:?}; \
+                     TLS-ALPN-01 requires a concrete (non-wildcard) DNS name"
+                )),
+                Some(_) => None,
+            }
+        } else {
+            None
+        };
+
         ListenerOutcome {
             name: l.name.clone(),
             protocol_supported,
@@ -639,6 +675,7 @@ impl ReconcileCtx {
             port: l.port as u16,
             tls_mode,
             protocol_conflict: false, // filled in across the port in build_gateway_model
+            acme_problem,
         }
     }
 
@@ -760,11 +797,21 @@ impl ReconcileCtx {
                             })
                             .collect()
                     };
+                // Conditions: the three standard ones, plus (only for ACME-opted-in
+                // listeners) a custom lolgateway.dev/ACMEIssued condition reporting
+                // why issuance can't proceed.
+                let mut conditions = vec![accepted, programmed, resolved];
+                if let Some(msg) = &o.acme_problem {
+                    conditions.push(condition_msg(
+                        COND_ACME, "False", "UnsupportedValue", msg, gen,
+                    ));
+                }
+
                 GatewayStatusListeners {
                     name: o.name.clone(),
                     attached_routes,
                     supported_kinds: Some(supported_kinds),
-                    conditions: vec![accepted, programmed, resolved],
+                    conditions,
                 }
             })
             .collect();
