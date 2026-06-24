@@ -1595,6 +1595,7 @@ dependencies = [
  "pingora-http",
  "pingora-proxy",
  "rcgen",
+ "regex",
  "rustls",
  "serde",
  "serde_json",
