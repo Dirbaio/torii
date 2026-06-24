@@ -57,8 +57,8 @@ struct Cli {
     advertise: String,
 
     /// Enable automatic TLS certificate issuance via ACME (TLS-ALPN-01).
-    /// OFF by default; even when on, a Gateway must opt in with the
-    /// `torii.dirba.io/acme-issuer` annotation. Requires a TLS listener port.
+    /// OFF by default; even when on, a Gateway must opt in by carrying the
+    /// `torii.dirba.io/acme` annotation. Requires a TLS listener port.
     #[arg(long, env = "TORII_ACME")]
     acme: bool,
 
@@ -68,8 +68,15 @@ struct Cli {
     #[arg(long, env = "TORII_ACME_NAMESPACE", default_value = "torii-system")]
     acme_namespace: String,
 
-    /// Contact email for the ACME account (used if a Gateway's
-    /// `torii.dirba.io/acme-email` annotation is absent). Optional.
+    /// Default ACME directory URL (e.g. Let's Encrypt) for all opted-in Gateways.
+    /// A Gateway's `torii.dirba.io/acme-issuer` annotation overrides this. If
+    /// neither is set, an opted-in listener reports an ACME failure. Optional.
+    #[arg(long, env = "TORII_ACME_ISSUER")]
+    acme_issuer: Option<String>,
+
+    /// Default contact email for the ACME account. A Gateway's
+    /// `torii.dirba.io/acme-email` annotation overrides this. If neither is set,
+    /// an opted-in listener reports an ACME failure. Optional.
     #[arg(long, env = "TORII_ACME_EMAIL")]
     acme_email: Option<String>,
 
@@ -118,6 +125,7 @@ async fn run(args: Cli) -> Result<()> {
     if args.acme {
         let acme_config = acme::AcmeConfig {
             namespace: args.acme_namespace.clone(),
+            default_issuer: args.acme_issuer.clone(),
             default_email: args.acme_email.clone(),
             holder_id: acme_holder_id(),
             ca_cert_path: args.acme_ca_cert.clone(),

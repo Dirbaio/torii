@@ -171,9 +171,13 @@ spec:
             # (LoadBalancer) or node IP. The downward API can't give a LB IP, so
             # set it explicitly here.
             - --advertise=CHANGEME.gateway.example.com
-            # --- ACME (optional). Remove these to disable automatic TLS certs. ---
+            # --- ACME (optional). Remove these to disable automatic TLS certs.
+            #     A Gateway then opts in with the `torii.dirba.io/acme` annotation;
+            #     issuer/email default to these flags (override per-Gateway with the
+            #     torii.dirba.io/acme-issuer / -email annotations). ---
             - --acme
             - --acme-namespace=torii-system
+            - --acme-issuer=https://acme-v02.api.letsencrypt.org/directory
             - --acme-email=ops@example.com
           env:
             # Stable leader-election identity for ACME (downward API → pod name).

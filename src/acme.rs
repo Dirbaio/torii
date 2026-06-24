@@ -1,11 +1,14 @@
 //! Automatic TLS certificate issuance via ACME (TLS-ALPN-01).
 //!
-//! Off by default; enabled with `--acme`. Even then, a Gateway must opt in with
-//! the `torii.dirba.io/acme-issuer` annotation (the ACME directory URL). For each
-//! HTTPS/TLS-terminate listener with a (single, non-wildcard) hostname and a
-//! `certificateRefs` Secret, we obtain a cert and write it into that Secret — the
-//! controller's existing Secret watcher + cert store then serve it, no special
-//! data-plane path for the *issued* cert.
+//! Off by default; enabled process-wide with `--acme`. Even then, a Gateway must
+//! opt in by carrying the `torii.dirba.io/acme` annotation (presence-only — its
+//! value is ignored). The ACME directory URL and contact email come from the CLI
+//! (`--acme-issuer` / `--acme-email`), optionally overridden per-Gateway by the
+//! `torii.dirba.io/acme-issuer` / `-email` annotations. For each HTTPS/TLS-terminate
+//! listener with a (single, non-wildcard) hostname and a `certificateRefs` Secret,
+//! we obtain a cert and write it into that Secret — the controller's existing Secret
+//! watcher + cert store then serve it, no special data-plane path for the *issued*
+//! cert.
 //!
 //! ## Multi-instance
 //! Issuance is driven by a single leader (a `coordination.k8s.io` Lease). But the
@@ -41,10 +44,14 @@ use gateway_api::apis::standard::gateways::Gateway;
 use crate::cert_store::CertKey;
 use crate::snapshot::{ChallengeStore, DataPlane};
 
-/// Gateway annotation naming the ACME directory URL (opt-in trigger). Public so the
-/// controller can detect ACME-opted-in listeners and report their status.
-pub const ANNO_ISSUER: &str = "torii.dirba.io/acme-issuer";
-/// Gateway annotation overriding the ACME contact email.
+/// Gateway opt-in annotation. Its mere PRESENCE enables ACME for the Gateway's
+/// terminate listeners — the value is ignored. Without it, ACME is not done even if
+/// the issuer/email annotations are present. Issuer + email come from the CLI args
+/// (optionally overridden per-Gateway by the annotations below).
+const ANNO_ENABLE: &str = "torii.dirba.io/acme";
+/// Gateway annotation overriding the default ACME directory URL (`--acme-issuer`).
+const ANNO_ISSUER: &str = "torii.dirba.io/acme-issuer";
+/// Gateway annotation overriding the default ACME contact email (`--acme-email`).
 const ANNO_EMAIL: &str = "torii.dirba.io/acme-email";
 
 const ACCOUNT_SECRET: &str = "torii-acme-account";
@@ -87,6 +94,9 @@ const BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
 #[derive(Clone)]
 pub struct AcmeConfig {
     pub namespace: String,
+    /// Default ACME directory URL for all opted-in Gateways (CLI `--acme-issuer`);
+    /// a Gateway's issuer annotation overrides it. `None` → must be annotated.
+    pub default_issuer: Option<String>,
     pub default_email: Option<String>,
     /// A stable identity for this instance (Lease holder id). Pod name or a uuid.
     pub holder_id: String,
@@ -154,8 +164,10 @@ struct AcmeTarget {
     gw_gen: i64,
     /// The listener hostname (may be a wildcard or empty → Unsupported).
     hostname: String,
-    /// ACME directory URL + contact (from the Gateway annotations).
-    directory: String,
+    /// ACME directory URL + contact, resolved from CLI defaults + Gateway
+    /// annotation overrides. Either being `None` (no CLI default, no annotation) is
+    /// a config error reported as an ACME failure rather than attempting issuance.
+    directory: Option<String>,
     email: Option<String>,
     /// The listener's certificateRefs Secret (namespace, name) — issuance target.
     secret_ns: String,
@@ -327,6 +339,24 @@ async fn scan_and_issue(
 ) -> Result<()> {
     let targets = self::targets(gw_api, config).await?;
     for target in targets {
+        // Config error: the Gateway opted in but no issuer/email is configured
+        // (neither a CLI default nor a Gateway annotation). Report it instead of
+        // silently doing nothing; a config fix triggers a re-scan (retry_in_s 0).
+        let mut missing = Vec::new();
+        if target.directory.is_none() {
+            missing.push("issuer (--acme-issuer or torii.dirba.io/acme-issuer)");
+        }
+        if target.email.is_none() {
+            missing.push("email (--acme-email or torii.dirba.io/acme-email)");
+        }
+        if !missing.is_empty() {
+            patch_acme_status(client, &target, &AcmeState::Failed {
+                detail: format!("ACME enabled but not configured: missing {}", missing.join(", ")),
+                retry_in_s: 0,
+            }).await;
+            continue;
+        }
+
         // Wildcard / empty hostname → can never validate via TLS-ALPN-01. Report it.
         if target.hostname.starts_with("*.") || target.hostname.is_empty() {
             patch_acme_status(client, &target, &AcmeState::Unsupported {
@@ -395,7 +425,14 @@ async fn targets(gw_api: &Api<Gateway>, config: &AcmeConfig) -> Result<Vec<AcmeT
     let mut out = Vec::new();
     for gw in gateways {
         let anns = gw.annotations();
-        let Some(directory) = anns.get(ANNO_ISSUER) else { continue };
+        // Opt-in: the enable annotation must be PRESENT (value ignored). Without it,
+        // ACME is skipped even if issuer/email annotations exist.
+        if !anns.contains_key(ANNO_ENABLE) {
+            continue;
+        }
+        // Issuer + email: per-Gateway annotation overrides the CLI default; either
+        // may be None (reported as a failure by the caller, not skipped here).
+        let directory = anns.get(ANNO_ISSUER).cloned().or_else(|| config.default_issuer.clone());
         let email = anns.get(ANNO_EMAIL).cloned().or_else(|| config.default_email.clone());
         let gw_ns = gw.namespace().unwrap_or_default();
         let gw_name = gw.name_any();
@@ -479,11 +516,16 @@ async fn cert_check(client: &Client, ns: &str, name: &str) -> CertCheck {
 /// Drive one ACME order to completion and write the issued cert into its Secret.
 /// Returns the issued cert's `notAfter` (unix seconds) on success.
 async fn issue(client: &Client, config: &AcmeConfig, need: &AcmeTarget) -> Result<i64> {
+    // scan_and_issue only reaches issuance once issuer + email are present.
+    let directory = need
+        .directory
+        .as_deref()
+        .ok_or_else(|| anyhow!("no ACME issuer configured"))?;
     tracing::info!(
-        host = %need.hostname, directory = %need.directory, secret = %need.secret_name,
+        host = %need.hostname, directory = %directory, secret = %need.secret_name,
         "ACME: starting issuance"
     );
-    let account = load_or_create_account(client, config, &need.directory, need.email.as_deref())
+    let account = load_or_create_account(client, config, directory, need.email.as_deref())
         .await
         .context("ACME account")?;
     tracing::debug!(host = %need.hostname, "ACME: account ready");
@@ -852,8 +894,8 @@ mod tests {
             gw_name: "gw".into(),
             listener_name: "https".into(),
             gw_gen: 1,
-            directory: "https://acme.example/dir".into(),
-            email: None,
+            directory: Some("https://acme.example/dir".into()),
+            email: Some("ops@example.com".into()),
             hostname: host.into(),
             secret_ns: "default".into(),
             secret_name: format!("{host}-tls"),
