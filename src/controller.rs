@@ -1795,7 +1795,17 @@ fn route_match_from(
         .map(|h| HeaderMatch {
             name: h.name,
             value: match h.r#type {
-                Some(HType::RegularExpression) => HeaderValueMatch::Regex(h.value),
+                Some(HType::RegularExpression) => match regex::Regex::new(&h.value) {
+                    Ok(re) => HeaderValueMatch::Regex(re),
+                    // An un-compilable pattern must not silently match the wrong
+                    // thing. Fail closed: an Exact match against a value a header can
+                    // never hold (NUL is rejected by the HTTP layer), so the route
+                    // simply never matches on this header.
+                    Err(e) => {
+                        tracing::warn!(pattern = %h.value, error = %e, "invalid header-match regex; route will not match");
+                        HeaderValueMatch::Exact("\0".to_string())
+                    }
+                },
                 _ => HeaderValueMatch::Exact(h.value),
             },
         })

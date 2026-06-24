@@ -187,7 +187,10 @@ pub struct HeaderMatch {
 #[derive(Debug, Clone)]
 pub enum HeaderValueMatch {
     Exact(String),
-    Regex(String),
+    /// A compiled `type: RegularExpression` header-value matcher. Compiled once in
+    /// the control plane (an un-compilable pattern produces no match entry, so it
+    /// never reaches here); `regex::Regex` is cheap to clone (Arc-shared program).
+    Regex(regex::Regex),
 }
 
 #[derive(Debug, Clone)]
@@ -501,8 +504,7 @@ impl RouteMatch {
                 .filter_map(|v| v.to_str().ok())
                 .any(|v| match &hm.value {
                     HeaderValueMatch::Exact(want) => v == want,
-                    // Minimal regex support: fall back to exact if we can't compile.
-                    HeaderValueMatch::Regex(want) => v == want,
+                    HeaderValueMatch::Regex(re) => re.is_match(v),
                 })
         })
     }
@@ -614,6 +616,26 @@ mod tests {
         // From HTTPRouteMatching: /v2 must not match /v2example
         assert!(!path_prefix_matches("/v2", "/v2example"));
         assert!(path_prefix_matches("/v2", "/v2/example"));
+    }
+
+    #[test]
+    fn regex_header_match() {
+        let h = |name: &str, val: HeaderValueMatch| RouteMatch {
+            headers: vec![HeaderMatch { name: name.into(), value: val }],
+            ..Default::default()
+        };
+        let re = |p: &str| HeaderValueMatch::Regex(regex::Regex::new(p).unwrap());
+
+        let mut hdrs = http::HeaderMap::new();
+        hdrs.insert("x-ver", "v123".parse().unwrap());
+
+        // A real regex matches (it used to do plain string equality, so `v123`
+        // would only have matched the literal pattern string `^v\d+$`).
+        assert!(h("x-ver", re(r"^v\d+$")).matches("", "GET", &hdrs, ""));
+        assert!(h("x-ver", re(r"\d{3}")).matches("", "GET", &hdrs, ""));
+        // Non-matching pattern doesn't match.
+        assert!(!h("x-ver", re(r"^w")).matches("", "GET", &hdrs, ""));
+        assert!(!h("x-ver", re(r"^v\d{4}$")).matches("", "GET", &hdrs, ""));
     }
 
     #[test]

@@ -46,6 +46,7 @@ async-trait = "0.1"
 arc-swap = "1"
 http = "1"
 futures = "0.3"
+regex = "1" # HTTPRoute header match type=RegularExpression
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tracing = "0.1"
