@@ -102,6 +102,13 @@ const SUPPORTED_FEATURES: &[&str] = &[
 /// reachable by the conformance suite running on the host.
 pub struct ControllerConfig {
     pub advertise_address: String,
+    /// Hand-off to the ACME subsystem: the desired issuance targets, republished after
+    /// each reconcile. `None` when `--acme` is off — no targets are computed at all.
+    pub acme_feed: Option<crate::acme::AcmeFeed>,
+    /// Default ACME directory URL / contact, from `--acme-issuer` / `--acme-email`. A
+    /// Gateway's `torii.dirba.io/acme-issuer` / `-email` annotation overrides each.
+    pub acme_default_issuer: Option<String>,
+    pub acme_default_email: Option<String>,
 }
 
 /// Cached stores for every resource we reconcile from.
@@ -452,7 +459,92 @@ impl ReconcileCtx {
             tls: tls_table,
         });
 
-        self.flush_status(patches).await
+        // Compute the ACME issuance targets from the SAME data, but publish them AFTER
+        // the status flush below — so the ACME leader only ever sees a target once this
+        // listener's status (incl. attachedRoutes) is written, and its condition patch
+        // can't race the controller. Cheap when --acme is off (feed is None).
+        let acme_targets = self
+            .config
+            .acme_feed
+            .as_ref()
+            .map(|_| self.acme_targets(&models, &attach_counts));
+
+        let flushed = self.flush_status(patches).await;
+
+        if let (Some(feed), Some(targets)) = (&self.config.acme_feed, acme_targets) {
+            feed.publish(targets);
+        }
+        flushed
+    }
+
+    /// Build the desired ACME issuance-target set from the reconcile's per-Gateway
+    /// models: every ACME-opted-in (`torii.dirba.io/acme` annotation) HTTPS/TLS-terminate
+    /// listener with a concrete core-Secret certificateRef. Issuer/email resolve from the
+    /// Gateway annotations falling back to the CLI defaults; `attached_routes` comes from
+    /// the counts we just computed (so ACME echoes the controller's value). Wildcard/empty
+    /// hostnames and missing issuer/email are NOT filtered here — they're included so ACME
+    /// reports their Unsupported/Failed state, matching the old self-listing behaviour.
+    fn acme_targets(
+        &self,
+        models: &[GatewayModel],
+        attach_counts: &BTreeMap<(String, String), BTreeMap<String, i32>>,
+    ) -> Vec<crate::acme::AcmeTarget> {
+        use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
+        let mut out = Vec::new();
+        for model in models {
+            let gw = &model.gw;
+            let anns = gw.metadata.annotations.clone().unwrap_or_default();
+            // Opt-in: the enable annotation must be PRESENT (value ignored).
+            if !anns.contains_key(crate::acme::ANNO_ENABLE) {
+                continue;
+            }
+            let directory = anns
+                .get(crate::acme::ANNO_ISSUER)
+                .cloned()
+                .or_else(|| self.config.acme_default_issuer.clone());
+            let email = anns
+                .get(crate::acme::ANNO_EMAIL)
+                .cloned()
+                .or_else(|| self.config.acme_default_email.clone());
+            let gw_ns = gw.metadata.namespace.clone().unwrap_or_default();
+            let gw_name = gw.metadata.name.clone().unwrap_or_default();
+            let counts = attach_counts.get(&(gw_ns.clone(), gw_name.clone()));
+            for l in &gw.spec.listeners {
+                if !matches!(l.protocol.as_str(), "HTTPS" | "TLS") {
+                    continue;
+                }
+                let Some(tls) = l.tls.as_ref() else { continue };
+                // Passthrough terminates at the backend; we don't issue for it.
+                if matches!(tls.mode, Some(Mode::Passthrough)) {
+                    continue;
+                }
+                let hostname = l.hostname.clone().unwrap_or_default();
+                let attached_routes =
+                    counts.and_then(|c| c.get(&l.name)).copied().unwrap_or(0);
+                for r in tls.certificate_refs.clone().unwrap_or_default() {
+                    // Only manage core-Secret refs.
+                    if r.group.clone().unwrap_or_default() != ""
+                        || r.kind.clone().unwrap_or_else(|| "Secret".into()) != "Secret"
+                    {
+                        continue;
+                    }
+                    let secret_ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
+                    out.push(crate::acme::AcmeTarget {
+                        gw_ns: gw_ns.clone(),
+                        gw_name: gw_name.clone(),
+                        listener_name: l.name.clone(),
+                        gw_gen: model.generation,
+                        hostname: hostname.clone(),
+                        directory: directory.clone(),
+                        email: email.clone(),
+                        secret_ns,
+                        secret_name: r.name.clone(),
+                        attached_routes,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// Write all accumulated status patches concurrently. Each patch is applied

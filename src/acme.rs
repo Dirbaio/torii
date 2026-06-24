@@ -22,9 +22,11 @@
 //! - issued certs: each listener's own `certificateRefs` Secret (`tls.crt/tls.key`).
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use arc_swap::ArcSwap;
 use futures::StreamExt;
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
@@ -36,7 +38,7 @@ use kube::api::{Api, Patch, PatchParams};
 use kube::runtime::reflector::{self, Store};
 use kube::runtime::watcher::{watcher, Config};
 use kube::runtime::WatchStreamExt;
-use kube::{Client, Resource, ResourceExt};
+use kube::Client;
 use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 
 use gateway_api::apis::standard::gateways::Gateway;
@@ -48,11 +50,11 @@ use crate::snapshot::{ChallengeStore, DataPlane};
 /// terminate listeners — the value is ignored. Without it, ACME is not done even if
 /// the issuer/email annotations are present. Issuer + email come from the CLI args
 /// (optionally overridden per-Gateway by the annotations below).
-const ANNO_ENABLE: &str = "torii.dirba.io/acme";
+pub const ANNO_ENABLE: &str = "torii.dirba.io/acme";
 /// Gateway annotation overriding the default ACME directory URL (`--acme-issuer`).
-const ANNO_ISSUER: &str = "torii.dirba.io/acme-issuer";
+pub const ANNO_ISSUER: &str = "torii.dirba.io/acme-issuer";
 /// Gateway annotation overriding the default ACME contact email (`--acme-email`).
-const ANNO_EMAIL: &str = "torii.dirba.io/acme-email";
+pub const ANNO_EMAIL: &str = "torii.dirba.io/acme-email";
 
 const ACCOUNT_SECRET: &str = "torii-acme-account";
 const CHALLENGE_SECRET: &str = "torii-acme-challenge";
@@ -90,14 +92,12 @@ const CHALLENGE_SETTLE: Duration = Duration::from_secs(2);
 const BACKOFF_BASE: Duration = Duration::from_secs(300);
 const BACKOFF_MAX: Duration = Duration::from_secs(6 * 3600);
 
-/// Runtime config for the ACME subsystem.
+/// Runtime config for the ACME subsystem. Issuer/email defaults are NOT here — the
+/// controller resolves them (CLI default + per-Gateway annotation override) when it
+/// builds each [`AcmeTarget`], so ACME never needs them.
 #[derive(Clone)]
 pub struct AcmeConfig {
     pub namespace: String,
-    /// Default ACME directory URL for all opted-in Gateways (CLI `--acme-issuer`);
-    /// a Gateway's issuer annotation overrides it. `None` → must be annotated.
-    pub default_issuer: Option<String>,
-    pub default_email: Option<String>,
     /// A stable identity for this instance (Lease holder id). Pod name or a uuid.
     pub holder_id: String,
     /// Path to a PEM root CA the ACME client should trust, for ACME servers with a
@@ -108,7 +108,17 @@ pub struct AcmeConfig {
 /// Spawn the ACME subsystem: a challenge-Secret reflector (every instance, feeds
 /// the data plane so any instance serves `acme-tls/1`) plus the leader loop
 /// (issuance + renewal, gated by the Lease). Returns immediately; runs forever.
-pub async fn run(client: Client, data_plane: DataPlane, config: AcmeConfig) -> Result<()> {
+///
+/// The set of listeners to issue for is NOT polled here — the controller computes it
+/// during reconcile and pushes it through [`AcmeFeed`]. The leader scans when the feed
+/// changes (immediate, event-driven issuance) OR on the [`SCAN_INTERVAL`] renewal tick
+/// (to catch certs aging into the renewal window with no spec change driving a poke).
+pub async fn run(
+    client: Client,
+    data_plane: DataPlane,
+    feed: AcmeFeed,
+    config: AcmeConfig,
+) -> Result<()> {
     // Every instance reflects the shared challenge Secret into the data plane.
     spawn_challenge_reflector(client.clone(), data_plane.clone(), config.namespace.clone());
 
@@ -124,7 +134,6 @@ pub async fn run(client: Client, data_plane: DataPlane, config: AcmeConfig) -> R
 
     tracing::info!(namespace = %config.namespace, "ACME subsystem started");
 
-    let gw_api: Api<Gateway> = Api::all(client.clone());
     let mut last_scan = std::time::Instant::now()
         .checked_sub(SCAN_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
@@ -142,42 +151,112 @@ pub async fn run(client: Client, data_plane: DataPlane, config: AcmeConfig) -> R
             }
         };
 
+        // Scan when the leader either was poked (handled via the select! below
+        // shortening the wait) or the renewal interval elapsed. A non-leader never
+        // scans, but still loops to keep trying to acquire the lease.
         if is_leader && last_scan.elapsed() >= SCAN_INTERVAL {
             last_scan = std::time::Instant::now();
-            if let Err(e) = scan_and_issue(&client, &gw_api, &config, &mut backoff).await {
+            let targets = feed.load();
+            if let Err(e) = scan_and_issue(&client, &targets, &config, &mut backoff).await {
                 tracing::warn!(error = format!("{e:#}"), "ACME scan/issue failed");
             }
         }
 
-        tokio::time::sleep(LEASE_RENEW).await;
+        // Wait up to LEASE_RENEW before the next lease renewal — but cut the wait short
+        // if the controller publishes a changed target set, so issuance for a freshly
+        // applied Gateway starts within a lease tick, not after SCAN_INTERVAL. A poke
+        // resets `last_scan` to the past so the next iteration scans immediately.
+        tokio::select! {
+            _ = tokio::time::sleep(LEASE_RENEW) => {}
+            _ = feed.notified() => {
+                last_scan = std::time::Instant::now()
+                    .checked_sub(SCAN_INTERVAL)
+                    .unwrap_or_else(std::time::Instant::now);
+            }
+        }
     }
 }
 
 /// One ACME-opted-in HTTPS/TLS-terminate listener: the unit we track issuance and
 /// report status for. Built for EVERY such listener (even wildcard/no-hostname ones,
 /// so their "unsupported" state is reported rather than silently skipped).
-struct AcmeTarget {
+///
+/// Constructed by the CONTROLLER during reconcile and published via [`AcmeFeed`] —
+/// not derived by ACME itself. The controller already validates these listeners and
+/// writes their status, so by the time a target reaches ACME the Gateway's listener
+/// status (incl. `attachedRoutes`) is populated: ACME's condition patch can't race it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AcmeTarget {
     /// Gateway + listener identity, for the status condition we apply.
-    gw_ns: String,
-    gw_name: String,
-    listener_name: String,
-    gw_gen: i64,
+    pub gw_ns: String,
+    pub gw_name: String,
+    pub listener_name: String,
+    pub gw_gen: i64,
     /// The listener hostname (may be a wildcard or empty → Unsupported).
-    hostname: String,
-    /// ACME directory URL + contact, resolved from CLI defaults + Gateway
-    /// annotation overrides. Either being `None` (no CLI default, no annotation) is
-    /// a config error reported as an ACME failure rather than attempting issuance.
-    directory: Option<String>,
-    email: Option<String>,
+    pub hostname: String,
+    /// ACME directory URL + contact, resolved by the controller from CLI defaults +
+    /// Gateway annotation overrides. Either being `None` (no CLI default, no
+    /// annotation) is a config error reported as an ACME failure rather than
+    /// attempting issuance.
+    pub directory: Option<String>,
+    pub email: Option<String>,
     /// The listener's certificateRefs Secret (namespace, name) — issuance target.
-    secret_ns: String,
-    secret_name: String,
+    pub secret_ns: String,
+    pub secret_name: String,
+    /// The listener's current `status.attachedRoutes`, supplied by the controller
+    /// (which owns the count). Echoed in our status patch because the CRD requires
+    /// `attachedRoutes` on every listener-status entry; sending the controller's value
+    /// keeps the apply a no-op for that field (no last-writer-wins flap).
+    pub attached_routes: i32,
 }
 
 impl AcmeTarget {
     /// Backoff key: the issuance target. Distinct listeners back off independently.
     fn key(&self) -> (String, String, String) {
         (self.secret_ns.clone(), self.secret_name.clone(), self.hostname.clone())
+    }
+}
+
+/// Control-plane → ACME hand-off: the desired set of issuance targets, republished by
+/// the controller after each reconcile (once status is synced), plus a notification so
+/// the ACME leader wakes and acts IMMEDIATELY instead of waiting for its renewal tick.
+///
+/// Cheap to clone (Arc-backed). The controller holds one clone and calls [`publish`];
+/// the ACME loop holds another and `load`s the current set / awaits [`notified`].
+///
+/// [`publish`]: AcmeFeed::publish
+/// [`notified`]: AcmeFeed::notified
+#[derive(Clone, Default)]
+pub struct AcmeFeed {
+    targets: Arc<ArcSwap<Vec<AcmeTarget>>>,
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl AcmeFeed {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Controller: publish the new desired target set and wake the ACME loop. Only
+    /// pokes when the set actually CHANGED, so a steady stream of unrelated reconciles
+    /// (route edits, status writes) doesn't wake ACME for nothing.
+    pub fn publish(&self, targets: Vec<AcmeTarget>) {
+        let changed = **self.targets.load() != targets;
+        self.targets.store(Arc::new(targets));
+        if changed {
+            self.notify.notify_one();
+        }
+    }
+
+    /// ACME: the current desired target set (cheap, lock-free).
+    fn load(&self) -> Arc<Vec<AcmeTarget>> {
+        self.targets.load_full()
+    }
+
+    /// ACME: resolves when the controller publishes a changed set. A poke that arrives
+    /// while no one is awaiting is remembered, so a publish during issuance isn't lost.
+    async fn notified(&self) {
+        self.notify.notified().await
     }
 }
 
@@ -219,9 +298,14 @@ impl AcmeState {
 /// SSA-apply the `torii.dirba.io/ACMEIssued` condition onto one Gateway listener,
 /// under the ACME field manager. Because Gateway status conditions are merged by
 /// `type` (listMapKey=type) and the controller uses a different field manager, this
-/// touches ONLY our condition — it neither triggers a full reconcile nor disturbs
-/// the standard Accepted/Programmed/ResolvedRefs conditions. Best-effort: a failure
-/// to write status must not abort issuance.
+/// touches ONLY our condition and leaves the standard Accepted/Programmed/ResolvedRefs
+/// conditions alone. The document also carries `attachedRoutes` — required on every
+/// listener-status entry by the CRD — set to the controller-supplied value, so it's a
+/// no-op for that field: a no-op apply doesn't bump resourceVersion, so it triggers no
+/// watch event and no reconcile. (Targets only reach ACME after the controller has
+/// written this listener's status, so the field is already present; echoing it is
+/// belt-and-suspenders against any cache-lag window.) Best-effort: a failure to write
+/// status must not abort issuance.
 async fn patch_acme_status(client: &Client, target: &AcmeTarget, state: &AcmeState) {
     let (status, reason, message) = state.condition();
     // A self-contained SSA document: just this listener + just our condition.
@@ -231,6 +315,9 @@ async fn patch_acme_status(client: &Client, target: &AcmeTarget, state: &AcmeSta
         "metadata": { "name": target.gw_name, "namespace": target.gw_ns },
         "status": { "listeners": [{
             "name": target.listener_name,
+            // Required on every listener-status entry by the CRD; echo the controller's
+            // value so this apply never changes the count it owns (no flap).
+            "attachedRoutes": target.attached_routes,
             // SSA requires the listMapKey fields of every list we touch; conditions
             // is keyed by `type`, listeners by `name` (set above).
             "conditions": [{
@@ -327,17 +414,17 @@ fn backoff_delay(fails: u32) -> Duration {
     Duration::from_secs(secs).min(BACKOFF_MAX)
 }
 
-/// Leader pass: for every ACME-opted-in listener, compute its state, (re)issue when
+/// Leader pass: for every published ACME target, compute its state, (re)issue when
 /// needed (honoring per-target backoff), and report the result on the listener's
 /// `torii.dirba.io/ACMEIssued` condition. Every target gets a status every scan —
-/// nothing is silently skipped.
+/// nothing is silently skipped. The target set comes from the controller via
+/// [`AcmeFeed`]; this never lists Gateways itself.
 async fn scan_and_issue(
     client: &Client,
-    gw_api: &Api<Gateway>,
+    targets: &[AcmeTarget],
     config: &AcmeConfig,
     backoff: &mut Backoff,
 ) -> Result<()> {
-    let targets = self::targets(gw_api, config).await?;
     for target in targets {
         // Config error: the Gateway opted in but no issuer/email is configured
         // (neither a CLI default nor a Gateway annotation). Report it instead of
@@ -350,7 +437,7 @@ async fn scan_and_issue(
             missing.push("email (--acme-email or torii.dirba.io/acme-email)");
         }
         if !missing.is_empty() {
-            patch_acme_status(client, &target, &AcmeState::Failed {
+            patch_acme_status(client, target, &AcmeState::Failed {
                 detail: format!("ACME enabled but not configured: missing {}", missing.join(", ")),
                 retry_in_s: 0,
             }).await;
@@ -359,7 +446,7 @@ async fn scan_and_issue(
 
         // Wildcard / empty hostname → can never validate via TLS-ALPN-01. Report it.
         if target.hostname.starts_with("*.") || target.hostname.is_empty() {
-            patch_acme_status(client, &target, &AcmeState::Unsupported {
+            patch_acme_status(client, target, &AcmeState::Unsupported {
                 reason: format!(
                     "ACME cannot validate hostname {:?}; TLS-ALPN-01 requires a concrete \
                      (non-wildcard, non-empty) DNS name",
@@ -373,38 +460,38 @@ async fn scan_and_issue(
         if let CertCheck::Good { not_after } =
             cert_check(client, &target.secret_ns, &target.secret_name).await
         {
-            backoff.record_success(&target);
-            patch_acme_status(client, &target, &AcmeState::Issued { not_after }).await;
+            backoff.record_success(target);
+            patch_acme_status(client, target, &AcmeState::Issued { not_after }).await;
             continue;
         }
 
         // Needs work. If backed off from a recent failure, keep reporting that
         // failure (with the remaining wait) rather than re-hitting the CA.
-        if !backoff.ready(&target) {
-            if let Some(state) = backoff.failed_state(&target) {
-                patch_acme_status(client, &target, &state).await;
+        if !backoff.ready(target) {
+            if let Some(state) = backoff.failed_state(target) {
+                patch_acme_status(client, target, &state).await;
             }
             continue;
         }
 
         // Attempt issuance, reporting Pending up front so the condition reflects
         // "in progress" even if the order takes a while or the process restarts.
-        patch_acme_status(client, &target, &AcmeState::Pending {
+        patch_acme_status(client, target, &AcmeState::Pending {
             stage: "ordering certificate".into(),
         }).await;
-        match issue(client, config, &target).await {
+        match issue(client, config, target).await {
             Ok(not_after) => {
-                backoff.record_success(&target);
-                patch_acme_status(client, &target, &AcmeState::Issued { not_after }).await;
+                backoff.record_success(target);
+                patch_acme_status(client, target, &AcmeState::Issued { not_after }).await;
             }
             Err(e) => {
                 let detail = format!("{e:#}");
-                let delay = backoff.record_failure(&target, detail.clone());
+                let delay = backoff.record_failure(target, detail.clone());
                 tracing::warn!(
                     host = %target.hostname, error = %detail,
                     retry_in_s = delay.as_secs(), "ACME issuance failed; backing off",
                 );
-                patch_acme_status(client, &target, &AcmeState::Failed {
+                patch_acme_status(client, target, &AcmeState::Failed {
                     detail,
                     retry_in_s: delay.as_secs(),
                 }).await;
@@ -412,64 +499,6 @@ async fn scan_and_issue(
         }
     }
     Ok(())
-}
-
-/// Enumerate EVERY ACME-opted-in HTTPS/TLS-terminate listener (one [`AcmeTarget`]
-/// per certificateRefs Secret). Unlike the old `needs()`, this does NOT pre-filter
-/// wildcard hosts or certs that don't need work — the caller decides each target's
-/// state and reports it, so nothing is silently dropped.
-async fn targets(gw_api: &Api<Gateway>, config: &AcmeConfig) -> Result<Vec<AcmeTarget>> {
-    use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
-    use kube::api::ListParams;
-    let gateways = gw_api.list(&ListParams::default()).await?;
-    let mut out = Vec::new();
-    for gw in gateways {
-        let anns = gw.annotations();
-        // Opt-in: the enable annotation must be PRESENT (value ignored). Without it,
-        // ACME is skipped even if issuer/email annotations exist.
-        if !anns.contains_key(ANNO_ENABLE) {
-            continue;
-        }
-        // Issuer + email: per-Gateway annotation overrides the CLI default; either
-        // may be None (reported as a failure by the caller, not skipped here).
-        let directory = anns.get(ANNO_ISSUER).cloned().or_else(|| config.default_issuer.clone());
-        let email = anns.get(ANNO_EMAIL).cloned().or_else(|| config.default_email.clone());
-        let gw_ns = gw.namespace().unwrap_or_default();
-        let gw_name = gw.name_any();
-        let gw_gen = gw.meta().generation.unwrap_or(0);
-        for l in &gw.spec.listeners {
-            if !matches!(l.protocol.as_str(), "HTTPS" | "TLS") {
-                continue;
-            }
-            let Some(tls) = l.tls.as_ref() else { continue };
-            // Passthrough terminates at the backend; we don't issue for it.
-            if matches!(tls.mode, Some(Mode::Passthrough)) {
-                continue;
-            }
-            let hostname = l.hostname.clone().unwrap_or_default();
-            for r in tls.certificate_refs.clone().unwrap_or_default() {
-                // Only manage core-Secret refs.
-                if r.group.clone().unwrap_or_default() != ""
-                    || r.kind.clone().unwrap_or_else(|| "Secret".into()) != "Secret"
-                {
-                    continue;
-                }
-                let secret_ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
-                out.push(AcmeTarget {
-                    gw_ns: gw_ns.clone(),
-                    gw_name: gw_name.clone(),
-                    listener_name: l.name.clone(),
-                    gw_gen,
-                    hostname: hostname.clone(),
-                    directory: directory.clone(),
-                    email: email.clone(),
-                    secret_ns,
-                    secret_name: r.name.clone(),
-                });
-            }
-        }
-    }
-    Ok(out)
 }
 
 /// The current state of a cert Secret for ACME purposes.
@@ -872,6 +901,37 @@ mod tests {
     }
 
     #[test]
+    fn feed_publishes_set_and_pokes_only_on_change() {
+        let feed = AcmeFeed::new();
+        assert!(feed.load().is_empty(), "starts empty");
+
+        // A first publish makes the set readable AND pokes (changed from empty).
+        feed.publish(vec![target("a.example.com")]);
+        assert_eq!(feed.load().len(), 1);
+        // The poke is buffered, so a waiter resolves immediately.
+        assert!(
+            futures::FutureExt::now_or_never(feed.notified()).is_some(),
+            "first publish should have poked"
+        );
+
+        // Re-publishing the SAME set must NOT poke (no spurious ACME wake-ups on
+        // unrelated reconciles that don't change the target set).
+        feed.publish(vec![target("a.example.com")]);
+        assert!(
+            futures::FutureExt::now_or_never(feed.notified()).is_none(),
+            "an unchanged publish must not poke"
+        );
+
+        // A different set pokes again.
+        feed.publish(vec![target("b.example.com")]);
+        assert_eq!(feed.load()[0].hostname, "b.example.com");
+        assert!(
+            futures::FutureExt::now_or_never(feed.notified()).is_some(),
+            "a changed publish should poke"
+        );
+    }
+
+    #[test]
     fn cert_not_after_parses_validity() {
         // Generate a self-signed cert and confirm we read a plausible notAfter.
         let key = rcgen::KeyPair::generate().unwrap();
@@ -899,6 +959,7 @@ mod tests {
             hostname: host.into(),
             secret_ns: "default".into(),
             secret_name: format!("{host}-tls"),
+            attached_routes: 0,
         }
     }
 

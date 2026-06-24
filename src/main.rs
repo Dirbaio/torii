@@ -121,27 +121,37 @@ async fn run(args: Cli) -> Result<()> {
         .spawn(move || dataplane::run(dp, &bind_ip, &http_ports, &tls_ports))
         .context("failed to spawn data-plane thread")?;
 
-    // ACME (optional): only spawned with --acme. When off, nothing changes.
-    if args.acme {
+    // ACME (optional): only spawned with --acme. When off, `acme_feed` is None and the
+    // controller skips computing/publishing issuance targets entirely.
+    let acme_feed = if args.acme {
+        // The controller computes the desired issuance targets during reconcile and
+        // pushes them through this feed; the ACME leader consumes them. So the
+        // controller, not ACME, resolves issuer/email — ACME just acts on the set.
+        let feed = acme::AcmeFeed::new();
         let acme_config = acme::AcmeConfig {
             namespace: args.acme_namespace.clone(),
-            default_issuer: args.acme_issuer.clone(),
-            default_email: args.acme_email.clone(),
             holder_id: acme_holder_id(),
             ca_cert_path: args.acme_ca_cert.clone(),
         };
         let acme_client = client.clone();
         let acme_dp = data_plane.clone();
+        let acme_feed = feed.clone();
         tokio::spawn(async move {
-            if let Err(e) = acme::run(acme_client, acme_dp, acme_config).await {
+            if let Err(e) = acme::run(acme_client, acme_dp, acme_feed, acme_config).await {
                 tracing::error!(error = %e, "ACME subsystem exited");
             }
         });
-    }
+        Some(feed)
+    } else {
+        None
+    };
 
     // Control plane on this runtime.
     let config = controller::ControllerConfig {
         advertise_address: args.advertise,
+        acme_feed,
+        acme_default_issuer: args.acme_issuer,
+        acme_default_email: args.acme_email,
     };
     controller::run(client, data_plane, config).await
 }
