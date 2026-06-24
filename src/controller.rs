@@ -1684,9 +1684,11 @@ impl ReconcileCtx {
             if slice.namespace().unwrap_or_default() != ns {
                 continue;
             }
-            // Only IPv4 endpoints are routable in our (IPv4) dev/cluster network;
-            // skip IPv6/FQDN slices to avoid dialing unreachable addresses.
-            if slice.address_type != "IPv4" {
+            // Route to IP endpoints of either family. The data plane dials an
+            // (IpAddr, port), which works for v4 and v6 alike. Skip FQDN slices:
+            // their "addresses" are DNS names, not IPs, so they don't parse below
+            // (and would need separate resolution we don't do).
+            if slice.address_type != "IPv4" && slice.address_type != "IPv6" {
                 continue;
             }
             let owner_svc = slice
