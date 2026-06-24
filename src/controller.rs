@@ -302,6 +302,8 @@ enum PolicyStatus {
 /// "invalid → 5xx") lives in the [`UpstreamTlsMap`], keyed by target Service.
 struct PolicyOutcome {
     status: PolicyStatus,
+    /// Human-readable detail for a False condition (empty when Accepted).
+    message: String,
 }
 
 /// (service-namespace, service-name, service-port) → backend TLS mode for the data
@@ -1455,6 +1457,30 @@ impl ReconcileCtx {
         for policy in &policies {
             let pol_ns = policy.namespace().unwrap_or_default();
             let pol_key = (pol_ns.clone(), policy.name_any());
+
+            // A targetRef of an unknown/unsupported kind → ResolvedRefs=False/
+            // InvalidKind (spec: backendtlspolicy_types.go). Previously such targets
+            // were silently dropped, leaving the policy with no status at all.
+            if let Some(bad) = policy
+                .spec
+                .target_refs
+                .iter()
+                .find(|t| !t.group.is_empty() || t.kind != "Service")
+            {
+                outcomes.insert(
+                    pol_key,
+                    PolicyOutcome {
+                        status: PolicyStatus::InvalidKind,
+                        message: format!(
+                            "targetRef {}/{} is not a core Service",
+                            if bad.group.is_empty() { "core" } else { &bad.group },
+                            bad.kind
+                        ),
+                    },
+                );
+                continue;
+            }
+
             let ca = self.resolve_policy_ca(policy, &pol_ns);
 
             // Invalid policies: emit the right ResolvedRefs reason, and mark every
@@ -1463,11 +1489,17 @@ impl ReconcileCtx {
             let ca_pem = match ca {
                 CaResult::Valid(pem) => pem,
                 CaResult::InvalidKind | CaResult::InvalidRef => {
-                    let status = match ca {
-                        CaResult::InvalidKind => PolicyStatus::InvalidKind,
-                        _ => PolicyStatus::InvalidCaRef,
+                    let (status, message) = match ca {
+                        CaResult::InvalidKind => (
+                            PolicyStatus::InvalidKind,
+                            "a caCertificateRef is not a core ConfigMap".to_string(),
+                        ),
+                        _ => (
+                            PolicyStatus::InvalidCaRef,
+                            "no valid CA certificate could be resolved".to_string(),
+                        ),
                     };
-                    outcomes.insert(pol_key, PolicyOutcome { status });
+                    outcomes.insert(pol_key, PolicyOutcome { status, message });
                     for t in &policy.spec.target_refs {
                         if !t.group.is_empty() || t.kind != "Service" {
                             continue;
@@ -1524,12 +1556,15 @@ impl ReconcileCtx {
                     }
                 }
             }
-            let status = if lost_any && !won_any {
-                PolicyStatus::Conflicted
+            let (status, message) = if lost_any && !won_any {
+                (
+                    PolicyStatus::Conflicted,
+                    "another BackendTLSPolicy already targets this Service section".to_string(),
+                )
             } else {
-                PolicyStatus::Accepted
+                (PolicyStatus::Accepted, String::new())
             };
-            outcomes.insert(pol_key, PolicyOutcome { status });
+            outcomes.insert(pol_key, PolicyOutcome { status, message });
         }
         (artifacts, outcomes)
     }
@@ -1607,6 +1642,8 @@ impl ReconcileCtx {
             let pol_ns = policy.namespace().unwrap_or_default();
             let outcome = outcomes
                 .get(&(pol_ns.clone(), policy.name_any()));
+            // The message explaining a False condition (empty when Accepted).
+            let msg = outcome.map(|o| o.message.as_str()).unwrap_or("");
             // Map the computed PolicyStatus to its (ResolvedRefs, Accepted) pair.
             let (resolved, accepted) = match outcome.map(|o| &o.status) {
                 Some(PolicyStatus::Accepted) => (
@@ -1616,15 +1653,15 @@ impl ReconcileCtx {
                 Some(PolicyStatus::Conflicted) => (
                     // Conflicted policies have valid refs → ResolvedRefs stays True.
                     condition("ResolvedRefs", "True", "ResolvedRefs", gen),
-                    condition("Accepted", "False", "Conflicted", gen),
+                    condition_msg("Accepted", "False", "Conflicted", msg, gen),
                 ),
                 Some(PolicyStatus::InvalidKind) => (
-                    condition("ResolvedRefs", "False", "InvalidKind", gen),
+                    condition_msg("ResolvedRefs", "False", "InvalidKind", msg, gen),
                     condition("Accepted", "False", "NoValidCACertificate", gen),
                 ),
                 // InvalidCaRef, or no outcome (shouldn't happen) → invalid-ref reason.
                 _ => (
-                    condition("ResolvedRefs", "False", "InvalidCACertificateRef", gen),
+                    condition_msg("ResolvedRefs", "False", "InvalidCACertificateRef", msg, gen),
                     condition("Accepted", "False", "NoValidCACertificate", gen),
                 ),
             };
