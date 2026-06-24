@@ -986,7 +986,7 @@ impl ReconcileCtx {
                 let filters = filters_from(rule_filters);
                 let request_timeout = rule.timeouts.as_ref().and_then(|t| {
                     let parse = |s: &Option<String>| {
-                        s.as_ref().and_then(|v| parse_go_duration(v)).filter(|d| !d.is_zero())
+                        s.as_ref().and_then(|v| parse_gep2257_duration(v)).filter(|d| !d.is_zero())
                     };
                     [parse(&t.request), parse(&t.backend_request)]
                         .into_iter()
@@ -1939,27 +1939,62 @@ fn cert_key_is_valid(ck: &CertKey) -> bool {
         && pingora_core::tls::pkey::PKey::private_key_from_pem(&ck.key_pem).is_ok()
 }
 
-/// Parse a Gateway API / Go-style duration (e.g. "500ms", "1s", "2m", "0s") into
-/// a [`Duration`]. Supports h/m/s/ms/us/ns units; returns None on parse failure.
-fn parse_go_duration(s: &str) -> Option<Duration> {
+/// Parse a Gateway API duration into a [`Duration`].
+///
+/// This is the **GEP-2257** format (`^([0-9]{1,5}(h|m|s|ms)){1,4}$`), a *strict
+/// subset* of Go's `time.ParseDuration` — NOT the full Go format. Specifically:
+/// only the units `h|m|s|ms` (no `ns`/`us`/`µs`), integer values only (no
+/// fractions like `1.5h`), no sign, at most four `<int><unit>` segments. We parse
+/// it directly rather than reusing a Go-style parser so we don't accept values the
+/// CRD's own pattern validation would reject.
+///
+/// One to four concatenated `<int><unit>` segments are summed (e.g. `1h30m`,
+/// `2m30s`, `500ms`, `0s`). Returns `None` on any parse failure. A previous version
+/// matched the whole tail as a single unit, so a compound value like `1h30m` failed
+/// and silently disabled the configured timeout.
+fn parse_gep2257_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
+    // Tolerate a bare "0" even though GEP-2257 requires a unit (e.g. "0s").
     if s == "0" {
         return Some(Duration::ZERO);
     }
-    // Split into a number and a unit suffix.
-    let unit_start = s.find(|c: char| c.is_alphabetic())?;
-    let (num, unit) = s.split_at(unit_start);
-    let value: f64 = num.parse().ok()?;
-    let nanos = match unit {
-        "ns" => value,
-        "us" | "µs" => value * 1e3,
-        "ms" => value * 1e6,
-        "s" => value * 1e9,
-        "m" => value * 60.0 * 1e9,
-        "h" => value * 3600.0 * 1e9,
-        _ => return None,
-    };
-    Some(Duration::from_nanos(nanos as u64))
+    if s.is_empty() {
+        return None;
+    }
+
+    let mut total = Duration::ZERO;
+    let mut rest = s;
+    while !rest.is_empty() {
+        // Digits of this segment's value.
+        let digits_end = rest.find(|c: char| !c.is_ascii_digit())?;
+        if digits_end == 0 {
+            return None; // a unit with no preceding number
+        }
+        let value: u64 = rest[..digits_end].parse().ok()?;
+        rest = &rest[digits_end..];
+
+        // Unit: match the longest known unit at the start (ms before m/s).
+        let (unit_secs_num, unit_secs_den, unit_len) = if rest.starts_with("ms") {
+            (1u64, 1000u64, 2) // milliseconds
+        } else if rest.starts_with('h') {
+            (3600, 1, 1)
+        } else if rest.starts_with('m') {
+            (60, 1, 1)
+        } else if rest.starts_with('s') {
+            (1, 1, 1)
+        } else {
+            return None; // unknown / missing unit
+        };
+        rest = &rest[unit_len..];
+
+        // value * unit, in nanoseconds, checked against overflow.
+        let nanos = (value as u128)
+            .checked_mul(unit_secs_num as u128)?
+            .checked_mul(1_000_000_000u128)?
+            / unit_secs_den as u128;
+        total = total.checked_add(Duration::from_nanos(u64::try_from(nanos).ok()?))?;
+    }
+    Some(total)
 }
 
 /// Build a [`PathRewrite`] from a redirect/url-rewrite path config. `is_full_path`
@@ -2161,5 +2196,46 @@ fn condition(type_: &str, status: &str, reason: &str, observed_generation: i64) 
         // keeps the merge patch deterministic (avoids needless status churn).
         // k8s-openapi 0.27 uses jiff (not chrono) for Time.
         last_transition_time: Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn duration_single_segment() {
+        assert_eq!(parse_gep2257_duration("1s"), Some(Duration::from_secs(1)));
+        assert_eq!(parse_gep2257_duration("500ms"), Some(Duration::from_millis(500)));
+        assert_eq!(parse_gep2257_duration("2m"), Some(Duration::from_secs(120)));
+        assert_eq!(parse_gep2257_duration("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_gep2257_duration("0s"), Some(Duration::ZERO));
+        assert_eq!(parse_gep2257_duration("0"), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn duration_compound_segments() {
+        // The bug this fixes: compound values used to parse to None.
+        assert_eq!(parse_gep2257_duration("1h30m"), Some(Duration::from_secs(5400)));
+        assert_eq!(parse_gep2257_duration("2m30s"), Some(Duration::from_secs(150)));
+        assert_eq!(
+            parse_gep2257_duration("1h30m15s"),
+            Some(Duration::from_secs(3600 + 1800 + 15))
+        );
+        assert_eq!(
+            parse_gep2257_duration("1h0m0s500ms"),
+            Some(Duration::from_millis(3_600_000 + 500))
+        );
+    }
+
+    #[test]
+    fn duration_rejects_garbage() {
+        assert_eq!(parse_gep2257_duration(""), None);
+        assert_eq!(parse_gep2257_duration("abc"), None);
+        assert_eq!(parse_gep2257_duration("10"), None); // number without a unit
+        assert_eq!(parse_gep2257_duration("s"), None); // unit without a number
+        assert_eq!(parse_gep2257_duration("1x"), None); // unknown unit
+        assert_eq!(parse_gep2257_duration("1us"), None); // not a GEP-2257 unit
+        assert_eq!(parse_gep2257_duration("1.5s"), None); // GEP-2257 is integer-only
     }
 }
