@@ -1369,8 +1369,9 @@ impl ReconcileCtx {
                 let Some(selector) = ns_cfg.and_then(|n| n.selector.as_ref()) else {
                     return false;
                 };
-                let labels = selector.match_labels.clone().unwrap_or_default();
-                // Find the route's namespace object and check its labels.
+                // Find the route's namespace object and evaluate the LabelSelector
+                // against its labels. A LabelSelector is matchLabels AND
+                // matchExpressions; an empty selector matches everything.
                 self.stores
                     .namespaces
                     .state()
@@ -1378,9 +1379,19 @@ impl ReconcileCtx {
                     .find(|n| n.name_any() == route_ns)
                     .map(|n| {
                         let ns_labels = n.labels();
-                        labels
+                        // matchLabels: every (k, v) must be present and equal.
+                        let labels_ok = selector
+                            .match_labels
                             .iter()
-                            .all(|(k, v)| ns_labels.get(k).map(|x| x == v).unwrap_or(false))
+                            .flatten()
+                            .all(|(k, v)| ns_labels.get(k).map(|x| x == v).unwrap_or(false));
+                        // matchExpressions: every expression must hold.
+                        let exprs_ok = selector
+                            .match_expressions
+                            .iter()
+                            .flatten()
+                            .all(|e| label_expr_matches(&e.key, &e.operator, &e.values, ns_labels));
+                        labels_ok && exprs_ok
                     })
                     .unwrap_or(false)
             }
@@ -1849,6 +1860,25 @@ fn listener_hostname_overlaps(listener_host: Option<&str>, route_hosts: &[String
     route_hosts.iter().any(|rh| hostnames_intersect(lh, rh))
 }
 
+/// Evaluate one Kubernetes `LabelSelectorRequirement` against a label set.
+/// Operators (case-sensitive, per the API): In, NotIn, Exists, DoesNotExist.
+/// An unknown operator never matches (fail closed).
+fn label_expr_matches(
+    key: &str,
+    operator: &str,
+    values: &Option<Vec<String>>,
+    labels: &std::collections::BTreeMap<String, String>,
+) -> bool {
+    let values = values.as_deref().unwrap_or_default();
+    match operator {
+        "In" => labels.get(key).map(|v| values.iter().any(|x| x == v)).unwrap_or(false),
+        "NotIn" => labels.get(key).map(|v| !values.iter().any(|x| x == v)).unwrap_or(true),
+        "Exists" => labels.contains_key(key),
+        "DoesNotExist" => !labels.contains_key(key),
+        _ => false,
+    }
+}
+
 /// Two hostnames intersect if they're equal, or one's wildcard covers the other.
 fn hostnames_intersect(a: &str, b: &str) -> bool {
     if a.eq_ignore_ascii_case(b) {
@@ -2213,5 +2243,31 @@ mod tests {
         assert_eq!(parse_gep2257_duration("1x"), None); // unknown unit
         assert_eq!(parse_gep2257_duration("1us"), None); // not a GEP-2257 unit
         assert_eq!(parse_gep2257_duration("1.5s"), None); // GEP-2257 is integer-only
+    }
+
+    fn lbls(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn label_expr_operators() {
+        let l = lbls(&[("env", "prod"), ("team", "core")]);
+        let v = |xs: &[&str]| Some(xs.iter().map(|s| s.to_string()).collect());
+
+        // In
+        assert!(label_expr_matches("env", "In", &v(&["prod", "stage"]), &l));
+        assert!(!label_expr_matches("env", "In", &v(&["dev"]), &l));
+        assert!(!label_expr_matches("missing", "In", &v(&["x"]), &l));
+        // NotIn (absent key counts as NotIn-match, per k8s semantics)
+        assert!(label_expr_matches("env", "NotIn", &v(&["dev"]), &l));
+        assert!(!label_expr_matches("env", "NotIn", &v(&["prod"]), &l));
+        assert!(label_expr_matches("missing", "NotIn", &v(&["x"]), &l));
+        // Exists / DoesNotExist (values ignored)
+        assert!(label_expr_matches("team", "Exists", &None, &l));
+        assert!(!label_expr_matches("missing", "Exists", &None, &l));
+        assert!(label_expr_matches("missing", "DoesNotExist", &None, &l));
+        assert!(!label_expr_matches("team", "DoesNotExist", &None, &l));
+        // Unknown operator fails closed.
+        assert!(!label_expr_matches("env", "Bogus", &v(&["prod"]), &l));
     }
 }
