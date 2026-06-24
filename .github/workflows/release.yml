@@ -1,0 +1,66 @@
+# Build the torii container image and push it to GHCR when a git tag is created.
+#
+# On `git push --tags` (any tag, e.g. v1.2.3), this builds the multi-stage
+# Dockerfile and publishes to ghcr.io/<owner>/torii. Tags pushed:
+#   - the git tag verbatim          (e.g. v1.2.3)
+#   - the semver pieces             (1.2.3, 1.2, 1)   for v-prefixed semver tags
+#   - latest                        (only for the highest semver, not pre-releases)
+#
+# Auth uses the built-in GITHUB_TOKEN — no secrets to configure. The package
+# inherits the repo's visibility; make it public in the repo's Packages settings
+# if you want anonymous `docker pull`.
+name: release
+
+on:
+  push:
+    tags:
+      - "*"
+
+# Least privilege: read the code, write the GHCR package.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Derive image tags/labels from the git ref. ghcr.io/<owner>/<repo>,
+      # lowercased automatically.
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+          # `latest` only for a real release tag, never a pre-release like v1.2.3-rc1.
+          flavor: |
+            latest=auto
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Speed up repeat builds by caching layers in the Actions cache.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
