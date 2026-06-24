@@ -254,17 +254,13 @@ pub struct Filters {
     pub response_headers: HeaderMods,
     pub redirect: Option<Redirect>,
     pub url_rewrite: Option<UrlRewrite>,
-    /// RequestMirror targets: a copy of the request is sent fire-and-forget to one
-    /// endpoint of each, with the given sampling percent (0..=100).
-    pub mirrors: Vec<Mirror>,
     /// CORS filter config, if present.
     pub cors: Option<Cors>,
 }
 
 impl Filters {
     /// Merge per-backend filters on top of rule-level filters. Header mods are
-    /// concatenated; redirect/url_rewrite/cors from the backend override if set;
-    /// mirrors are combined.
+    /// concatenated; redirect/url_rewrite/cors from the backend override if set.
     pub fn merged_with(&self, backend: &Filters) -> Filters {
         let mut out = self.clone();
         out.request_headers.set.extend(backend.request_headers.set.clone());
@@ -282,7 +278,6 @@ impl Filters {
         if backend.cors.is_some() {
             out.cors = backend.cors.clone();
         }
-        out.mirrors.extend(backend.mirrors.clone());
         out
     }
 }
@@ -308,13 +303,6 @@ impl Cors {
                 || cors_origin_wildcard_matches(o, origin)
         })
     }
-}
-
-/// A request-mirror target (resolved backend endpoints + sampling percent).
-#[derive(Debug, Clone)]
-pub struct Mirror {
-    pub endpoints: Vec<Endpoint>,
-    pub percent: u8,
 }
 
 #[derive(Debug, Clone)]
