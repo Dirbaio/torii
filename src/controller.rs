@@ -48,12 +48,12 @@ use crate::snapshot::{DataPlane, Snapshot};
 use crate::tls_table::{TlsAction, TlsBackend, TlsBackends, TlsTable};
 
 /// Our controller name. Must be DOMAIN/PATH and match GatewayClass.spec.controllerName.
-pub const CONTROLLER_NAME: &str = "lolgateway.dev/controller";
+pub const CONTROLLER_NAME: &str = "torii.dirba.io/controller";
 
 /// Server-Side Apply field manager for the controller's status writes. Distinct
 /// from the ACME subsystem's manager ([`crate::acme::FIELD_MANAGER`]) so the two
 /// can own different conditions on the same object without clobbering each other.
-const FIELD_MANAGER: &str = "lolgateway-controller";
+const FIELD_MANAGER: &str = "torii-controller";
 
 /// Features we report in GatewayClass.status.supportedFeatures. The conformance
 /// suite uses this to decide which tests apply when running a whole profile
@@ -768,7 +768,7 @@ impl ReconcileCtx {
                             .collect()
                     };
                 // The three standard conditions. The ACME subsystem separately owns
-                // the `lolgateway.dev/ACMEIssued` listener condition via its own SSA
+                // the `torii.dirba.io/ACMEIssued` listener condition via its own SSA
                 // field manager (merged by condition type), so we never touch it.
                 GatewayStatusListeners {
                     name: o.name.clone(),
@@ -1819,7 +1819,7 @@ impl ReconcileCtx {
 
     /// Write an object's status via **Server-Side Apply** under our field manager.
     /// SSA (not a merge patch) is what lets a second writer — the ACME subsystem —
-    /// own its own `lolgateway.dev/ACMEIssued` listener condition without our
+    /// own its own `torii.dirba.io/ACMEIssued` listener condition without our
     /// reconcile clobbering it: k8s merges the conditions list by `type`
     /// (listMapKey=type), so each manager's fields are preserved independently.
     /// `force` takes ownership of any field a previous manager held (e.g. after an
@@ -1865,7 +1865,7 @@ impl ReconcileCtx {
 }
 
 
-/// Validate one HTTPRoute rule for values that are CRD-valid but that lolgateway
+/// Validate one HTTPRoute rule for values that are CRD-valid but that torii
 /// can't honor. Returns `Some(message)` describing the first such problem, or `None`
 /// if the rule is fully supported. A rule that fails this is NOT programmed into the
 /// data plane and the route reports `Accepted=False`/`UnsupportedValue` with this

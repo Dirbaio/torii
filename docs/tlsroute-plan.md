@@ -1,8 +1,8 @@
 # TLSRoute implementation plan (SNI passthrough + terminate on a shared port)
 
 Status: **IMPLEMENTED** (2026-06-20). The design below was followed as written and
-needed no edits to vendored `pingora/`. Shipped as `lolgateway/src/tls_sni.rs`
-(ClientHello SNI parser) + `lolgateway/src/tls_table.rs` (`TlsTable` SNI dispatch),
+needed no edits to vendored `pingora/`. Shipped as `torii/src/tls_sni.rs`
+(ClientHello SNI parser) + `torii/src/tls_table.rs` (`TlsTable` SNI dispatch),
 plus `GatewayTlsApp` in `dataplane.rs` and TLSRoute reconcile in `controller.rs`.
 Conformance: **11/12** TLSRoute tests pass; the lone gap is
 `TLSRouteHostnameIntersection`, which requires per-Gateway distinct addresses (we
@@ -65,7 +65,7 @@ Matching tests in `gateway-api/conformance/tests/`:
 
 The controller already has the listener scaffolding: it maps `protocol: "TLS"` →
 `supportedKinds: ["TLSRoute"]` and detects `GatewayListenersTlsMode::Passthrough`
-(`lolgateway/src/controller.rs:517,572`). It just never built a data path for it.
+(`torii/src/controller.rs:517,572`). It just never built a data path for it.
 
 ## 2. The Pingora integration point (verified — no `pingora/` edits required)
 
@@ -237,7 +237,7 @@ peek_sni(stream):
 
 Add a per-port SNI map **inside the existing `ArcSwap<Snapshot>`** — no new swap
 mechanism, published in the same atomic store as routes + certs
-(`lolgateway/src/snapshot.rs`).
+(`torii/src/snapshot.rs`).
 
 ```rust
 pub struct Snapshot {

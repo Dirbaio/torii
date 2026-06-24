@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# lolgateway dev tasks. Usage: ./d <task> [args]
+# torii dev tasks. Usage: ./d <task> [args]
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -14,7 +14,7 @@ build)
     ;;
 
 test)
-    cargo test --bin lolgateway
+    cargo test --bin torii
     ;;
 
 check)
@@ -49,7 +49,7 @@ EOF
 apiVersion: gateway.networking.k8s.io/v1
 kind: GatewayClass
 metadata: { name: gateway-conformance }
-spec: { controllerName: lolgateway.dev/controller }
+spec: { controllerName: torii.dirba.io/controller }
 EOF
     ;;
 

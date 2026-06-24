@@ -43,7 +43,7 @@ pub struct RequestCtx {
     /// Forwarded-header values captured from the inbound connection in
     /// `request_filter` (the only phase with `Session` access), emitted to the
     /// upstream in `upstream_request_filter`. We OVERWRITE any client-supplied
-    /// `X-Forwarded-*` rather than appending: lolgateway may sit directly on the
+    /// `X-Forwarded-*` rather than appending: torii may sit directly on the
     /// public internet with no trusted proxy in front, so an inbound XFF is
     /// attacker-controlled and must not be honored (it would let a client spoof
     /// its source IP past rate-limits / geo-blocking).
@@ -209,7 +209,7 @@ impl ProxyHttp for GatewayProxy {
         Self::CTX: Send + Sync,
     {
         // Forwarded headers (nginx-ingress parity). OVERWRITE rather than append:
-        // an inbound X-Forwarded-* is attacker-controlled when lolgateway faces
+        // an inbound X-Forwarded-* is attacker-controlled when torii faces
         // the internet directly, so we never trust/extend it. Set before
         // apply_header_mods so an explicit user RequestHeaderModifier still wins.
         let fwd = &ctx.fwd;

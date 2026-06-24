@@ -1,4 +1,4 @@
-# lolgateway
+# ⛩️ torii
 
 A [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) controller written in Rust,
 with a data plane built on [Pingora](https://github.com/cloudflare/pingora). The goal is
@@ -110,7 +110,7 @@ pre-existing limitation (the HTTP data path shares the same single-address model
 
 ### Automatic TLS certificates (ACME)
 
-lolgateway can obtain and renew TLS certificates automatically via **ACME TLS-ALPN-01**
+torii can obtain and renew TLS certificates automatically via **ACME TLS-ALPN-01**
 (e.g. from Let's Encrypt). It is **off by default** and must be enabled with `--acme`.
 
 The Gateway API v1.5 spec has **no official field** for ACME issuance — listeners only
@@ -123,10 +123,10 @@ kind: Gateway
 metadata:
   name: web
   annotations:
-    lolgateway.dev/acme-issuer: "https://acme-v02.api.letsencrypt.org/directory"
-    lolgateway.dev/acme-email: "you@example.com"
+    torii.dirba.io/acme-issuer: "https://acme-v02.api.letsencrypt.org/directory"
+    torii.dirba.io/acme-email: "you@example.com"
 spec:
-  gatewayClassName: lolgateway
+  gatewayClassName: torii
   listeners:
     - name: https
       port: 443
@@ -139,12 +139,12 @@ spec:
 ```
 
 How it works:
-- Run with `--acme [--acme-namespace lolgateway-system] [--acme-email ...]`.
+- Run with `--acme [--acme-namespace torii-system] [--acme-email ...]`.
 - For each opted-in HTTPS listener whose `certificateRefs` Secret is missing, invalid, or
-  expiring (renewed ~30 days before `notAfter`), lolgateway runs an ACME order and writes
+  expiring (renewed ~30 days before `notAfter`), torii runs an ACME order and writes
   the issued cert into that Secret — which then flows through the normal cert path.
 - **The full issuance/renewal state is observable via the k8s API** — no controller-log
-  access needed. Each opted-in listener gets a `lolgateway.dev/ACMEIssued` condition on the
+  access needed. Each opted-in listener gets a `torii.dirba.io/ACMEIssued` condition on the
   Gateway: `True/Issued` (with the cert's expiry), `False/Pending` (in progress),
   `False/Failed` (the message carries the *actual* CA failure reason — e.g. the per-challenge
   problem or connect error — plus the retry-in time), or `False/UnsupportedValue` (a
@@ -174,7 +174,7 @@ profiles** (Gateway, HTTPRoute, TLSRoute-via-Gateway, ReferenceGrant, BackendTLS
 and their extended features).
 
 **Out of scope** (these profiles are not targeted and their tests are expected to be
-skipped — lolgateway does not advertise their features):
+skipped — torii does not advertise their features):
 
 - `GATEWAY-GRPC` — GRPCRoute
 - `GATEWAY-TCP` — TCPRoute
@@ -205,7 +205,7 @@ Notes on a few out-of-scope / unimplemented items:
 ## Local dev cluster (kind)
 
 We develop against a local single-node [kind](https://kind.sigs.k8s.io/) cluster. The key
-trick is making the **Pod CIDR and Service CIDR routable from the host**, so lolgateway can
+trick is making the **Pod CIDR and Service CIDR routable from the host**, so torii can
 run on the host with `cargo run` and still open TCP connections directly to Service
 ClusterIPs and backend Pod IPs — no `kubectl port-forward`, no building/pushing a container
 image. This makes the iteration loop fast.
@@ -272,7 +272,7 @@ kind get kubeconfig --name lol > kubeconfig
 The `kubeconfig` filename is **gitignored** — it contains a client cert/key, so never
 commit it.
 
-Point `kubectl` (and lolgateway) at it via the `KUBECONFIG` env var:
+Point `kubectl` (and torii) at it via the `KUBECONFIG` env var:
 
 ```bash
 export KUBECONFIG=$PWD/kubeconfig
@@ -298,11 +298,11 @@ INFO listed namespaces count=5
 OK: connected to Kubernetes 1.36, 5 namespace(s) visible
 ```
 
-Adjust log verbosity with `--log` or `RUST_LOG`, e.g. `--log lolgateway=debug,kube=info`.
+Adjust log verbosity with `--log` or `RUST_LOG`, e.g. `--log torii=debug,kube=info`.
 
 ## Running the controller
 
-`lolgateway run` starts both planes in one process: the kube controller (on the tokio
+`torii run` starts both planes in one process: the kube controller (on the tokio
 runtime) and the Pingora proxy (on a dedicated thread).
 
 ```bash
@@ -332,7 +332,7 @@ Without this, `--bind 0.0.0.0:80` fails and the conformance traffic stage gets
 ## Running the conformance suite
 
 The conformance GatewayClass must exist (named `gateway-conformance`, controllerName
-`lolgateway.dev/controller`) and our controller must be running and have set its
+`torii.dirba.io/controller`) and our controller must be running and have set its
 `Accepted=True` condition. Apply it once:
 
 ```bash
@@ -342,7 +342,7 @@ kind: GatewayClass
 metadata:
   name: gateway-conformance
 spec:
-  controllerName: lolgateway.dev/controller
+  controllerName: torii.dirba.io/controller
 EOF
 ```
 

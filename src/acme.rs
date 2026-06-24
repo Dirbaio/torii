@@ -1,7 +1,7 @@
 //! Automatic TLS certificate issuance via ACME (TLS-ALPN-01).
 //!
 //! Off by default; enabled with `--acme`. Even then, a Gateway must opt in with
-//! the `lolgateway.dev/acme-issuer` annotation (the ACME directory URL). For each
+//! the `torii.dirba.io/acme-issuer` annotation (the ACME directory URL). For each
 //! HTTPS/TLS-terminate listener with a (single, non-wildcard) hostname and a
 //! `certificateRefs` Secret, we obtain a cert and write it into that Secret — the
 //! controller's existing Secret watcher + cert store then serve it, no special
@@ -14,8 +14,8 @@
 //! into its data plane — any instance can answer the `acme-tls/1` handshake.
 //!
 //! ## State (all in k8s, in `--acme-namespace`)
-//! - account key: Secret `lolgateway-acme-account` (`credentials.json`).
-//! - in-flight challenge certs: Secret `lolgateway-acme-challenge` (`<host>.crt/.key`).
+//! - account key: Secret `torii-acme-account` (`credentials.json`).
+//! - in-flight challenge certs: Secret `torii-acme-challenge` (`<host>.crt/.key`).
 //! - issued certs: each listener's own `certificateRefs` Secret (`tls.crt/tls.key`).
 
 use std::collections::{BTreeMap, HashMap};
@@ -43,25 +43,25 @@ use crate::snapshot::{ChallengeStore, DataPlane};
 
 /// Gateway annotation naming the ACME directory URL (opt-in trigger). Public so the
 /// controller can detect ACME-opted-in listeners and report their status.
-pub const ANNO_ISSUER: &str = "lolgateway.dev/acme-issuer";
+pub const ANNO_ISSUER: &str = "torii.dirba.io/acme-issuer";
 /// Gateway annotation overriding the ACME contact email.
-const ANNO_EMAIL: &str = "lolgateway.dev/acme-email";
+const ANNO_EMAIL: &str = "torii.dirba.io/acme-email";
 
-const ACCOUNT_SECRET: &str = "lolgateway-acme-account";
-const CHALLENGE_SECRET: &str = "lolgateway-acme-challenge";
+const ACCOUNT_SECRET: &str = "torii-acme-account";
+const CHALLENGE_SECRET: &str = "torii-acme-challenge";
 /// Server-Side Apply field manager for ACME's writes. Public so the controller can
 /// reference it; distinct from the controller's manager so each owns its own fields
-/// (Secrets here, plus the `lolgateway.dev/ACMEIssued` listener condition) without
+/// (Secrets here, plus the `torii.dirba.io/ACMEIssued` listener condition) without
 /// clobbering the other.
-pub const FIELD_MANAGER: &str = "lolgateway-acme";
+pub const FIELD_MANAGER: &str = "torii-acme";
 
 /// The custom listener condition type the ACME subsystem owns. Reports the full
 /// issuance/renewal lifecycle (Issued / Pending / Failed / unsupported hostname) on
 /// the Gateway, so operators can see ACME state and failure reasons via the k8s API
 /// — no controller-log access needed. Gateway API permits extra condition types and
 /// the conformance suite ignores unknown ones, so this is safe.
-const COND_ACME: &str = "lolgateway.dev/ACMEIssued";
-const LEASE_NAME: &str = "lolgateway-acme-leader";
+const COND_ACME: &str = "torii.dirba.io/ACMEIssued";
+const LEASE_NAME: &str = "torii-acme-leader";
 
 /// Renew when the cert is within this window of expiry (Let's Encrypt issues
 /// 90-day certs; ~30 days early is the conventional safety margin).
@@ -170,7 +170,7 @@ impl AcmeTarget {
 }
 
 /// The ACME issuance/renewal state of one listener, surfaced as the
-/// `lolgateway.dev/ACMEIssued` condition. Each maps to a (status, reason, message).
+/// `torii.dirba.io/ACMEIssued` condition. Each maps to a (status, reason, message).
 enum AcmeState {
     /// A valid cert is present; `not_after` is the unix-seconds expiry.
     Issued { not_after: i64 },
@@ -204,7 +204,7 @@ impl AcmeState {
     }
 }
 
-/// SSA-apply the `lolgateway.dev/ACMEIssued` condition onto one Gateway listener,
+/// SSA-apply the `torii.dirba.io/ACMEIssued` condition onto one Gateway listener,
 /// under the ACME field manager. Because Gateway status conditions are merged by
 /// `type` (listMapKey=type) and the controller uses a different field manager, this
 /// touches ONLY our condition — it neither triggers a full reconcile nor disturbs
@@ -317,7 +317,7 @@ fn backoff_delay(fails: u32) -> Duration {
 
 /// Leader pass: for every ACME-opted-in listener, compute its state, (re)issue when
 /// needed (honoring per-target backoff), and report the result on the listener's
-/// `lolgateway.dev/ACMEIssued` condition. Every target gets a status every scan —
+/// `torii.dirba.io/ACMEIssued` condition. Every target gets a status every scan —
 /// nothing is silently skipped.
 async fn scan_and_issue(
     client: &Client,
