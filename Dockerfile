@@ -2,8 +2,8 @@
 # glibc/OpenSSL ABI matches the Debian runtime + the kind node), then a slim
 # runtime image with just the shared libs Pingora's OpenSSL backend needs.
 #
-# Context is the repo root; .dockerignore trims it to Cargo.{toml,lock} + the
-# lolgateway/ crate + the vendored pingora/ path deps.
+# Context is the repo root; .dockerignore trims it to Cargo.{toml,lock} + src/
+# + the vendored pingora/ path deps.
 
 FROM rust:1-bookworm AS builder
 
@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 WORKDIR /src
 COPY . .
 
-# Build only our binary (workspace excludes pingora/gateway-api already).
+# Build only our binary (pingora/gateway-api are path/vendored, not members).
 RUN cargo build --release --bin lolgateway \
     && cp target/release/lolgateway /lolgateway
 
