@@ -907,11 +907,6 @@ impl ReconcileCtx {
                 *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
             }
 
-            let accepted = match accept_reason {
-                None => condition("Accepted", "True", "Accepted", gen),
-                Some(reason) => condition("Accepted", "False", reason, gen),
-            };
-
             // Tiebreaker metadata for precedence ordering.
             let route_creation = route
                 .meta()
@@ -925,7 +920,18 @@ impl ReconcileCtx {
             // Resolve backends across all rules, tracking the most specific
             // ResolvedRefs failure reason (RefNotPermitted takes priority).
             let mut refs_failure: Option<&'static str> = None;
+            // First unsupported-value problem found in any rule. The offending rule
+            // is skipped (not programmed) and the route is Accepted=False.
+            let mut unsupported: Option<String> = None;
             for (rule_order, rule) in route.spec.rules.iter().flatten().enumerate() {
+                // A rule with a CRD-valid but unsupported value is not programmed;
+                // record the reason for the route's Accepted condition and skip it.
+                if let Some(msg) = validate_http_rule(rule_order, rule) {
+                    if unsupported.is_none() {
+                        unsupported = Some(msg);
+                    }
+                    continue;
+                }
                 let mut backends = Vec::new();
                 for backend_ref in rule.backend_refs.iter().flatten() {
                     let svc_port = backend_ref.port.unwrap_or(0) as u16;
@@ -1040,6 +1046,17 @@ impl ReconcileCtx {
                     }
                 }
             }
+
+            // Accepted: attachment failure (no listener took the route) wins; then a
+            // rule with an unsupported value → UnsupportedValue + an explanatory
+            // message; otherwise Accepted.
+            let accepted = match (accept_reason, &unsupported) {
+                (Some(reason), _) => condition("Accepted", "False", reason, gen),
+                (None, Some(msg)) => {
+                    condition_msg("Accepted", "False", "UnsupportedValue", msg, gen)
+                }
+                (None, None) => condition("Accepted", "True", "Accepted", gen),
+            };
 
             let resolved = match refs_failure {
                 None => condition("ResolvedRefs", "True", "ResolvedRefs", gen),
@@ -1773,6 +1790,97 @@ impl ReconcileCtx {
 }
 
 
+/// Validate one HTTPRoute rule for values that are CRD-valid but that lolgateway
+/// can't honor. Returns `Some(message)` describing the first such problem, or `None`
+/// if the rule is fully supported. A rule that fails this is NOT programmed into the
+/// data plane and the route reports `Accepted=False`/`UnsupportedValue` with this
+/// message — never silently dropped.
+fn validate_http_rule(
+    rule_idx: usize,
+    rule: &gateway_api::apis::standard::httproutes::HttpRouteRules,
+) -> Option<String> {
+    use gateway_api::apis::standard::httproutes::{
+        HttpRouteRulesFiltersType as FType, HttpRouteRulesMatchesHeadersType as HType,
+        HttpRouteRulesMatchesPathType as PType, HttpRouteRulesMatchesQueryParamsType as QType,
+    };
+    let at = format!("rules[{rule_idx}]");
+
+    for (mi, m) in rule.matches.iter().flatten().enumerate() {
+        // Path: RegularExpression is implementation-specific and not implemented.
+        if let Some(p) = &m.path {
+            if matches!(p.r#type, Some(PType::RegularExpression)) {
+                return Some(format!(
+                    "{at}.matches[{mi}].path: RegularExpression path matching is not supported"
+                ));
+            }
+        }
+        // Header match: a RegularExpression value must compile.
+        for (hi, h) in m.headers.iter().flatten().enumerate() {
+            if matches!(h.r#type, Some(HType::RegularExpression)) {
+                if let Err(e) = regex::Regex::new(&h.value) {
+                    return Some(format!(
+                        "{at}.matches[{mi}].headers[{hi}]: invalid RegularExpression {:?}: {e}",
+                        h.value
+                    ));
+                }
+            }
+        }
+        // Query params: RegularExpression is not implemented (we match Exact only).
+        for (qi, q) in m.query_params.iter().flatten().enumerate() {
+            if matches!(q.r#type, Some(QType::RegularExpression)) {
+                return Some(format!(
+                    "{at}.matches[{mi}].queryParams[{qi}]: RegularExpression query matching is not supported"
+                ));
+            }
+        }
+    }
+
+    // Filters: reject types we don't implement rather than silently ignoring them.
+    for (fi, f) in rule.filters.iter().flatten().enumerate() {
+        match f.r#type {
+            FType::RequestHeaderModifier
+            | FType::ResponseHeaderModifier
+            | FType::RequestRedirect
+            | FType::UrlRewrite
+            | FType::Cors => {}
+            FType::RequestMirror => {
+                return Some(format!(
+                    "{at}.filters[{fi}]: RequestMirror is not supported"
+                ));
+            }
+            FType::ExtensionRef => {
+                return Some(format!(
+                    "{at}.filters[{fi}]: ExtensionRef filters are not supported"
+                ));
+            }
+        }
+        // Redirect status code must be a valid HTTP redirect code.
+        if let Some(r) = &f.request_redirect {
+            if let Some(code) = r.status_code {
+                if !matches!(code, 301 | 302 | 303 | 307 | 308) {
+                    return Some(format!(
+                        "{at}.filters[{fi}].requestRedirect.statusCode: unsupported value {code}"
+                    ));
+                }
+            }
+        }
+    }
+
+    // Timeouts: a present-but-unparseable GEP-2257 duration would otherwise be
+    // silently dropped (no timeout enforced).
+    if let Some(t) = &rule.timeouts {
+        for (field, val) in [("request", &t.request), ("backendRequest", &t.backend_request)] {
+            if let Some(s) = val {
+                if parse_gep2257_duration(s).is_none() {
+                    return Some(format!("{at}.timeouts.{field}: invalid duration {s:?}"));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 /// Convert a Gateway API HTTPRouteMatch into our internal RouteMatch.
 fn route_match_from(
     m: &gateway_api::apis::standard::httproutes::HttpRouteRulesMatches,
@@ -2201,13 +2309,28 @@ where
     store.get(&reflector::ObjectRef::new(name).within(ns))
 }
 
-/// Build a metav1 Condition with observedGeneration set.
+/// Build a metav1 Condition with observedGeneration set and an empty message.
 fn condition(type_: &str, status: &str, reason: &str, observed_generation: i64) -> Condition {
+    condition_msg(type_, status, reason, "", observed_generation)
+}
+
+/// Build a metav1 Condition carrying a human-readable `message`. The Gateway API
+/// `message` field is meant to explain WHY a condition is False — infra users see
+/// it via `kubectl describe`/`get -o yaml` even without controller-log access. The
+/// conformance suite matches only on type/status/reason (helpers.go), so a detailed
+/// message is always safe to include and never breaks a test.
+fn condition_msg(
+    type_: &str,
+    status: &str,
+    reason: &str,
+    message: &str,
+    observed_generation: i64,
+) -> Condition {
     Condition {
         type_: type_.to_string(),
         status: status.to_string(),
         reason: reason.to_string(),
-        message: String::new(),
+        message: message.to_string(),
         observed_generation: Some(observed_generation),
         // A fixed timestamp is fine; the suite never inspects it. A stable value
         // keeps the merge patch deterministic (avoids needless status churn).
