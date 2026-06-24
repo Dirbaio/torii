@@ -78,11 +78,11 @@ const RENEW_WINDOW: Duration = Duration::from_secs(30 * 24 * 3600);
 /// How often the leader scans for issuance/renewal work.
 const SCAN_INTERVAL: Duration = Duration::from_secs(300);
 /// Lease lifetime; we renew well within it.
-const LEASE_TTL: Duration = Duration::from_secs(15);
-const LEASE_RENEW: Duration = Duration::from_secs(5);
+const LEASE_TTL: Duration = Duration::from_secs(120);
+const LEASE_RENEW: Duration = Duration::from_secs(60);
 /// Settle time after publishing a challenge cert before telling ACME to verify,
 /// so the challenge Secret can propagate to followers (the validator may hit any).
-const CHALLENGE_SETTLE: Duration = Duration::from_secs(2);
+const CHALLENGE_SETTLE: Duration = Duration::from_secs(10);
 
 /// Failure backoff: after a failed issuance, wait at least this long before
 /// retrying that host, doubling per consecutive failure up to [`BACKOFF_MAX`].
