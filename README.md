@@ -143,6 +143,15 @@ How it works:
 - For each opted-in HTTPS listener whose `certificateRefs` Secret is missing, invalid, or
   expiring (renewed ~30 days before `notAfter`), lolgateway runs an ACME order and writes
   the issued cert into that Secret — which then flows through the normal cert path.
+- **The full issuance/renewal state is observable via the k8s API** — no controller-log
+  access needed. Each opted-in listener gets a `lolgateway.dev/ACMEIssued` condition on the
+  Gateway: `True/Issued` (with the cert's expiry), `False/Pending` (in progress),
+  `False/Failed` (the message carries the *actual* CA failure reason — e.g. the per-challenge
+  problem or connect error — plus the retry-in time), or `False/UnsupportedValue` (a
+  wildcard/empty hostname TLS-ALPN-01 can't validate). The ACME subsystem patches only this
+  condition, via Server-Side Apply under its own field manager, so it never triggers a full
+  reconcile and coexists with the controller's standard listener conditions.
+  `kubectl describe gateway web` shows it.
 - **All state lives in Kubernetes:** the ACME account key and in-flight challenge certs are
   Secrets in `--acme-namespace`; issued certs go in each listener's own `certificateRefs`
   Secret.
