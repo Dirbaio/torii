@@ -47,7 +47,7 @@ reads it lock-free per request. Request dispatch is indexed by `(port, listener 
 — exact/wildcard/any tiers — so it scans only the routes serving the request's Host, not
 the whole table. The Pingora TLS backend is **OpenSSL** (not rustls), because per-SNI cert
 selection needs the OpenSSL/BoringSSL certificate callback. See the modules in
-[lolgateway/src/](lolgateway/src/).
+[src/](src/).
 
 ### Conformance results
 
@@ -358,8 +358,8 @@ between tests (otherwise pod-readiness races cause spurious failures):
 KUBECONFIG=$PWD/kubeconfig bash hack/run-tests.sh HTTPRouteMatching HTTPRouteWeight
 ```
 
-There's also a [`justfile`](justfile) wrapping the common tasks: `just cluster-up`,
-`just run`, `just conformance <Test...>`, `just cluster-down`.
+There's also a [`d`](d) script wrapping the common tasks: `./d cluster-up`,
+`./d run`, `./d conformance <Test...>`, `./d cluster-down`.
 
 ## Vendored references
 
