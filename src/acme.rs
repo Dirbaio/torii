@@ -41,8 +41,9 @@ use gateway_api::apis::standard::gateways::Gateway;
 use crate::cert_store::CertKey;
 use crate::snapshot::{ChallengeStore, DataPlane};
 
-/// Gateway annotation naming the ACME directory URL (opt-in trigger).
-const ANNO_ISSUER: &str = "lolgateway.dev/acme-issuer";
+/// Gateway annotation naming the ACME directory URL (opt-in trigger). Public so the
+/// controller can detect ACME-opted-in listeners and report their status.
+pub const ANNO_ISSUER: &str = "lolgateway.dev/acme-issuer";
 /// Gateway annotation overriding the ACME contact email.
 const ANNO_EMAIL: &str = "lolgateway.dev/acme-email";
 
