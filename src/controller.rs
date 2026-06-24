@@ -776,10 +776,22 @@ impl ReconcileCtx {
                 condition("Programmed", "False", "InvalidParameters", gen),
             ]
         } else {
-            let any_accepted = model.listeners.iter().any(|o| o.protocol_supported);
-            let all_accepted = model.listeners.iter().all(|o| o.protocol_supported);
+            // A protocol-conflicted listener (mixed TLS termination, unsupported) is
+            // itself Accepted=False/Programmed=False, so it must not count as accepted
+            // or programmed in the Gateway-level rollup either.
+            let any_accepted = model
+                .listeners
+                .iter()
+                .any(|o| o.protocol_supported && !o.protocol_conflict);
+            let all_accepted = model
+                .listeners
+                .iter()
+                .all(|o| o.protocol_supported && !o.protocol_conflict);
             let all_programmed = model.listeners.iter().all(|o| {
-                o.protocol_supported && o.tls_failure.is_none() && !o.invalid_kind
+                o.protocol_supported
+                    && o.tls_failure.is_none()
+                    && !o.invalid_kind
+                    && !o.protocol_conflict
             });
             let accepted = if any_accepted {
                 let reason = if all_accepted { "Accepted" } else { "ListenersNotValid" };
