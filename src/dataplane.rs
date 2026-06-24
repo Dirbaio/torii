@@ -562,6 +562,10 @@ fn select_alpn<'a>(client: &'a [u8], proto: &[u8]) -> Option<&'a [u8]> {
 /// handshake. This is what makes per-listener / per-SNI HTTPS termination work.
 struct SniCertCallback {
     data_plane: DataPlane,
+    /// Self-signed last-resort cert, generated once at startup. Served when no
+    /// real cert matches so the handshake completes (with a browser warning)
+    /// instead of failing — letting a user click through to the upstream.
+    fallback: Arc<crate::cert_store::CertKey>,
 }
 
 #[async_trait]
@@ -583,11 +587,16 @@ impl pingora_core::listeners::TlsAccept for SniCertCallback {
         }
 
         let snapshot = self.data_plane.load();
-        let Some(ck) = snapshot.certs.select(sni.as_deref()) else {
-            // No cert available; leave the default (handshake will fail cleanly).
-            return;
-        };
-        install_cert(ssl, ck);
+        match snapshot.certs.select(sni.as_deref()) {
+            Some(ck) => install_cert(ssl, ck),
+            // No real cert (no SNI match, Secret missing, ACME not done yet). Serve
+            // the self-signed fallback so the handshake completes — the client gets
+            // a security warning but can click through and reach the upstream.
+            None => {
+                tracing::debug!(?sni, "no matching cert; serving self-signed fallback");
+                install_cert(ssl, &self.fallback);
+            }
+        }
     }
 }
 
@@ -919,8 +928,14 @@ fn build_tls_acceptor(
         }
     });
     let acceptor = Arc::new(builder.build());
+    // Generate the last-resort self-signed cert once, at startup. Always present,
+    // independent of ACME — served whenever no real cert matches a handshake.
+    let fallback = Arc::new(
+        crate::cert_store::CertKey::generate_self_signed()
+            .expect("failed to generate fallback TLS cert"),
+    );
     let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
-        Box::new(SniCertCallback { data_plane });
+        Box::new(SniCertCallback { data_plane, fallback });
     (acceptor, Arc::new(callbacks))
 }
 
