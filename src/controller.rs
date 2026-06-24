@@ -594,11 +594,7 @@ impl ReconcileCtx {
         gw: &Gateway,
     ) -> ListenerOutcome {
         // Which route kinds are valid for this listener's protocol.
-        let protocol_kinds: &[&str] = match l.protocol.as_str() {
-            "HTTP" | "HTTPS" => &["HTTPRoute"],
-            "TLS" => &["TLSRoute"],
-            _ => &[],
-        };
+        let protocol_kinds: &[&str] = protocol_route_kinds(l.protocol.as_str());
 
         // Reconcile requested allowedRoutes.kinds against the protocol's valid set.
         // Any requested kind not valid → InvalidRouteKinds, dropped from supportedKinds.
@@ -1839,14 +1835,28 @@ fn route_match_from(
     }
 }
 
+/// The route kinds a listener's protocol implicitly supports when
+/// `allowedRoutes.kinds` is unset (Gateway API: kinds default from the protocol).
+/// HTTP/HTTPS → HTTPRoute; TLS → TLSRoute; anything else → none.
+fn protocol_route_kinds(protocol: &str) -> &'static [&'static str] {
+    match protocol {
+        "HTTP" | "HTTPS" => &["HTTPRoute"],
+        "TLS" => &["TLSRoute"],
+        _ => &[],
+    }
+}
+
 /// Does a listener's allowedRoutes.kinds permit the given route kind? An absent
-/// `kinds` list means all kinds the listener's protocol supports (HTTP → HTTPRoute).
+/// `kinds` list does NOT mean "all kinds" — it means the kinds the listener's
+/// PROTOCOL supports. So an HTTPRoute must not attach to a `protocol: TLS` listener
+/// just because that listener omitted `kinds` (it would otherwise be reported
+/// Accepted=True and inflate attachedRoutes, even though no traffic is served).
 fn listener_allows_kind(
     listener: &gateway_api::apis::standard::gateways::GatewayListeners,
     kind: &str,
 ) -> bool {
     match listener.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref()) {
-        None => true,
+        None => protocol_route_kinds(&listener.protocol).contains(&kind),
         Some(kinds) => kinds.iter().any(|k| k.kind == kind),
     }
 }
