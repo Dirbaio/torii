@@ -163,7 +163,6 @@ spec:
           image: ghcr.io/CHANGEME/torii:latest
           imagePullPolicy: IfNotPresent
           args:
-            - run
             - --bind-ip=0.0.0.0
             - --http-ports=80
             - --tls-ports=443

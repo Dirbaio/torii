@@ -346,7 +346,6 @@ spec:
           image: $IMAGE
           imagePullPolicy: Never
           args:
-            - run
             - --bind-ip=0.0.0.0
             - --http-ports=80
             - --tls-ports=443

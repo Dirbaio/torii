@@ -17,14 +17,10 @@ test)
     cargo test --bin torii
     ;;
 
-check)
-    cargo run -- check
-    ;;
-
 # Run the controller + proxy. HTTP on 80/8080/8090, HTTPS (TLS-terminate, per-SNI
 # cert) on 443/8443/8883. Needs `sudo sysctl net.ipv4.ip_unprivileged_port_start=80`.
 run)
-    cargo run -- run --bind-ip 0.0.0.0 \
+    cargo run -- --bind-ip 0.0.0.0 \
         --http-ports 80,8080,8090 --tls-ports 443,8443,8883 --advertise 127.0.0.1
     ;;
 
@@ -78,7 +74,7 @@ conformance-all)
     ;;
 
 *)
-    echo "usage: ./d {build|test|check|run|cluster-up|cluster-down|conformance <Test...>|conformance-all}" >&2
+    echo "usage: ./d {build|test|run|cluster-up|cluster-down|conformance <Test...>|conformance-all}" >&2
     exit 1
     ;;
 esac

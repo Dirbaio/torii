@@ -1,12 +1,11 @@
 //! torii — a Kubernetes Gateway API controller built on Pingora.
 //!
-//! This is the scaffolding entrypoint. Right now it only proves we can talk to
-//! the Kubernetes API server; the controller and data plane come later.
+//! The single entrypoint runs both planes: the kube controller (control plane) on
+//! the tokio runtime, and the Pingora proxy (data plane) on a dedicated thread.
 
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
-use k8s_openapi::api::core::v1::Namespace;
-use kube::{api::ListParams, Api, Client};
+use clap::Parser;
+use kube::Client;
 
 mod acme;
 mod acme_cert;
@@ -18,7 +17,8 @@ mod snapshot;
 mod tls_sni;
 mod tls_table;
 
-/// torii: a Kubernetes Gateway API controller built on Pingora.
+/// torii: a Kubernetes Gateway API controller built on Pingora. Running the binary
+/// starts both the controller and the proxy; there are no subcommands.
 #[derive(Parser, Debug)]
 #[command(name = "torii", version, about)]
 struct Cli {
@@ -26,20 +26,6 @@ struct Cli {
     #[arg(long, env = "TORII_LOG", default_value = "info")]
     log: String,
 
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    /// Connect to the Kubernetes API server and verify access.
-    Check,
-    /// Run the controller (control plane) and the proxy (data plane).
-    Run(RunArgs),
-}
-
-#[derive(clap::Args, Debug)]
-struct RunArgs {
     /// IP the data-plane proxy binds to.
     #[arg(long, env = "TORII_BIND_IP", default_value = "0.0.0.0")]
     bind_ip: String,
@@ -96,23 +82,20 @@ struct RunArgs {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    init_tracing(&cli.log);
+    let args = Cli::parse();
+    init_tracing(&args.log);
 
     // kube's rustls-tls backend needs a process-wide CryptoProvider chosen explicitly.
     rustls::crypto::ring::default_provider()
         .install_default()
         .expect("failed to install rustls ring CryptoProvider");
 
-    match cli.command {
-        Command::Check => check().await,
-        Command::Run(args) => run(args).await,
-    }
+    run(args).await
 }
 
 /// Run both planes: the kube controller on this tokio runtime, and the Pingora
 /// proxy on a dedicated OS thread (it blocks and manages its own runtime).
-async fn run(args: RunArgs) -> Result<()> {
+async fn run(args: Cli) -> Result<()> {
     let client = Client::try_default()
         .await
         .context("failed to build Kubernetes client")?;
@@ -175,50 +158,4 @@ fn init_tracing(filter: &str) {
         .with(fmt::layer())
         .with(env_filter)
         .init();
-}
-
-/// Verify we can reach the API server and read core resources.
-///
-/// Uses the ambient config: in-cluster service account if present, otherwise
-/// the current kubeconfig context (`~/.kube/config` / `$KUBECONFIG`).
-async fn check() -> Result<()> {
-    let client = Client::try_default()
-        .await
-        .context("failed to build Kubernetes client (is a kubeconfig or in-cluster config available?)")?;
-
-    tracing::info!(
-        default_namespace = client.default_namespace(),
-        "built Kubernetes client"
-    );
-
-    // 1. Hit the version endpoint — the cheapest proof the API server answers.
-    let info = client
-        .apiserver_version()
-        .await
-        .context("failed to query API server version")?;
-    tracing::info!(
-        version = %format!("{}.{}", info.major, info.minor),
-        git_version = %info.git_version,
-        platform = %info.platform,
-        "connected to Kubernetes API server"
-    );
-
-    // 2. List namespaces — proves auth + RBAC let us actually read objects.
-    let namespaces: Api<Namespace> = Api::all(client.clone());
-    let ns_list = namespaces
-        .list(&ListParams::default())
-        .await
-        .context("failed to list namespaces (check RBAC permissions)")?;
-    tracing::info!(count = ns_list.items.len(), "listed namespaces");
-    for ns in &ns_list.items {
-        tracing::debug!(name = ns.metadata.name.as_deref().unwrap_or("<unnamed>"), "namespace");
-    }
-
-    println!(
-        "OK: connected to Kubernetes {}.{}, {} namespace(s) visible",
-        info.major,
-        info.minor,
-        ns_list.items.len()
-    );
-    Ok(())
 }
