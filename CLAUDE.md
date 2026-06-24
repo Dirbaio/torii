@@ -163,8 +163,9 @@ Iterate one test at a time. `HTTPRouteSimpleSameNamespace`
 
 ## Conventions
 
-- **Pingora's MSRV is 1.84** (`pingora-core/Cargo.toml`), edition 2021. Local toolchain
-  is newer; stay edition-2021-compatible in our crates to match.
+- **Our crate is edition 2024, `rust-version = "1.96"`.** Pingora (vendored, path dep)
+  is its own crate on its own edition (MSRV 1.84, edition 2021) — editions are per-crate,
+  so ours doesn't force Pingora's. Keep `cargo clippy` clean.
 - Never edit `pingora/` or `gateway-api/`. If you think you need to, you've misunderstood
   the API — re-read the reference instead.
 - Conformance is the source of truth for *behavior*. When unsure how something should

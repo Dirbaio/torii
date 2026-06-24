@@ -270,7 +270,7 @@ enum TlsListenerMode {
 /// `Arc<Gateway>` so route processing can compute attachment against it.
 struct GatewayModel {
     gw: Arc<Gateway>,
-    gen: i64,
+    generation: i64,
     /// False when the Gateway is rejected (invalid parametersRef) — it must not
     /// serve traffic, and routes must not claim it as a parent.
     usable: bool,
@@ -516,9 +516,9 @@ impl ReconcileCtx {
     }
 
     fn gatewayclass_patch(&self, gc: &GatewayClass) -> StatusPatch {
-        let gen = gc.meta().generation.unwrap_or(0);
+        let generation = gc.meta().generation.unwrap_or(0);
         let status = GatewayClassStatus {
-            conditions: Some(vec![condition("Accepted", "True", "Accepted", gen)]),
+            conditions: Some(vec![condition("Accepted", "True", "Accepted", generation)]),
             supported_features: Some(
                 SUPPORTED_FEATURES
                     .iter()
@@ -539,7 +539,7 @@ impl ReconcileCtx {
     /// no status is written here. The cert is loaded ONCE (used for both the
     /// listener status and the CertStore).
     fn build_gateway_model(&self, gw: &Gateway) -> GatewayModel {
-        let gen = gw.meta().generation.unwrap_or(0);
+        let generation = gw.meta().generation.unwrap_or(0);
 
         // An invalid/unsupported `spec.infrastructure.parametersRef` makes the
         // whole Gateway unacceptable (Accepted=False/InvalidParameters) and unusable.
@@ -581,7 +581,7 @@ impl ReconcileCtx {
 
         GatewayModel {
             gw: Arc::new(gw.clone()),
-            gen,
+            generation,
             usable: !invalid_parameters,
             invalid_parameters,
             listeners,
@@ -715,7 +715,7 @@ impl ReconcileCtx {
         attach_counts: &BTreeMap<(String, String), BTreeMap<String, i32>>,
     ) -> StatusPatch {
         let gw = &model.gw;
-        let gen = model.gen;
+        let generation = model.generation;
         let ns = gw.namespace().unwrap_or_default();
         let counts = attach_counts.get(&(ns.clone(), gw.name_any()));
 
@@ -728,29 +728,29 @@ impl ReconcileCtx {
                     .and_then(|c| c.get(&o.name).copied())
                     .unwrap_or(0);
                 let accepted = if !o.protocol_supported {
-                    condition("Accepted", "False", "UnsupportedProtocol", gen)
+                    condition("Accepted", "False", "UnsupportedProtocol", generation)
                 } else if o.protocol_conflict {
                     // Two TLS modes share this port and we don't support mixed.
-                    condition("Accepted", "False", "ProtocolConflict", gen)
+                    condition("Accepted", "False", "ProtocolConflict", generation)
                 } else {
-                    condition("Accepted", "True", "Accepted", gen)
+                    condition("Accepted", "True", "Accepted", generation)
                 };
                 // ResolvedRefs precedence: InvalidRouteKinds, then TLS ref issue.
                 let resolved = if o.invalid_kind {
-                    condition("ResolvedRefs", "False", "InvalidRouteKinds", gen)
+                    condition("ResolvedRefs", "False", "InvalidRouteKinds", generation)
                 } else if let Some(reason) = o.tls_failure {
-                    condition("ResolvedRefs", "False", reason, gen)
+                    condition("ResolvedRefs", "False", reason, generation)
                 } else {
-                    condition("ResolvedRefs", "True", "ResolvedRefs", gen)
+                    condition("ResolvedRefs", "True", "ResolvedRefs", generation)
                 };
                 let programmed = if o.protocol_supported
                     && o.tls_failure.is_none()
                     && !o.invalid_kind
                     && !o.protocol_conflict
                 {
-                    condition("Programmed", "True", "Programmed", gen)
+                    condition("Programmed", "True", "Programmed", generation)
                 } else {
-                    condition("Programmed", "False", "Invalid", gen)
+                    condition("Programmed", "False", "Invalid", generation)
                 };
                 // A protocol-conflicted listener (mixed TLS termination, which we
                 // don't support) is rejected and advertises NO supported kinds —
@@ -784,8 +784,8 @@ impl ReconcileCtx {
         // invalid_kind/tls_failure affect ResolvedRefs/Programmed, not Accepted.
         let conditions = if model.invalid_parameters {
             vec![
-                condition("Accepted", "False", "InvalidParameters", gen),
-                condition("Programmed", "False", "InvalidParameters", gen),
+                condition("Accepted", "False", "InvalidParameters", generation),
+                condition("Programmed", "False", "InvalidParameters", generation),
             ]
         } else {
             // A protocol-conflicted listener (mixed TLS termination, unsupported) is
@@ -807,14 +807,14 @@ impl ReconcileCtx {
             });
             let accepted = if any_accepted {
                 let reason = if all_accepted { "Accepted" } else { "ListenersNotValid" };
-                condition("Accepted", "True", reason, gen)
+                condition("Accepted", "True", reason, generation)
             } else {
-                condition("Accepted", "False", "ListenersNotValid", gen)
+                condition("Accepted", "False", "ListenersNotValid", generation)
             };
             let programmed = if all_programmed && any_accepted {
-                condition("Programmed", "True", "Programmed", gen)
+                condition("Programmed", "True", "Programmed", generation)
             } else {
-                condition("Programmed", "False", "Invalid", gen)
+                condition("Programmed", "False", "Invalid", generation)
             };
             vec![accepted, programmed]
         };
@@ -886,7 +886,7 @@ impl ReconcileCtx {
         table: &mut RouteTable,
         attach_counts: &mut BTreeMap<(String, String), BTreeMap<String, i32>>,
     ) -> Option<StatusPatch> {
-        let gen = route.meta().generation.unwrap_or(0);
+        let generation = route.meta().generation.unwrap_or(0);
         let route_ns = route.namespace().unwrap_or_default();
 
         let mut parents: Vec<HttpRouteStatusParents> = Vec::new();
@@ -1041,7 +1041,7 @@ impl ReconcileCtx {
                         // the listener hostname. Empty route hostnames inherit the
                         // listener's; a listener with no hostname matches any.
                         let effective_hosts =
-                            effective_hostnames(&hostnames, l.hostname.as_deref());
+                            effective_hostnames(hostnames, l.hostname.as_deref());
                         table.entries.push(RouteEntry {
                             listener_port: l.port as u16,
                             listener_hostname: l.hostname.clone(),
@@ -1063,16 +1063,16 @@ impl ReconcileCtx {
             // rule with an unsupported value → UnsupportedValue + an explanatory
             // message; otherwise Accepted.
             let accepted = match (accept_reason, &unsupported) {
-                (Some(reason), _) => condition("Accepted", "False", reason, gen),
+                (Some(reason), _) => condition("Accepted", "False", reason, generation),
                 (None, Some(msg)) => {
-                    condition_msg("Accepted", "False", "UnsupportedValue", msg, gen)
+                    condition_msg("Accepted", "False", "UnsupportedValue", msg, generation)
                 }
-                (None, None) => condition("Accepted", "True", "Accepted", gen),
+                (None, None) => condition("Accepted", "True", "Accepted", generation),
             };
 
             let resolved = match refs_failure {
-                None => condition("ResolvedRefs", "True", "ResolvedRefs", gen),
-                Some(reason) => condition("ResolvedRefs", "False", reason, gen),
+                None => condition("ResolvedRefs", "True", "ResolvedRefs", generation),
+                Some(reason) => condition("ResolvedRefs", "False", reason, generation),
             };
 
             parents.push(HttpRouteStatusParents {
@@ -1185,7 +1185,7 @@ impl ReconcileCtx {
         tls_table: &mut TlsTable,
         attach_counts: &mut BTreeMap<(String, String), BTreeMap<String, i32>>,
     ) -> Option<StatusPatch> {
-        let gen = route.meta().generation.unwrap_or(0);
+        let generation = route.meta().generation.unwrap_or(0);
         let route_ns = route.namespace().unwrap_or_default();
         let route_hostnames = &route.spec.hostnames;
 
@@ -1220,8 +1220,8 @@ impl ReconcileCtx {
             }
 
             let accepted = match accept_reason {
-                None => condition("Accepted", "True", "Accepted", gen),
-                Some(reason) => condition("Accepted", "False", reason, gen),
+                None => condition("Accepted", "True", "Accepted", generation),
+                Some(reason) => condition("Accepted", "False", reason, generation),
             };
 
             // Resolve backends across all rules (shared by every matched SNI), and
@@ -1270,8 +1270,8 @@ impl ReconcileCtx {
             }
 
             let resolved = match refs_failure {
-                None => condition("ResolvedRefs", "True", "ResolvedRefs", gen),
-                Some(reason) => condition("ResolvedRefs", "False", reason, gen),
+                None => condition("ResolvedRefs", "True", "ResolvedRefs", generation),
+                Some(reason) => condition("ResolvedRefs", "False", reason, generation),
             };
 
             parents.push(TlsRouteStatusParents {
@@ -1433,6 +1433,7 @@ impl ReconcileCtx {
     ///   - the [`UpstreamTlsMap`] artifact (keyed by target Service) the data plane
     ///     uses to re-encrypt, and
     ///   - a per-policy [`PolicyOutcome`] (the validated status), keyed by (ns, name).
+    ///
     /// The conflict tiebreak (oldest creationTimestamp, then name) is applied while
     /// building the map, so the use-side and the status-side agree on which policy
     /// wins for a given Service.
@@ -1648,7 +1649,7 @@ impl ReconcileCtx {
     ) -> Vec<StatusPatch> {
         let mut patches = Vec::new();
         for policy in self.stores.backend_tls_policies.state() {
-            let gen = policy.meta().generation.unwrap_or(0);
+            let generation = policy.meta().generation.unwrap_or(0);
             let pol_ns = policy.namespace().unwrap_or_default();
             let outcome = outcomes
                 .get(&(pol_ns.clone(), policy.name_any()));
@@ -1657,22 +1658,22 @@ impl ReconcileCtx {
             // Map the computed PolicyStatus to its (ResolvedRefs, Accepted) pair.
             let (resolved, accepted) = match outcome.map(|o| &o.status) {
                 Some(PolicyStatus::Accepted) => (
-                    condition("ResolvedRefs", "True", "ResolvedRefs", gen),
-                    condition("Accepted", "True", "Accepted", gen),
+                    condition("ResolvedRefs", "True", "ResolvedRefs", generation),
+                    condition("Accepted", "True", "Accepted", generation),
                 ),
                 Some(PolicyStatus::Conflicted) => (
                     // Conflicted policies have valid refs → ResolvedRefs stays True.
-                    condition("ResolvedRefs", "True", "ResolvedRefs", gen),
-                    condition_msg("Accepted", "False", "Conflicted", msg, gen),
+                    condition("ResolvedRefs", "True", "ResolvedRefs", generation),
+                    condition_msg("Accepted", "False", "Conflicted", msg, generation),
                 ),
                 Some(PolicyStatus::InvalidKind) => (
-                    condition_msg("ResolvedRefs", "False", "InvalidKind", msg, gen),
-                    condition("Accepted", "False", "NoValidCACertificate", gen),
+                    condition_msg("ResolvedRefs", "False", "InvalidKind", msg, generation),
+                    condition("Accepted", "False", "NoValidCACertificate", generation),
                 ),
                 // InvalidCaRef, or no outcome (shouldn't happen) → invalid-ref reason.
                 _ => (
-                    condition_msg("ResolvedRefs", "False", "InvalidCACertificateRef", msg, gen),
-                    condition("Accepted", "False", "NoValidCACertificate", gen),
+                    condition_msg("ResolvedRefs", "False", "InvalidCACertificateRef", msg, generation),
+                    condition("Accepted", "False", "NoValidCACertificate", generation),
                 ),
             };
 
@@ -1882,23 +1883,21 @@ fn validate_http_rule(
 
     for (mi, m) in rule.matches.iter().flatten().enumerate() {
         // Path: RegularExpression is implementation-specific and not implemented.
-        if let Some(p) = &m.path {
-            if matches!(p.r#type, Some(PType::RegularExpression)) {
+        if let Some(p) = &m.path
+            && matches!(p.r#type, Some(PType::RegularExpression)) {
                 return Some(format!(
                     "{at}.matches[{mi}].path: RegularExpression path matching is not supported"
                 ));
             }
-        }
         // Header match: a RegularExpression value must compile.
         for (hi, h) in m.headers.iter().flatten().enumerate() {
-            if matches!(h.r#type, Some(HType::RegularExpression)) {
-                if let Err(e) = regex::Regex::new(&h.value) {
+            if matches!(h.r#type, Some(HType::RegularExpression))
+                && let Err(e) = regex::Regex::new(&h.value) {
                     return Some(format!(
                         "{at}.matches[{mi}].headers[{hi}]: invalid RegularExpression {:?}: {e}",
                         h.value
                     ));
                 }
-            }
         }
         // Query params: RegularExpression is not implemented (we match Exact only).
         for (qi, q) in m.query_params.iter().flatten().enumerate() {
@@ -1930,26 +1929,23 @@ fn validate_http_rule(
             }
         }
         // Redirect status code must be a valid HTTP redirect code.
-        if let Some(r) = &f.request_redirect {
-            if let Some(code) = r.status_code {
-                if !matches!(code, 301 | 302 | 303 | 307 | 308) {
+        if let Some(r) = &f.request_redirect
+            && let Some(code) = r.status_code
+                && !matches!(code, 301 | 302 | 303 | 307 | 308) {
                     return Some(format!(
                         "{at}.filters[{fi}].requestRedirect.statusCode: unsupported value {code}"
                     ));
                 }
-            }
-        }
     }
 
     // Timeouts: a present-but-unparseable GEP-2257 duration would otherwise be
     // silently dropped (no timeout enforced).
     if let Some(t) = &rule.timeouts {
         for (field, val) in [("request", &t.request), ("backendRequest", &t.backend_request)] {
-            if let Some(s) = val {
-                if parse_gep2257_duration(s).is_none() {
+            if let Some(s) = val
+                && parse_gep2257_duration(s).is_none() {
                     return Some(format!("{at}.timeouts.{field}: invalid duration {s:?}"));
                 }
-            }
         }
     }
 
