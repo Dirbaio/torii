@@ -85,10 +85,15 @@ impl ProxyHttp for GatewayProxy {
         let path = req.uri.path().to_string();
         let query = req.uri.query().unwrap_or("").to_string();
         let method = req.method.as_str().to_string();
+        // Determine the request's target host. HTTP/2 carries it in the `:authority`
+        // pseudo-header (surfaced by pingora on the request URI); HTTP/1.1 carries it
+        // in the `Host` header. Per RFC 9113 §8.3.1, when `:authority` is present the
+        // `Host` header MUST NOT be used — so prefer the URI authority, and only fall
+        // back to `Host` for HTTP/1.1 (where the URI has no authority).
         let host = req
-            .headers
-            .get("host")
-            .and_then(|v| v.to_str().ok())
+            .uri
+            .host()
+            .or_else(|| req.headers.get("host").and_then(|v| v.to_str().ok()))
             .map(strip_port)
             .unwrap_or_default()
             .to_string();
@@ -831,17 +836,16 @@ impl pingora_core::apps::ServerApp for GatewayTlsApp {
 }
 
 impl GatewayTlsApp {
-    /// Terminate TLS and feed the resulting stream to the HTTP proxy, looping for
-    /// HTTP/1.1 keepalive reuse. Mirrors pingora's own `HttpServerApp` accept loop
-    /// (`apps/mod.rs`), HTTP/1.1 only — our ALPN never negotiates h2, so h2c is
-    /// not a concern here.
+    /// Terminate TLS and feed the resulting stream to the HTTP proxy. Dispatches on
+    /// the ALPN-negotiated protocol: HTTP/2 (`h2`) or HTTP/1.1. Mirrors pingora's own
+    /// `HttpServerApp` accept loop (`apps/mod.rs`), but inlined because pingora's h2
+    /// accept-loop helper (`v2::server::accept_downstream_sessions`) is `pub(crate)`.
     async fn terminate_and_serve_http(
         &self,
         stream: pingora_core::protocols::Stream,
         shutdown: &pingora_core::server::ShutdownWatch,
     ) -> Option<pingora_core::protocols::Stream> {
-        use pingora_core::apps::HttpServerApp;
-        use pingora_core::protocols::http::ServerSession;
+        use pingora_core::protocols::tls::ALPN;
 
         let tls_stream = match pingora_core::protocols::tls::server::handshake_with_callback(
             &self.acceptor,
@@ -857,7 +861,27 @@ impl GatewayTlsApp {
             }
         };
 
-        let mut session = ServerSession::new_http1(Box::new(tls_stream));
+        // Box the concrete TLS stream as the `Box<dyn IO>` the HTTP servers take,
+        // preserving the trait-object's ALPN accessor for the dispatch below.
+        let stream: pingora_core::protocols::Stream = Box::new(tls_stream);
+        if matches!(stream.selected_alpn_proto(), Some(ALPN::H2)) {
+            self.serve_h2(stream, shutdown).await;
+        } else {
+            self.serve_h1(stream, shutdown).await;
+        }
+        None
+    }
+
+    /// HTTP/1.1 accept loop with keepalive reuse.
+    async fn serve_h1(
+        &self,
+        stream: pingora_core::protocols::Stream,
+        shutdown: &pingora_core::server::ShutdownWatch,
+    ) {
+        use pingora_core::apps::HttpServerApp;
+        use pingora_core::protocols::http::ServerSession;
+
+        let mut session = ServerSession::new_http1(stream);
         // Default keepalive (60s), or none while shutting down.
         session.set_keepalive(if *shutdown.borrow() { None } else { Some(60) });
 
@@ -869,7 +893,57 @@ impl GatewayTlsApp {
             }
             result = self.proxy.process_new_http(session, shutdown).await;
         }
-        None
+    }
+
+    /// HTTP/2 accept loop: handshake the connection, then accept each h2 stream and
+    /// drive it through the proxy concurrently. Mirrors pingora's `apps/mod.rs` h2
+    /// path (which uses the `pub(crate)` accept_downstream_sessions helper).
+    async fn serve_h2(
+        &self,
+        stream: pingora_core::protocols::Stream,
+        shutdown: &pingora_core::server::ShutdownWatch,
+    ) {
+        use pingora_core::apps::HttpServerApp;
+        use pingora_core::protocols::http::v2::server;
+        use pingora_core::protocols::http::ServerSession;
+        use pingora_core::protocols::Digest;
+
+        // Connection digest shared across all streams of this h2 connection.
+        let digest = std::sync::Arc::new(Digest {
+            ssl_digest: stream.get_ssl_digest(),
+            timing_digest: stream.get_timing_digest(),
+            proxy_digest: stream.get_proxy_digest(),
+            socket_digest: stream.get_socket_digest(),
+        });
+
+        let mut conn = match server::handshake(stream, self.proxy.h2_options()).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(error = %e, "HTTPS h2 handshake failed");
+                return;
+            }
+        };
+
+        // Accept h2 streams until the client closes the connection. Each stream is
+        // an independent request; spawn it so concurrent streams aren't serialized.
+        loop {
+            match server::HttpSession::from_h2_conn(&mut conn, digest.clone()).await {
+                Ok(Some(h2)) => {
+                    let proxy = self.proxy.clone();
+                    let shutdown = shutdown.clone();
+                    tokio::spawn(async move {
+                        proxy
+                            .process_new_http(ServerSession::new_http2(h2), &shutdown)
+                            .await;
+                    });
+                }
+                Ok(None) => break, // client closed the connection cleanly
+                Err(e) => {
+                    tracing::debug!(error = %e, "HTTPS h2 stream accept failed");
+                    break;
+                }
+            }
+        }
     }
 }
 
@@ -918,14 +992,18 @@ fn build_tls_acceptor(
 
     let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
         .expect("failed to create TLS acceptor builder");
-    // ALPN: accept the ACME `acme-tls/1` challenge protocol; decline anything else
-    // (NOACK → client falls back to HTTP/1.1), identical to the previous listener.
+    // ALPN: offer, in preference order, the ACME `acme-tls/1` challenge protocol,
+    // then HTTP/2 (`h2`), then HTTP/1.1. We pick the first of OUR preferences that
+    // the client also offered. NOACK only if the client offered none of them (it
+    // then falls back to HTTP/1.1 without an ALPN-negotiated protocol).
     builder.set_alpn_select_callback(|_ssl, client| {
         use pingora_core::tls::ssl::AlpnError;
-        match select_alpn(client, b"acme-tls/1") {
-            Some(p) => Ok(p),
-            None => Err(AlpnError::NOACK),
+        for proto in [b"acme-tls/1".as_slice(), b"h2", b"http/1.1"] {
+            if let Some(p) = select_alpn(client, proto) {
+                return Ok(p);
+            }
         }
+        Err(AlpnError::NOACK)
     });
     let acceptor = Arc::new(builder.build());
     // Generate the last-resort self-signed cert once, at startup. Always present,
