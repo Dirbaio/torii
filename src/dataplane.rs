@@ -775,6 +775,13 @@ const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// indefinitely (no keepalive/read timeout applies on this custom L4 path).
 const PIPE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Cap on concurrent HTTP/2 streams per connection (SETTINGS_MAX_CONCURRENT_STREAMS,
+/// RFC 9113 §6.5.2). Our terminate-then-HTTP h2 accept loop spawns one task per
+/// stream; without an advertised cap a single connection could open unboundedly
+/// many. 256 matches common server defaults (nginx/Go) and what Pingora's own h2
+/// path effectively uses.
+const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
+
 /// The TLS data-plane application for a port that may carry TLSRoutes.
 ///
 /// On a **plain-TCP** listener (so Pingora does NOT terminate TLS for us), this
@@ -950,7 +957,12 @@ impl GatewayTlsApp {
             socket_digest: stream.get_socket_digest(),
         });
 
-        let mut conn = match server::handshake(stream, self.proxy.h2_options()).await {
+        // Advertise a bounded max_concurrent_streams so a single connection can't
+        // open unboundedly many streams (each a spawned task). Start from any
+        // options the proxy provides, then enforce our cap.
+        let mut h2_options = self.proxy.h2_options().unwrap_or_else(server::H2Options::new);
+        h2_options.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+        let mut conn = match server::handshake(stream, Some(h2_options)).await {
             Ok(c) => c,
             Err(e) => {
                 tracing::debug!(error = %e, "HTTPS h2 handshake failed");
