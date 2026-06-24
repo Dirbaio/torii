@@ -268,10 +268,14 @@ impl Filters {
         let mut out = self.clone();
         out.request_headers.set.extend(backend.request_headers.set.clone());
         out.request_headers.add.extend(backend.request_headers.add.clone());
-        out.request_headers.remove.extend(backend.request_headers.remove.clone());
+        out.request_headers
+            .remove
+            .extend(backend.request_headers.remove.clone());
         out.response_headers.set.extend(backend.response_headers.set.clone());
         out.response_headers.add.extend(backend.response_headers.add.clone());
-        out.response_headers.remove.extend(backend.response_headers.remove.clone());
+        out.response_headers
+            .remove
+            .extend(backend.response_headers.remove.clone());
         if backend.redirect.is_some() {
             out.redirect = backend.redirect.clone();
         }
@@ -300,11 +304,9 @@ impl Cors {
     /// Does this CORS config allow the given Origin? Supports `*` (any), exact
     /// match, and a wildcard host like `https://*.bar.com`.
     pub fn allows_origin(&self, origin: &str) -> bool {
-        self.allow_origins.iter().any(|o| {
-            o == "*"
-                || o.eq_ignore_ascii_case(origin)
-                || cors_origin_wildcard_matches(o, origin)
-        })
+        self.allow_origins
+            .iter()
+            .any(|o| o == "*" || o.eq_ignore_ascii_case(origin) || cors_origin_wildcard_matches(o, origin))
     }
 }
 
@@ -339,14 +341,7 @@ pub struct UpstreamTls {
 }
 
 impl RouteEntry {
-    pub fn matches(
-        &self,
-        host: &str,
-        path: &str,
-        method: &str,
-        headers: &http::HeaderMap,
-        query: &str,
-    ) -> bool {
+    pub fn matches(&self, host: &str, path: &str, method: &str, headers: &http::HeaderMap, query: &str) -> bool {
         self.matches_host(host) && self.r#match.matches(path, method, headers, query)
     }
 
@@ -408,19 +403,11 @@ impl RouteEntry {
             .path_score()
             .cmp(&self.path_score())
             // 2. Method match present.
-            .then_with(|| {
-                (other.r#match.method.is_some() as u8).cmp(&(self.r#match.method.is_some() as u8))
-            })
+            .then_with(|| (other.r#match.method.is_some() as u8).cmp(&(self.r#match.method.is_some() as u8)))
             // 3. Largest number of header matches.
             .then_with(|| other.r#match.headers.len().cmp(&self.r#match.headers.len()))
             // 4. Largest number of query param matches.
-            .then_with(|| {
-                other
-                    .r#match
-                    .query_params
-                    .len()
-                    .cmp(&self.r#match.query_params.len())
-            })
+            .then_with(|| other.r#match.query_params.len().cmp(&self.r#match.query_params.len()))
             // 5. Oldest route by creation timestamp.
             .then_with(|| self.route_creation.cmp(&other.route_creation))
             // 6. Alphabetical by {namespace}/{name}.
@@ -621,7 +608,10 @@ mod tests {
     #[test]
     fn regex_header_match() {
         let h = |name: &str, val: HeaderValueMatch| RouteMatch {
-            headers: vec![HeaderMatch { name: name.into(), value: val }],
+            headers: vec![HeaderMatch {
+                name: name.into(),
+                value: val,
+            }],
             ..Default::default()
         };
         let re = |p: &str| HeaderValueMatch::Regex(regex::Regex::new(p).unwrap());
@@ -722,9 +712,21 @@ mod tests {
             hostnames: vec![],
             r#match: RouteMatch::default(),
             backends: vec![
-                Backend { weight: 70, endpoints: vec![ip(1)], filters: Filters::default() },
-                Backend { weight: 30, endpoints: vec![ip(2)], filters: Filters::default() },
-                Backend { weight: 0, endpoints: vec![ip(3)], filters: Filters::default() },
+                Backend {
+                    weight: 70,
+                    endpoints: vec![ip(1)],
+                    filters: Filters::default(),
+                },
+                Backend {
+                    weight: 30,
+                    endpoints: vec![ip(2)],
+                    filters: Filters::default(),
+                },
+                Backend {
+                    weight: 0,
+                    endpoints: vec![ip(3)],
+                    filters: Filters::default(),
+                },
             ],
             filters: Filters::default(),
             request_timeout: None,
@@ -819,12 +821,7 @@ mod tests {
             Some("*.svc.example.com"),
             Some("EXAMPLE.com"), // case sensitivity
         ];
-        let route_hosts: [&[&str]; 4] = [
-            &[],
-            &["a.example.com"],
-            &["*.example.com"],
-            &["x.svc.example.com"],
-        ];
+        let route_hosts: [&[&str]; 4] = [&[], &["a.example.com"], &["*.example.com"], &["x.svc.example.com"]];
         let paths = [
             PathMatch::Prefix("/".into()),
             PathMatch::Prefix("/api".into()),
@@ -850,7 +847,10 @@ mod tests {
             e.route_key = format!("ns/r{n}");
             entries.push(e);
         }
-        let mut t = RouteTable { entries, ..Default::default() };
+        let mut t = RouteTable {
+            entries,
+            ..Default::default()
+        };
         t.sort();
 
         let test_hosts = [
@@ -870,14 +870,9 @@ mod tests {
                     let got = t.match_request(port, host, path, "GET", &h, "");
                     let want = reference_match(&t, port, host, path, "GET", &h, "");
                     // Compare by route_key + path identity (entries are unique enough).
-                    let key = |e: Option<&RouteEntry>| {
-                        e.map(|e| (e.route_key.clone(), format!("{:?}", e.r#match.path)))
-                    };
-                    assert_eq!(
-                        key(got),
-                        key(want),
-                        "mismatch at port={port} host={host} path={path}"
-                    );
+                    let key =
+                        |e: Option<&RouteEntry>| e.map(|e| (e.route_key.clone(), format!("{:?}", e.r#match.path)));
+                    assert_eq!(key(got), key(want), "mismatch at port={port} host={host} path={path}");
                 }
             }
         }

@@ -180,9 +180,10 @@ fn wildcard_covers(pattern: &str, host: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::net::IpAddr;
+
     use super::*;
     use crate::route_table::BackendTls;
-    use std::net::IpAddr;
 
     fn ep(n: u8) -> Endpoint {
         Endpoint {
@@ -194,7 +195,10 @@ mod tests {
 
     fn backends(n: u8) -> TlsBackends {
         TlsBackends {
-            backends: vec![TlsBackend { weight: 1, endpoints: vec![ep(n)] }],
+            backends: vec![TlsBackend {
+                weight: 1,
+                endpoints: vec![ep(n)],
+            }],
         }
     }
 
@@ -263,10 +267,7 @@ mod tests {
     fn wildcard_does_not_match_bare_domain() {
         let mut t = TlsTable::default();
         t.insert(443, "*.example.com", TlsAction::Passthrough(backends(1)));
-        assert!(matches!(
-            t.lookup(443, Some("example.com"), 0),
-            TlsDecision::NoRoute
-        ));
+        assert!(matches!(t.lookup(443, Some("example.com"), 0), TlsDecision::NoRoute));
     }
 
     #[test]
@@ -293,7 +294,10 @@ mod tests {
             443,
             "echo.example.com",
             TlsAction::Passthrough(TlsBackends {
-                backends: vec![TlsBackend { weight: 1, endpoints: vec![] }],
+                backends: vec![TlsBackend {
+                    weight: 1,
+                    endpoints: vec![],
+                }],
             }),
         );
         assert!(matches!(

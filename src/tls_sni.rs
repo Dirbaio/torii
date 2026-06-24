@@ -136,8 +136,7 @@ impl<'a> Reader<'a> {
     }
 
     fn u24(&mut self) -> Option<u32> {
-        self.take(3)
-            .map(|b| u32::from_be_bytes([0, b[0], b[1], b[2]]))
+        self.take(3).map(|b| u32::from_be_bytes([0, b[0], b[1], b[2]]))
     }
 }
 
@@ -240,10 +239,7 @@ mod tests {
         for n in 0..full.len() {
             let _ = parse_client_hello_sni(&full[..n]); // must not panic
         }
-        assert_eq!(
-            parse_client_hello_sni(&full).as_deref(),
-            Some("echo.example.com")
-        );
+        assert_eq!(parse_client_hello_sni(&full).as_deref(), Some("echo.example.com"));
     }
 
     #[test]
@@ -255,10 +251,7 @@ mod tests {
     fn trailing_data_after_record_is_ignored() {
         let mut buf = client_hello_with_sni(Some("echo.example.com"));
         buf.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // junk after the record
-        assert_eq!(
-            parse_client_hello_sni(&buf).as_deref(),
-            Some("echo.example.com")
-        );
+        assert_eq!(parse_client_hello_sni(&buf).as_deref(), Some("echo.example.com"));
     }
 
     #[test]
@@ -303,9 +296,6 @@ mod tests {
         rec.extend_from_slice(&(hs.len() as u16).to_be_bytes());
         rec.extend_from_slice(&hs);
 
-        assert_eq!(
-            parse_client_hello_sni(&rec).as_deref(),
-            Some("multi.example.com")
-        );
+        assert_eq!(parse_client_hello_sni(&rec).as_deref(), Some("multi.example.com"));
     }
 }

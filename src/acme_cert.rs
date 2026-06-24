@@ -10,8 +10,7 @@ use rcgen::{CertificateParams, CustomExtension, KeyPair};
 /// ONLY for connections negotiating the `acme-tls/1` ALPN protocol.
 pub fn alpn_cert(host: &str, key_auth_digest: &[u8]) -> Result<(Vec<u8>, Vec<u8>)> {
     let key = KeyPair::generate().context("gen ALPN cert key")?;
-    let mut params = CertificateParams::new(vec![host.to_string()])
-        .context("ALPN cert params")?;
+    let mut params = CertificateParams::new(vec![host.to_string()]).context("ALPN cert params")?;
     params
         .custom_extensions
         .push(CustomExtension::new_acme_identifier(key_auth_digest));
@@ -49,13 +48,12 @@ mod tests {
         // contain the digest (DER: OCTET STRING tag 0x04, len 0x20, then 32 bytes).
         let (_, pem) = x509_parser::pem::parse_x509_pem(&cert_pem).unwrap();
         let cert = pem.parse_x509().unwrap();
-        let san = cert
-            .subject_alternative_name()
-            .unwrap()
-            .expect("SAN present");
-        let has_host = san.value.general_names.iter().any(|n| {
-            matches!(n, x509_parser::extensions::GeneralName::DNSName(h) if *h == "test.example.com")
-        });
+        let san = cert.subject_alternative_name().unwrap().expect("SAN present");
+        let has_host = san
+            .value
+            .general_names
+            .iter()
+            .any(|n| matches!(n, x509_parser::extensions::GeneralName::DNSName(h) if *h == "test.example.com"));
         assert!(has_host, "SAN must contain the host");
 
         let acme_oid = x509_parser::der_parser::oid!(1.3.6.1.5.5.7.1.31);
@@ -78,8 +76,7 @@ mod tests {
         let der = csr_der(&key, "csr.example.com").unwrap();
         // Round-trips as a parseable PKCS#10 CSR with the host as a SAN.
         let (rest, csr) =
-            x509_parser::certification_request::X509CertificationRequest::from_der(&der)
-                .expect("valid CSR DER");
+            x509_parser::certification_request::X509CertificationRequest::from_der(&der).expect("valid CSR DER");
         assert!(rest.is_empty(), "CSR consumes all DER");
         // The requested SAN/subject hostname appears in the encoded request.
         assert!(
@@ -89,7 +86,8 @@ mod tests {
         // The subject MUST NOT carry rcgen's default CN — Let's Encrypt reads the
         // CSR subject CN as a requested identifier and rejects "rcgen self signed cert".
         assert!(
-            !der.windows(b"rcgen self signed cert".len()).any(|w| w == b"rcgen self signed cert"),
+            !der.windows(b"rcgen self signed cert".len())
+                .any(|w| w == b"rcgen self signed cert"),
             "CSR subject must not contain rcgen's default CN"
         );
         let _ = csr; // parsed successfully

@@ -14,7 +14,7 @@ use async_trait::async_trait;
 use pingora_core::prelude::*;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
-use pingora_proxy::{http_proxy, http_proxy_service, ProxyHttp, Session};
+use pingora_proxy::{ProxyHttp, Session, http_proxy, http_proxy_service};
 
 use crate::route_table::{BackendTls, Endpoint, Filters, HeaderMods};
 use crate::snapshot::DataPlane;
@@ -116,11 +116,18 @@ impl ProxyHttp for GatewayProxy {
                 .map(|a| a.ip().to_string()),
             host: host.clone(),
             port,
-            scheme: if self.tls_ports.contains(&port) { "https" } else { "http" },
+            scheme: if self.tls_ports.contains(&port) {
+                "https"
+            } else {
+                "http"
+            },
         };
 
         let snapshot = self.data_plane.load();
-        let Some(entry) = snapshot.routes.match_request(port, &host, &path, &method, &headers, &query) else {
+        let Some(entry) = snapshot
+            .routes
+            .match_request(port, &host, &path, &method, &headers, &query)
+        else {
             tracing::debug!(%host, %path, %method, "no route matched -> 404");
             session.respond_error(404).await?;
             return Ok(true);
@@ -129,10 +136,7 @@ impl ProxyHttp for GatewayProxy {
         // CORS: handle preflight here; for actual requests, stash to add headers
         // to the response later.
         if let Some(cors) = &entry.filters.cors {
-            let origin = headers
-                .get("origin")
-                .and_then(|v| v.to_str().ok())
-                .unwrap_or("");
+            let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
             let allowed = !origin.is_empty() && cors.allows_origin(origin);
             if method.eq_ignore_ascii_case("OPTIONS") && headers.contains_key("access-control-request-method") {
                 // Preflight: respond directly. Echo the requested method/headers
@@ -260,11 +264,7 @@ impl ProxyHttp for GatewayProxy {
     }
 
     /// Forward to the backend chosen in `request_filter`.
-    async fn upstream_peer(
-        &self,
-        _session: &mut Session,
-        ctx: &mut Self::CTX,
-    ) -> Result<Box<HttpPeer>> {
+    async fn upstream_peer(&self, _session: &mut Session, ctx: &mut Self::CTX) -> Result<Box<HttpPeer>> {
         let ep = ctx
             .upstream
             .as_ref()
@@ -278,9 +278,10 @@ impl ProxyHttp for GatewayProxy {
                 p.options.verify_cert = true;
                 p.options.verify_hostname = true;
                 if !tls.ca_pem.is_empty()
-                    && let Ok(certs) = pingora_core::tls::x509::X509::stack_from_pem(&tls.ca_pem) {
-                        p.options.ca = Some(std::sync::Arc::new(certs.into_boxed_slice()));
-                    }
+                    && let Ok(certs) = pingora_core::tls::x509::X509::stack_from_pem(&tls.ca_pem)
+                {
+                    p.options.ca = Some(std::sync::Arc::new(certs.into_boxed_slice()));
+                }
                 p
             }
             BackendTls::Plaintext => HttpPeer::new((ep.ip, ep.port), false, String::new()),
@@ -734,17 +735,13 @@ impl pingora_core::protocols::GetTimingDigest for BoxedStream {
 }
 
 impl pingora_core::protocols::GetProxyDigest for BoxedStream {
-    fn get_proxy_digest(
-        &self,
-    ) -> Option<std::sync::Arc<pingora_core::protocols::raw_connect::ProxyDigest>> {
+    fn get_proxy_digest(&self) -> Option<std::sync::Arc<pingora_core::protocols::raw_connect::ProxyDigest>> {
         self.0.get_proxy_digest()
     }
 }
 
 impl pingora_core::protocols::GetSocketDigest for BoxedStream {
-    fn get_socket_digest(
-        &self,
-    ) -> Option<std::sync::Arc<pingora_core::protocols::SocketDigest>> {
+    fn get_socket_digest(&self) -> Option<std::sync::Arc<pingora_core::protocols::SocketDigest>> {
         self.0.get_socket_digest()
     }
 }
@@ -913,11 +910,7 @@ impl GatewayTlsApp {
     }
 
     /// HTTP/1.1 accept loop with keepalive reuse.
-    async fn serve_h1(
-        &self,
-        stream: pingora_core::protocols::Stream,
-        shutdown: &pingora_core::server::ShutdownWatch,
-    ) {
+    async fn serve_h1(&self, stream: pingora_core::protocols::Stream, shutdown: &pingora_core::server::ShutdownWatch) {
         use pingora_core::apps::HttpServerApp;
         use pingora_core::protocols::http::ServerSession;
 
@@ -938,15 +931,11 @@ impl GatewayTlsApp {
     /// HTTP/2 accept loop: handshake the connection, then accept each h2 stream and
     /// drive it through the proxy concurrently. Mirrors pingora's `apps/mod.rs` h2
     /// path (which uses the `pub(crate)` accept_downstream_sessions helper).
-    async fn serve_h2(
-        &self,
-        stream: pingora_core::protocols::Stream,
-        shutdown: &pingora_core::server::ShutdownWatch,
-    ) {
+    async fn serve_h2(&self, stream: pingora_core::protocols::Stream, shutdown: &pingora_core::server::ShutdownWatch) {
         use pingora_core::apps::HttpServerApp;
-        use pingora_core::protocols::http::v2::server;
-        use pingora_core::protocols::http::ServerSession;
         use pingora_core::protocols::Digest;
+        use pingora_core::protocols::http::ServerSession;
+        use pingora_core::protocols::http::v2::server;
 
         // Connection digest shared across all streams of this h2 connection.
         let digest = std::sync::Arc::new(Digest {
@@ -977,9 +966,7 @@ impl GatewayTlsApp {
                     let proxy = self.proxy.clone();
                     let shutdown = shutdown.clone();
                     tokio::spawn(async move {
-                        proxy
-                            .process_new_http(ServerSession::new_http2(h2), &shutdown)
-                            .await;
+                        proxy.process_new_http(ServerSession::new_http2(h2), &shutdown).await;
                     });
                 }
                 Ok(None) => break, // client closed the connection cleanly
@@ -1003,11 +990,7 @@ impl GatewayTlsApp {
 /// that stamps a shared `last_active` instant on every successful read/write. A
 /// watchdog races the copy and fires only after a full `idle` window with no
 /// activity. Returns the per-direction byte counts, or an idle-timeout error.
-async fn copy_bidirectional_idle<A, B>(
-    a: &mut A,
-    b: &mut B,
-    idle: std::time::Duration,
-) -> std::io::Result<(u64, u64)>
+async fn copy_bidirectional_idle<A, B>(a: &mut A, b: &mut B, idle: std::time::Duration) -> std::io::Result<(u64, u64)>
 where
     A: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
     B: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + ?Sized,
@@ -1017,8 +1000,16 @@ where
     // Shared "millis since start of last I/O activity", updated by both wrappers.
     let start = tokio::time::Instant::now();
     let last_active = Arc::new(AtomicU64::new(0));
-    let mut wa = ActivityIo { inner: a, start, last_active: last_active.clone() };
-    let mut wb = ActivityIo { inner: b, start, last_active: last_active.clone() };
+    let mut wa = ActivityIo {
+        inner: a,
+        start,
+        last_active: last_active.clone(),
+    };
+    let mut wb = ActivityIo {
+        inner: b,
+        start,
+        last_active: last_active.clone(),
+    };
 
     let copy = tokio::io::copy_bidirectional(&mut wa, &mut wb);
     tokio::pin!(copy);
@@ -1027,9 +1018,7 @@ where
         // Sleep until the deadline implied by the most recent activity, then re-check;
         // if activity advanced in the meantime, sleep again. Only a full idle window
         // with zero progress trips the timeout.
-        let deadline = start
-            + std::time::Duration::from_millis(last_active.load(Ordering::Relaxed))
-            + idle;
+        let deadline = start + std::time::Duration::from_millis(last_active.load(Ordering::Relaxed)) + idle;
         tokio::select! {
             res = &mut copy => return res,
             _ = tokio::time::sleep_until(deadline) => {
@@ -1059,8 +1048,7 @@ struct ActivityIo<'a, T: ?Sized> {
 impl<T: ?Sized> ActivityIo<'_, T> {
     fn mark(&self) {
         let ms = self.start.elapsed().as_millis() as u64;
-        self.last_active
-            .store(ms, std::sync::atomic::Ordering::Relaxed);
+        self.last_active.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1073,9 +1061,10 @@ impl<T: tokio::io::AsyncRead + Unpin + ?Sized> tokio::io::AsyncRead for Activity
         let before = buf.filled().len();
         let r = std::pin::Pin::new(&mut *self.inner).poll_read(cx, buf);
         if let std::task::Poll::Ready(Ok(())) = &r
-            && buf.filled().len() != before {
-                self.mark();
-            }
+            && buf.filled().len() != before
+        {
+            self.mark();
+        }
         r
     }
 }
@@ -1088,9 +1077,10 @@ impl<T: tokio::io::AsyncWrite + Unpin + ?Sized> tokio::io::AsyncWrite for Activi
     ) -> std::task::Poll<std::io::Result<usize>> {
         let r = std::pin::Pin::new(&mut *self.inner).poll_write(cx, buf);
         if let std::task::Poll::Ready(Ok(n)) = &r
-            && *n > 0 {
-                self.mark();
-            }
+            && *n > 0
+        {
+            self.mark();
+        }
         r
     }
     fn poll_flush(
@@ -1150,8 +1140,8 @@ fn build_tls_acceptor(
 ) {
     use pingora_core::tls::ssl::{SslAcceptor, SslMethod};
 
-    let mut builder = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls())
-        .expect("failed to create TLS acceptor builder");
+    let mut builder =
+        SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).expect("failed to create TLS acceptor builder");
     // ALPN: offer, in preference order, the ACME `acme-tls/1` challenge protocol,
     // then HTTP/2 (`h2`), then HTTP/1.1. We pick the first of OUR preferences that
     // the client also offered. NOACK only if the client offered none of them (it
@@ -1168,12 +1158,9 @@ fn build_tls_acceptor(
     let acceptor = Arc::new(builder.build());
     // Generate the last-resort self-signed cert once, at startup. Always present,
     // independent of ACME — served whenever no real cert matches a handshake.
-    let fallback = Arc::new(
-        crate::cert_store::CertKey::generate_self_signed()
-            .expect("failed to generate fallback TLS cert"),
-    );
-    let callbacks: pingora_core::listeners::TlsAcceptCallbacks =
-        Box::new(SniCertCallback { data_plane, fallback });
+    let fallback =
+        Arc::new(crate::cert_store::CertKey::generate_self_signed().expect("failed to generate fallback TLS cert"));
+    let callbacks: pingora_core::listeners::TlsAcceptCallbacks = Box::new(SniCertCallback { data_plane, fallback });
     (acceptor, Arc::new(callbacks))
 }
 
@@ -1186,12 +1173,7 @@ fn build_tls_acceptor(
 ///
 /// This blocks forever (Pingora calls `std::process::exit` on shutdown), so call
 /// it from a dedicated thread.
-pub fn run(
-    data_plane: DataPlane,
-    bind_ip: &str,
-    http_ports: &[u16],
-    tls_ports: &[u16],
-) -> ! {
+pub fn run(data_plane: DataPlane, bind_ip: &str, http_ports: &[u16], tls_ports: &[u16]) -> ! {
     // Pass None so Pingora doesn't parse our process argv as its own options.
     let mut server = Server::new(None).expect("failed to create pingora server");
     server.bootstrap();
@@ -1222,8 +1204,7 @@ pub fn run(
             acceptor,
             tls_callbacks,
         };
-        let mut tls_service =
-            pingora_core::services::listening::Service::new("tls-sni-dispatch".to_string(), app);
+        let mut tls_service = pingora_core::services::listening::Service::new("tls-sni-dispatch".to_string(), app);
         for port in tls_ports {
             tls_service.add_tcp(&format!("{bind_ip}:{port}"));
         }
@@ -1236,9 +1217,11 @@ pub fn run(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::time::Duration;
+
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use super::*;
 
     // copy_bidirectional_idle relays bytes both ways and ends cleanly on EOF.
     #[tokio::test]
@@ -1246,9 +1229,8 @@ mod tests {
         let (mut a_ext, mut a_int) = tokio::io::duplex(64);
         let (mut b_ext, mut b_int) = tokio::io::duplex(64);
 
-        let pipe = tokio::spawn(async move {
-            copy_bidirectional_idle(&mut a_int, &mut b_int, Duration::from_secs(5)).await
-        });
+        let pipe =
+            tokio::spawn(async move { copy_bidirectional_idle(&mut a_int, &mut b_int, Duration::from_secs(5)).await });
 
         // a → b
         a_ext.write_all(b"ping").await.unwrap();

@@ -24,8 +24,7 @@ impl CertKey {
     /// independent of whether ACME is configured.
     pub fn generate_self_signed() -> Result<CertKey, rcgen::Error> {
         let key = rcgen::KeyPair::generate()?;
-        let mut params =
-            rcgen::CertificateParams::new(vec!["torii-fallback.invalid".to_string()])?;
+        let mut params = rcgen::CertificateParams::new(vec!["torii-fallback.invalid".to_string()])?;
         let mut dn = rcgen::DistinguishedName::new();
         dn.push(rcgen::DnType::CommonName, "torii fallback certificate");
         dn.push(rcgen::DnType::OrganizationName, "torii");
@@ -99,7 +98,10 @@ mod tests {
     }
 
     fn dummy_cert() -> CertKey {
-        CertKey { cert_pem: b"c".to_vec(), key_pem: b"k".to_vec() }
+        CertKey {
+            cert_pem: b"c".to_vec(),
+            key_pem: b"k".to_vec(),
+        }
     }
 
     #[test]

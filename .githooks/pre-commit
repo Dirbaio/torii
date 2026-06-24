@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Pre-commit: format Rust with nightly rustfmt (rustfmt.toml uses nightly-only
+# options — group_imports / imports_granularity — so plain `cargo fmt` errors).
+#
+# Behaviour: format the whole tree, then RE-STAGE only the files that were
+# already staged for this commit. Formatting changes to files you didn't stage
+# are left in the working tree (unstaged), never sneaked into the commit.
+#
+# Enable once per clone with:  git config core.hooksPath .githooks
+set -euo pipefail
+
+# Only act when something Rust is staged — skip cleanly for docs/yaml-only commits.
+staged_rs="$(git diff --cached --name-only --diff-filter=ACM -- '*.rs')"
+[ -z "$staged_rs" ] && exit 0
+
+if ! cargo +nightly fmt --version >/dev/null 2>&1; then
+    echo "pre-commit: 'cargo +nightly fmt' unavailable — install nightly rustfmt:" >&2
+    echo "            rustup component add rustfmt --toolchain nightly" >&2
+    exit 1
+fi
+
+# Format the workspace (rustfmt reads rustfmt.toml automatically).
+cargo +nightly fmt
+
+# Re-stage only the originally-staged Rust files, so the commit picks up any
+# reformatting of exactly those files (and nothing else).
+echo "$staged_rs" | while IFS= read -r f; do
+    [ -f "$f" ] && git add -- "$f"
+done

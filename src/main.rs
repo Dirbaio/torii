@@ -165,7 +165,8 @@ fn acme_holder_id() -> String {
 }
 
 fn init_tracing(filter: &str) {
-    use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::{EnvFilter, fmt};
 
     // CLI flag / env sets the default; RUST_LOG still wins if explicitly set.
     let env_filter = EnvFilter::try_from_default_env()

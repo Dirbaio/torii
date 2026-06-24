@@ -25,23 +25,21 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use futures::StreamExt;
-use instant_acme::{
-    Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus,
-    RetryPolicy,
-};
-use k8s_openapi::api::core::v1::Secret;
-use k8s_openapi::ByteString;
-use kube::api::{Api, Patch, PatchParams};
-use kube::runtime::reflector::{self, Store};
-use kube::runtime::watcher::{watcher, Config};
-use kube::runtime::WatchStreamExt;
-use kube::Client;
-use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
-
 use gateway_api::apis::standard::gateways::Gateway;
+use instant_acme::{
+    Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
+};
+use k8s_openapi::ByteString;
+use k8s_openapi::api::core::v1::Secret;
+use kube::Client;
+use kube::api::{Api, Patch, PatchParams};
+use kube::runtime::WatchStreamExt;
+use kube::runtime::reflector::{self, Store};
+use kube::runtime::watcher::{Config, watcher};
+use kube_leader_election::{LeaseLock, LeaseLockParams, LeaseLockResult};
 
 use crate::cert_store::CertKey;
 use crate::snapshot::{ChallengeStore, DataPlane};
@@ -113,12 +111,7 @@ pub struct AcmeConfig {
 /// during reconcile and pushes it through [`AcmeFeed`]. The leader scans when the feed
 /// changes (immediate, event-driven issuance) OR on the [`SCAN_INTERVAL`] renewal tick
 /// (to catch certs aging into the renewal window with no spec change driving a poke).
-pub async fn run(
-    client: Client,
-    data_plane: DataPlane,
-    feed: AcmeFeed,
-    config: AcmeConfig,
-) -> Result<()> {
+pub async fn run(client: Client, data_plane: DataPlane, feed: AcmeFeed, config: AcmeConfig) -> Result<()> {
     // Every instance reflects the shared challenge Secret into the data plane.
     spawn_challenge_reflector(client.clone(), data_plane.clone(), config.namespace.clone());
 
@@ -291,9 +284,7 @@ impl AcmeState {
                 "Issued",
                 format!("certificate issued; valid until unix:{not_after}"),
             ),
-            AcmeState::Pending { stage } => {
-                ("False", "Pending", format!("issuance in progress: {stage}"))
-            }
+            AcmeState::Pending { stage } => ("False", "Pending", format!("issuance in progress: {stage}")),
             AcmeState::Failed { detail, retry_in_s } => (
                 "False",
                 "Failed",
@@ -446,29 +437,37 @@ async fn scan_and_issue(
             missing.push("email (--acme-email or torii.dirba.io/acme-email)");
         }
         if !missing.is_empty() {
-            patch_acme_status(client, target, &AcmeState::Failed {
-                detail: format!("ACME enabled but not configured: missing {}", missing.join(", ")),
-                retry_in_s: 0,
-            }).await;
+            patch_acme_status(
+                client,
+                target,
+                &AcmeState::Failed {
+                    detail: format!("ACME enabled but not configured: missing {}", missing.join(", ")),
+                    retry_in_s: 0,
+                },
+            )
+            .await;
             continue;
         }
 
         // Wildcard / empty hostname → can never validate via TLS-ALPN-01. Report it.
         if target.hostname.starts_with("*.") || target.hostname.is_empty() {
-            patch_acme_status(client, target, &AcmeState::Unsupported {
-                reason: format!(
-                    "ACME cannot validate hostname {:?}; TLS-ALPN-01 requires a concrete \
+            patch_acme_status(
+                client,
+                target,
+                &AcmeState::Unsupported {
+                    reason: format!(
+                        "ACME cannot validate hostname {:?}; TLS-ALPN-01 requires a concrete \
                      (non-wildcard, non-empty) DNS name",
-                    target.hostname
-                ),
-            }).await;
+                        target.hostname
+                    ),
+                },
+            )
+            .await;
             continue;
         }
 
         // Already have a good cert? Report Issued and move on (no CA traffic).
-        if let CertCheck::Good { not_after } =
-            cert_check(client, &target.secret_ns, &target.secret_name).await
-        {
+        if let CertCheck::Good { not_after } = cert_check(client, &target.secret_ns, &target.secret_name).await {
             backoff.record_success(target);
             patch_acme_status(client, target, &AcmeState::Issued { not_after }).await;
             continue;
@@ -485,9 +484,14 @@ async fn scan_and_issue(
 
         // Attempt issuance, reporting Pending up front so the condition reflects
         // "in progress" even if the order takes a while or the process restarts.
-        patch_acme_status(client, target, &AcmeState::Pending {
-            stage: "ordering certificate".into(),
-        }).await;
+        patch_acme_status(
+            client,
+            target,
+            &AcmeState::Pending {
+                stage: "ordering certificate".into(),
+            },
+        )
+        .await;
         match issue(client, config, target).await {
             Ok(not_after) => {
                 backoff.record_success(target);
@@ -500,10 +504,15 @@ async fn scan_and_issue(
                     host = %target.hostname, error = %detail,
                     retry_in_s = delay.as_secs(), "ACME issuance failed; backing off",
                 );
-                patch_acme_status(client, target, &AcmeState::Failed {
-                    detail,
-                    retry_in_s: delay.as_secs(),
-                }).await;
+                patch_acme_status(
+                    client,
+                    target,
+                    &AcmeState::Failed {
+                        detail,
+                        retry_in_s: delay.as_secs(),
+                    },
+                )
+                .await;
             }
         }
     }
@@ -532,7 +541,9 @@ async fn cert_check(client: &Client, ns: &str, name: &str) -> CertCheck {
             // Returning NeedsWork would churn; we want to skip this scan instead, but
             // the caller only distinguishes Good vs NeedsWork. Report NeedsWork only
             // on a real 404 above; here, pretend it's fine to avoid churn.
-            return CertCheck::Good { not_after: now_unix() + RENEW_WINDOW.as_secs() as i64 };
+            return CertCheck::Good {
+                not_after: now_unix() + RENEW_WINDOW.as_secs() as i64,
+            };
         }
     };
     let Some(crt) = secret.data.as_ref().and_then(|d| d.get("tls.crt")) else {
@@ -569,10 +580,7 @@ async fn issue(client: &Client, config: &AcmeConfig, need: &AcmeTarget) -> Resul
     tracing::debug!(host = %need.hostname, "ACME: account ready");
 
     let ids = [Identifier::Dns(need.hostname.clone())];
-    let mut order = account
-        .new_order(&NewOrder::new(&ids))
-        .await
-        .context("new_order")?;
+    let mut order = account.new_order(&NewOrder::new(&ids)).await.context("new_order")?;
     let order_url = order.url().to_string();
     tracing::info!(host = %need.hostname, status = ?order.state().status, url = %order_url, "ACME: order created");
 
@@ -592,8 +600,8 @@ async fn issue(client: &Client, config: &AcmeConfig, need: &AcmeTarget) -> Resul
             .challenge(ChallengeType::TlsAlpn01)
             .ok_or_else(|| anyhow!("ACME directory offers no tls-alpn-01 challenge"))?;
         let digest = challenge.key_authorization().digest();
-        let (cert_pem, key_pem) = crate::acme_cert::alpn_cert(&identifier, digest.as_ref())
-            .context("build challenge cert")?;
+        let (cert_pem, key_pem) =
+            crate::acme_cert::alpn_cert(&identifier, digest.as_ref()).context("build challenge cert")?;
         publish_challenge(client, &config.namespace, &identifier, &cert_pem, &key_pem).await?;
         tracing::debug!(
             host = %need.hostname, %identifier, settle_ms = CHALLENGE_SETTLE.as_millis(),
@@ -701,8 +709,7 @@ async fn authorization_failures(order: &mut instant_acme::Order, host: &str) -> 
 /// testing PKIs like pebble); otherwise the default client with system roots.
 fn account_builder(config: &AcmeConfig) -> Result<instant_acme::AccountBuilder> {
     match &config.ca_cert_path {
-        Some(path) => Account::builder_with_root(path)
-            .with_context(|| format!("load ACME CA cert from {path}")),
+        Some(path) => Account::builder_with_root(path).with_context(|| format!("load ACME CA cert from {path}")),
         None => Ok(Account::builder()?),
     }
 }
@@ -719,12 +726,13 @@ async fn load_or_create_account(
     let key = account_key(directory);
 
     if let Ok(secret) = api.get(ACCOUNT_SECRET).await
-        && let Some(creds_raw) = secret.data.as_ref().and_then(|d| d.get(&key)) {
-            let creds: AccountCredentials = serde_json::from_slice(&creds_raw.0)
-                .context("parse stored ACME credentials")?;
-            let account = account_builder(config)?.from_credentials(creds).await?;
-            return Ok(account);
-        }
+        && let Some(creds_raw) = secret.data.as_ref().and_then(|d| d.get(&key))
+    {
+        let creds: AccountCredentials =
+            serde_json::from_slice(&creds_raw.0).context("parse stored ACME credentials")?;
+        let account = account_builder(config)?.from_credentials(creds).await?;
+        return Ok(account);
+    }
 
     let contact: Vec<String> = email.map(|e| format!("mailto:{e}")).into_iter().collect();
     let contact_refs: Vec<&str> = contact.iter().map(|s| s.as_str()).collect();
@@ -751,13 +759,7 @@ async fn load_or_create_account(
 
 /// Publish a challenge validation cert to the shared challenge Secret so any
 /// instance can serve the `acme-tls/1` handshake for `host`.
-async fn publish_challenge(
-    client: &Client,
-    ns: &str,
-    host: &str,
-    cert_pem: &[u8],
-    key_pem: &[u8],
-) -> Result<()> {
+async fn publish_challenge(client: &Client, ns: &str, host: &str, cert_pem: &[u8], key_pem: &[u8]) -> Result<()> {
     let api: Api<Secret> = Api::namespaced(client.clone(), ns);
     // Read-modify-write the map so concurrent hosts don't clobber each other.
     let mut data: BTreeMap<String, ByteString> = api
@@ -785,13 +787,7 @@ async fn unpublish_challenge(client: &Client, ns: &str, host: &str) -> Result<()
 
 /// Write a `kubernetes.io/tls` Secret (tls.crt/tls.key) — the format the
 /// controller's `load_tls_secret` reads.
-async fn write_tls_secret(
-    client: &Client,
-    ns: &str,
-    name: &str,
-    cert_pem: &[u8],
-    key_pem: &[u8],
-) -> Result<()> {
+async fn write_tls_secret(client: &Client, ns: &str, name: &str, cert_pem: &[u8], key_pem: &[u8]) -> Result<()> {
     let api: Api<Secret> = Api::namespaced(client.clone(), ns);
     let mut data = BTreeMap::new();
     data.insert("tls.crt".to_string(), ByteString(cert_pem.to_vec()));
@@ -818,12 +814,8 @@ async fn apply_secret(
         data: Some(data),
         ..Default::default()
     };
-    api.patch(
-        name,
-        &PatchParams::apply(FIELD_MANAGER).force(),
-        &Patch::Apply(&secret),
-    )
-    .await?;
+    api.patch(name, &PatchParams::apply(FIELD_MANAGER).force(), &Patch::Apply(&secret))
+        .await?;
     Ok(())
 }
 
@@ -852,7 +844,9 @@ fn build_challenge_store(store: &Store<Secret>) -> ChallengeStore {
     type PartialCerts = HashMap<String, (Option<Vec<u8>>, Option<Vec<u8>>)>;
     let mut out: PartialCerts = HashMap::new();
     for secret in store.state() {
-        let Some(data) = secret.data.as_ref() else { continue };
+        let Some(data) = secret.data.as_ref() else {
+            continue;
+        };
         for (k, v) in data {
             if let Some(host) = k.strip_suffix(".crt") {
                 out.entry(host.to_string()).or_default().0 = Some(v.0.clone());
@@ -863,7 +857,13 @@ fn build_challenge_store(store: &Store<Secret>) -> ChallengeStore {
     }
     out.into_iter()
         .filter_map(|(host, (c, k))| {
-            Some((host, CertKey { cert_pem: c?, key_pem: k? }))
+            Some((
+                host,
+                CertKey {
+                    cert_pem: c?,
+                    key_pem: k?,
+                },
+            ))
         })
         .collect()
 }
@@ -1020,7 +1020,11 @@ mod tests {
         assert_eq!((s, r), ("True", "Issued"));
         let (s, r, _) = (AcmeState::Pending { stage: "x".into() }).condition();
         assert_eq!((s, r), ("False", "Pending"));
-        let (s, r, m) = (AcmeState::Failed { detail: "dns".into(), retry_in_s: 9 }).condition();
+        let (s, r, m) = (AcmeState::Failed {
+            detail: "dns".into(),
+            retry_in_s: 9,
+        })
+        .condition();
         assert_eq!((s, r), ("False", "Failed"));
         assert!(m.contains("dns") && m.contains("9s"));
         let (s, r, _) = (AcmeState::Unsupported { reason: "wild".into() }).condition();

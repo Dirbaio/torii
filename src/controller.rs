@@ -11,38 +11,36 @@ use std::time::Duration;
 
 use anyhow::Result;
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
-use k8s_openapi::api::discovery::v1::EndpointSlice;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
-use kube::api::{Patch, PatchParams};
-use kube::runtime::reflector::{self, Store};
-use kube::runtime::watcher::{watcher, Config};
-use kube::runtime::WatchStreamExt;
-use kube::{Api, Client, Resource, ResourceExt};
-
-use gateway_api::apis::standard::gatewayclasses::{
-    GatewayClass, GatewayClassStatus, GatewayClassStatusSupportedFeatures,
-};
-use gateway_api::apis::standard::gateways::{
-    Gateway, GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners,
-    GatewayStatusListenersSupportedKinds,
-};
-use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
-};
-use gateway_api::apis::standard::tlsroutes::{
-    TLSRoute, TlsRouteStatus, TlsRouteStatusParents, TlsRouteStatusParentsParentRef,
-};
-use gateway_api::apis::standard::referencegrants::ReferenceGrant;
 use gateway_api::apis::standard::backendtlspolicies::{
     BackendTLSPolicy, BackendTlsPolicyStatus, BackendTlsPolicyStatusAncestors,
     BackendTlsPolicyStatusAncestorsAncestorRef,
 };
+use gateway_api::apis::standard::gatewayclasses::{
+    GatewayClass, GatewayClassStatus, GatewayClassStatusSupportedFeatures,
+};
+use gateway_api::apis::standard::gateways::{
+    Gateway, GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
+};
+use gateway_api::apis::standard::httproutes::{
+    HTTPRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
+};
+use gateway_api::apis::standard::referencegrants::ReferenceGrant;
+use gateway_api::apis::standard::tlsroutes::{
+    TLSRoute, TlsRouteStatus, TlsRouteStatusParents, TlsRouteStatusParentsParentRef,
+};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
+use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
+use kube::api::{Patch, PatchParams};
+use kube::runtime::WatchStreamExt;
+use kube::runtime::reflector::{self, Store};
+use kube::runtime::watcher::{Config, watcher};
+use kube::{Api, Client, Resource, ResourceExt};
 
 use crate::cert_store::{CertKey, CertStore};
 use crate::route_table::{
-    Backend, Endpoint, Filters, HeaderMatch, HeaderMods, HeaderValueMatch, PathMatch, PathRewrite,
-    QueryMatch, Redirect, RouteEntry, RouteMatch, RouteTable, UrlRewrite,
+    Backend, Endpoint, Filters, HeaderMatch, HeaderMods, HeaderValueMatch, PathMatch, PathRewrite, QueryMatch,
+    Redirect, RouteEntry, RouteMatch, RouteTable, UrlRewrite,
 };
 use crate::snapshot::{DataPlane, Snapshot};
 use crate::tls_table::{TlsAction, TlsBackend, TlsBackends, TlsTable};
@@ -127,11 +125,7 @@ struct Stores {
 }
 
 /// Run the control plane forever: start watchers, and on any change recompute.
-pub async fn run(
-    client: Client,
-    data_plane: DataPlane,
-    config: ControllerConfig,
-) -> Result<()> {
+pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig) -> Result<()> {
     // A change signal: every watcher event pokes this channel; a single consumer
     // debounces and runs a full reconcile.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
@@ -325,8 +319,7 @@ struct PolicyOutcome {
 /// covers every port of the Service. Built once (conflict tiebreak applied) so
 /// route resolution and policy status agree. Only `ReEncrypt`/`Invalid` are stored
 /// (no policy → absent → the route defaults the endpoint to Plaintext).
-type UpstreamTlsMap =
-    std::collections::HashMap<(String, String, u16), crate::route_table::BackendTls>;
+type UpstreamTlsMap = std::collections::HashMap<(String, String, u16), crate::route_table::BackendTls>;
 
 /// Which API kind a deferred status patch targets (for building the right `Api<K>`).
 enum PatchTarget {
@@ -365,8 +358,7 @@ impl ReconcileCtx {
             .into_iter()
             .filter(|gc| gc.spec.controller_name == CONTROLLER_NAME)
             .collect();
-        let owned_class_names: Vec<String> =
-            owned_classes.iter().map(|gc| gc.name_any()).collect();
+        let owned_class_names: Vec<String> = owned_classes.iter().map(|gc| gc.name_any()).collect();
         for gc in &owned_classes {
             patches.push(self.gatewayclass_patch(gc));
         }
@@ -403,16 +395,11 @@ impl ReconcileCtx {
         // ── Stage 2b: routes → RouteTable, parent status, attachment counts ──
         // Attachment is computed ONCE per (route, gateway, parentRef) and feeds
         // both the data plane and the per-listener attachedRoutes counts.
-        let usable_gateways: Vec<Arc<Gateway>> = models
-            .iter()
-            .filter(|m| m.usable)
-            .map(|m| m.gw.clone())
-            .collect();
+        let usable_gateways: Vec<Arc<Gateway>> = models.iter().filter(|m| m.usable).map(|m| m.gw.clone()).collect();
         let mut route_table = RouteTable::default();
         let mut tls_table = crate::tls_table::TlsTable::default();
         // (gw_ns, gw_name) → (listener_name → count).
-        let mut attach_counts: BTreeMap<(String, String), BTreeMap<String, i32>> =
-            BTreeMap::new();
+        let mut attach_counts: BTreeMap<(String, String), BTreeMap<String, i32>> = BTreeMap::new();
         for route in &routes {
             if let Some(patch) = self.process_route(
                 route,
@@ -430,12 +417,7 @@ impl ReconcileCtx {
         // (passthrough / terminate-then-TCP) data path, not HTTP entries.
         let tls_routes: Vec<Arc<TLSRoute>> = self.stores.tls_routes.state();
         for route in &tls_routes {
-            if let Some(patch) = self.process_tls_route(
-                route,
-                &models,
-                &mut tls_table,
-                &mut attach_counts,
-            ) {
+            if let Some(patch) = self.process_tls_route(route, &models, &mut tls_table, &mut attach_counts) {
                 patches.push(patch);
             }
         }
@@ -519,8 +501,7 @@ impl ReconcileCtx {
                     continue;
                 }
                 let hostname = l.hostname.clone().unwrap_or_default();
-                let attached_routes =
-                    counts.and_then(|c| c.get(&l.name)).copied().unwrap_or(0);
+                let attached_routes = counts.and_then(|c| c.get(&l.name)).copied().unwrap_or(0);
                 // Does a usable cert currently exist for this listener? From the same
                 // CertStore-resolution the controller just did. Flips when the cert
                 // Secret is created/deleted, so a deletion changes the target set and
@@ -583,9 +564,7 @@ impl ReconcileCtx {
     async fn apply_patch(&self, p: StatusPatch) -> Result<()> {
         let ns = p.ns.unwrap_or_default();
         match p.target {
-            PatchTarget::GatewayClass => {
-                self.patch_status(&self.gc_api, &p.name, "GatewayClass", p.json).await
-            }
+            PatchTarget::GatewayClass => self.patch_status(&self.gc_api, &p.name, "GatewayClass", p.json).await,
             PatchTarget::Gateway => {
                 let api: Api<Gateway> = Api::namespaced(self.client.clone(), &ns);
                 self.patch_status(&api, &p.name, "Gateway", p.json).await
@@ -653,12 +632,8 @@ impl ReconcileCtx {
             .and_then(|i| i.parameters_ref.as_ref())
             .is_some();
 
-        let mut listeners: Vec<ListenerOutcome> = gw
-            .spec
-            .listeners
-            .iter()
-            .map(|l| self.listener_outcome(l, gw))
-            .collect();
+        let mut listeners: Vec<ListenerOutcome> =
+            gw.spec.listeners.iter().map(|l| self.listener_outcome(l, gw)).collect();
 
         // Mixed TLS termination is not supported (we don't claim
         // SupportTLSRouteModeMixed): if a port carries TLS listeners of BOTH modes
@@ -706,20 +681,19 @@ impl ReconcileCtx {
         // Reconcile requested allowedRoutes.kinds against the protocol's valid set.
         // Any requested kind not valid → InvalidRouteKinds, dropped from supportedKinds.
         let mut invalid_kind = false;
-        let supported_kinds: Vec<&'static str> =
-            match l.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref()) {
-                Some(requested) => requested
-                    .iter()
-                    .filter_map(|k| match protocol_kinds.iter().find(|p| **p == k.kind) {
-                        Some(p) => Some(*p),
-                        None => {
-                            invalid_kind = true;
-                            None
-                        }
-                    })
-                    .collect(),
-                None => protocol_kinds.to_vec(),
-            };
+        let supported_kinds: Vec<&'static str> = match l.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref()) {
+            Some(requested) => requested
+                .iter()
+                .filter_map(|k| match protocol_kinds.iter().find(|p| **p == k.kind) {
+                    Some(p) => Some(*p),
+                    None => {
+                        invalid_kind = true;
+                        None
+                    }
+                })
+                .collect(),
+            None => protocol_kinds.to_vec(),
+        };
 
         let protocol_supported = matches!(l.protocol.as_str(), "HTTP" | "HTTPS" | "TLS");
 
@@ -792,9 +766,7 @@ impl ReconcileCtx {
             }
             let ref_ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
             // Cross-namespace cert Secret requires a permitting ReferenceGrant.
-            if ref_ns != gw_ns
-                && !self.ref_grant_permits(&gw_ns, "Gateway", &ref_ns, "Secret", &r.name)
-            {
+            if ref_ns != gw_ns && !self.ref_grant_permits(&gw_ns, "Gateway", &ref_ns, "Secret", &r.name) {
                 return (Some("RefNotPermitted"), None);
             }
             // The Secret must exist AND contain a valid tls.crt + tls.key.
@@ -826,9 +798,7 @@ impl ReconcileCtx {
             .listeners
             .iter()
             .map(|o| {
-                let attached_routes = counts
-                    .and_then(|c| c.get(&o.name).copied())
-                    .unwrap_or(0);
+                let attached_routes = counts.and_then(|c| c.get(&o.name).copied()).unwrap_or(0);
                 let accepted = if !o.protocol_supported {
                     condition("Accepted", "False", "UnsupportedProtocol", generation)
                 } else if o.protocol_conflict {
@@ -845,30 +815,26 @@ impl ReconcileCtx {
                 } else {
                     condition("ResolvedRefs", "True", "ResolvedRefs", generation)
                 };
-                let programmed = if o.protocol_supported
-                    && o.tls_failure.is_none()
-                    && !o.invalid_kind
-                    && !o.protocol_conflict
-                {
-                    condition("Programmed", "True", "Programmed", generation)
-                } else {
-                    condition("Programmed", "False", "Invalid", generation)
-                };
+                let programmed =
+                    if o.protocol_supported && o.tls_failure.is_none() && !o.invalid_kind && !o.protocol_conflict {
+                        condition("Programmed", "True", "Programmed", generation)
+                    } else {
+                        condition("Programmed", "False", "Invalid", generation)
+                    };
                 // A protocol-conflicted listener (mixed TLS termination, which we
                 // don't support) is rejected and advertises NO supported kinds —
                 // the conformance suite asserts an empty SupportedKinds for it.
-                let supported_kinds: Vec<GatewayStatusListenersSupportedKinds> =
-                    if o.protocol_conflict {
-                        Vec::new()
-                    } else {
-                        o.supported_kinds
-                            .iter()
-                            .map(|k| GatewayStatusListenersSupportedKinds {
-                                group: Some("gateway.networking.k8s.io".into()),
-                                kind: k.to_string(),
-                            })
-                            .collect()
-                    };
+                let supported_kinds: Vec<GatewayStatusListenersSupportedKinds> = if o.protocol_conflict {
+                    Vec::new()
+                } else {
+                    o.supported_kinds
+                        .iter()
+                        .map(|k| GatewayStatusListenersSupportedKinds {
+                            group: Some("gateway.networking.k8s.io".into()),
+                            kind: k.to_string(),
+                        })
+                        .collect()
+                };
                 // The three standard conditions. The ACME subsystem separately owns
                 // the `torii.dirba.io/ACMEIssued` listener condition via its own SSA
                 // field manager (merged by condition type), so we never touch it.
@@ -901,12 +867,10 @@ impl ReconcileCtx {
                 .listeners
                 .iter()
                 .all(|o| o.protocol_supported && !o.protocol_conflict);
-            let all_programmed = model.listeners.iter().all(|o| {
-                o.protocol_supported
-                    && o.tls_failure.is_none()
-                    && !o.invalid_kind
-                    && !o.protocol_conflict
-            });
+            let all_programmed = model
+                .listeners
+                .iter()
+                .all(|o| o.protocol_supported && o.tls_failure.is_none() && !o.invalid_kind && !o.protocol_conflict);
             let accepted = if any_accepted {
                 let reason = if all_accepted { "Accepted" } else { "ListenersNotValid" };
                 condition("Accepted", "True", reason, generation)
@@ -944,14 +908,7 @@ impl ReconcileCtx {
     /// entry matching the target `{core / to_kind}`, optionally restricted by
     /// `to_name`. Used for both cert Secret refs (Gateway→Secret) and backendRefs
     /// (HTTPRoute→Service).
-    fn ref_grant_permits(
-        &self,
-        from_ns: &str,
-        from_kind: &str,
-        to_ns: &str,
-        to_kind: &str,
-        to_name: &str,
-    ) -> bool {
+    fn ref_grant_permits(&self, from_ns: &str, from_kind: &str, to_ns: &str, to_kind: &str, to_name: &str) -> bool {
         // Store::find iterates the reflector map under a read lock and short-circuits
         // on the first match, without cloning every grant into a Vec (as state() does).
         self.stores
@@ -960,21 +917,17 @@ impl ReconcileCtx {
                 if rg.namespace().unwrap_or_default() != to_ns {
                     return false;
                 }
-                let from_ok = rg.spec.from.iter().any(|f| {
-                    f.group == "gateway.networking.k8s.io"
-                        && f.kind == from_kind
-                        && f.namespace == from_ns
-                });
+                let from_ok =
+                    rg.spec.from.iter().any(|f| {
+                        f.group == "gateway.networking.k8s.io" && f.kind == from_kind && f.namespace == from_ns
+                    });
                 let to_ok = rg.spec.to.iter().any(|t| {
-                    t.group.is_empty()
-                        && t.kind == to_kind
-                        && t.name.as_deref().map(|n| n == to_name).unwrap_or(true)
+                    t.group.is_empty() && t.kind == to_kind && t.name.as_deref().map(|n| n == to_name).unwrap_or(true)
                 });
                 from_ok && to_ok
             })
             .is_some()
     }
-
 
     /// STAGE 2b: resolve a route's backends, build its RouteEntries, count its
     /// attachment per listener, and produce its parent status patch (or None if it
@@ -1011,9 +964,7 @@ impl ReconcileCtx {
 
             // attachedRoutes counts: ensure every listener has a 0 entry, then
             // increment the ones this route attached to.
-            let gw_counts = attach_counts
-                .entry((parent_ns.clone(), gw.name_any()))
-                .or_default();
+            let gw_counts = attach_counts.entry((parent_ns.clone(), gw.name_any())).or_default();
             for l in &gw.spec.listeners {
                 gw_counts.entry(l.name.clone()).or_insert(0);
             }
@@ -1062,13 +1013,7 @@ impl ReconcileCtx {
 
                     // Cross-namespace backendRefs require a permitting ReferenceGrant.
                     if bns != route_ns
-                        && !self.ref_grant_permits(
-                            &route_ns,
-                            "HTTPRoute",
-                            &bns,
-                            "Service",
-                            &backend_ref.name,
-                        )
+                        && !self.ref_grant_permits(&route_ns, "HTTPRoute", &bns, "Service", &backend_ref.name)
                     {
                         refs_failure = Some("RefNotPermitted");
                         continue; // no endpoints → 500 at the data plane
@@ -1081,11 +1026,7 @@ impl ReconcileCtx {
                         Some(mut endpoints) => {
                             // Apply any BackendTLSPolicy decision for this Service
                             // PORT (re-encrypt, or invalid→must-5xx), from the map.
-                            if let Some(bt) = upstream_tls.get(&(
-                                bns.clone(),
-                                backend_ref.name.clone(),
-                                svc_port,
-                            )) {
+                            if let Some(bt) = upstream_tls.get(&(bns.clone(), backend_ref.name.clone(), svc_port)) {
                                 for ep in &mut endpoints {
                                     ep.tls = bt.clone();
                                 }
@@ -1093,9 +1034,7 @@ impl ReconcileCtx {
                             backends.push(Backend {
                                 weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
                                 endpoints,
-                                filters: backend_filters_from(
-                                    backend_ref.filters.as_deref().unwrap_or_default(),
-                                ),
+                                filters: backend_filters_from(backend_ref.filters.as_deref().unwrap_or_default()),
                             });
                         }
                         // Service does not exist → BackendNotFound (don't downgrade
@@ -1114,7 +1053,9 @@ impl ReconcileCtx {
                 let filters = filters_from(rule_filters);
                 let request_timeout = rule.timeouts.as_ref().and_then(|t| {
                     let parse = |s: &Option<String>| {
-                        s.as_ref().and_then(|v| parse_gep2257_duration(v)).filter(|d| !d.is_zero())
+                        s.as_ref()
+                            .and_then(|v| parse_gep2257_duration(v))
+                            .filter(|d| !d.is_zero())
                     };
                     [parse(&t.request), parse(&t.backend_request)]
                         .into_iter()
@@ -1142,8 +1083,7 @@ impl ReconcileCtx {
                         // Effective hostnames = intersection of route hostnames and
                         // the listener hostname. Empty route hostnames inherit the
                         // listener's; a listener with no hostname matches any.
-                        let effective_hosts =
-                            effective_hostnames(hostnames, l.hostname.as_deref());
+                        let effective_hosts = effective_hostnames(hostnames, l.hostname.as_deref());
                         table.entries.push(RouteEntry {
                             listener_port: l.port as u16,
                             listener_hostname: l.hostname.clone(),
@@ -1166,9 +1106,7 @@ impl ReconcileCtx {
             // message; otherwise Accepted.
             let accepted = match (accept_reason, &unsupported) {
                 (Some(reason), _) => condition("Accepted", "False", reason, generation),
-                (None, Some(msg)) => {
-                    condition_msg("Accepted", "False", "UnsupportedValue", msg, generation)
-                }
+                (None, Some(msg)) => condition_msg("Accepted", "False", "UnsupportedValue", msg, generation),
                 (None, None) => condition("Accepted", "True", "Accepted", generation),
             };
 
@@ -1214,7 +1152,10 @@ impl ReconcileCtx {
         route: &HTTPRoute,
         gw: &Gateway,
         pref: &gateway_api::apis::standard::httproutes::HttpRouteParentRefs,
-    ) -> (Vec<gateway_api::apis::standard::gateways::GatewayListeners>, Option<&'static str>) {
+    ) -> (
+        Vec<gateway_api::apis::standard::gateways::GatewayListeners>,
+        Option<&'static str>,
+    ) {
         let route_ns = route.namespace().unwrap_or_default();
         let route_hostnames: &[String] = route.spec.hostnames.as_deref().unwrap_or_default();
 
@@ -1225,10 +1166,7 @@ impl ReconcileCtx {
             .listeners
             .iter()
             .filter(|l| {
-                pref.section_name
-                    .as_ref()
-                    .map(|s| &l.name == s)
-                    .unwrap_or(true)
+                pref.section_name.as_ref().map(|s| &l.name == s).unwrap_or(true)
                     && pref.port.map(|p| l.port == p).unwrap_or(true)
             })
             .cloned()
@@ -1297,9 +1235,7 @@ impl ReconcileCtx {
             let parent_ns = pref.namespace.clone().unwrap_or_else(|| route_ns.clone());
             // Find the parent among usable Gateways we own.
             let Some(model) = models.iter().find(|m| {
-                m.usable
-                    && m.gw.name_any() == pref.name
-                    && m.gw.namespace().unwrap_or_default() == parent_ns
+                m.usable && m.gw.name_any() == pref.name && m.gw.namespace().unwrap_or_default() == parent_ns
             }) else {
                 continue; // not ours / not found / not usable
             };
@@ -1307,13 +1243,10 @@ impl ReconcileCtx {
 
             // Which TLS listeners this route attaches to (sectionName/port +
             // allowedRoutes + SNI hostname overlap + not protocol-conflicted).
-            let (attached, accept_reason) =
-                self.attached_tls_listeners(route, gw, model, pref);
+            let (attached, accept_reason) = self.attached_tls_listeners(route, gw, model, pref);
 
             // attachedRoutes counts: ensure every listener has a 0, then bump ours.
-            let gw_counts = attach_counts
-                .entry((parent_ns.clone(), gw.name_any()))
-                .or_default();
+            let gw_counts = attach_counts.entry((parent_ns.clone(), gw.name_any())).or_default();
             for l in &gw.spec.listeners {
                 gw_counts.entry(l.name.clone()).or_insert(0);
             }
@@ -1491,10 +1424,7 @@ impl ReconcileCtx {
     ) -> bool {
         use gateway_api::apis::standard::gateways::GatewayListenersAllowedRoutesNamespacesFrom as From;
         let gw_ns = gw.namespace().unwrap_or_default();
-        let ns_cfg = listener
-            .allowed_routes
-            .as_ref()
-            .and_then(|ar| ar.namespaces.as_ref());
+        let ns_cfg = listener.allowed_routes.as_ref().and_then(|ar| ar.namespaces.as_ref());
         let from = ns_cfg.and_then(|n| n.from.as_ref()).unwrap_or(&From::Same);
         match from {
             From::Same => route_ns == gw_ns,
@@ -1539,9 +1469,7 @@ impl ReconcileCtx {
     /// The conflict tiebreak (oldest creationTimestamp, then name) is applied while
     /// building the map, so the use-side and the status-side agree on which policy
     /// wins for a given Service.
-    fn build_policy_artifacts(
-        &self,
-    ) -> (UpstreamTlsMap, BTreeMap<(String, String), PolicyOutcome>) {
+    fn build_policy_artifacts(&self) -> (UpstreamTlsMap, BTreeMap<(String, String), PolicyOutcome>) {
         use crate::route_table::BackendTls;
         let mut artifacts: UpstreamTlsMap = UpstreamTlsMap::new();
         let mut outcomes: BTreeMap<(String, String), PolicyOutcome> = BTreeMap::new();
@@ -1551,7 +1479,11 @@ impl ReconcileCtx {
         let mut policies = self.stores.backend_tls_policies.state();
         policies.sort_by_key(|p| {
             (
-                p.meta().creation_timestamp.as_ref().map(|t| t.0.as_second()).unwrap_or(0),
+                p.meta()
+                    .creation_timestamp
+                    .as_ref()
+                    .map(|t| t.0.as_second())
+                    .unwrap_or(0),
                 p.name_any(),
             )
         });
@@ -1564,8 +1496,7 @@ impl ReconcileCtx {
         // Per data-plane port: was its current artifact set by a section-specific
         // policy? A section-specific (sectionName) policy takes precedence over a
         // Service-wide (no sectionName) one for that port, regardless of sort order.
-        let mut port_specific: std::collections::HashSet<(String, String, u16)> =
-            std::collections::HashSet::new();
+        let mut port_specific: std::collections::HashSet<(String, String, u16)> = std::collections::HashSet::new();
 
         for policy in &policies {
             let pol_ns = policy.namespace().unwrap_or_default();
@@ -1691,7 +1622,9 @@ impl ReconcileCtx {
             return Vec::new();
         };
         let ports = svc.spec.as_ref().and_then(|s| s.ports.as_ref());
-        let Some(ports) = ports else { return Vec::new() };
+        let Some(ports) = ports else {
+            return Vec::new();
+        };
         match section {
             // sectionName = a specific Service port name.
             Some(name) => ports
@@ -1753,8 +1686,7 @@ impl ReconcileCtx {
         for policy in self.stores.backend_tls_policies.state() {
             let generation = policy.meta().generation.unwrap_or(0);
             let pol_ns = policy.namespace().unwrap_or_default();
-            let outcome = outcomes
-                .get(&(pol_ns.clone(), policy.name_any()));
+            let outcome = outcomes.get(&(pol_ns.clone(), policy.name_any()));
             // The message explaining a False condition (empty when Accepted).
             let msg = outcome.map(|o| o.message.as_str()).unwrap_or("");
             // Map the computed PolicyStatus to its (ResolvedRefs, Accepted) pair.
@@ -1791,8 +1723,7 @@ impl ReconcileCtx {
             for gw in gateways {
                 let gw_ns = gw.namespace().unwrap_or_default();
                 let routes_to_gw_target = routes.iter().any(|r| {
-                    route_has_parent(r, &gw.name_any(), &gw_ns)
-                        && route_targets_service_in(r, &target_svcs, &pol_ns)
+                    route_has_parent(r, &gw.name_any(), &gw_ns) && route_targets_service_in(r, &target_svcs, &pol_ns)
                 });
                 if routes_to_gw_target {
                     ancestors.push(BackendTlsPolicyStatusAncestors {
@@ -1852,9 +1783,7 @@ impl ReconcileCtx {
             _ => None, // named ports resolved per-endpoint-slice below
         };
         let target_port_name: Option<String> = match &port_spec.target_port {
-            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(s)) => {
-                Some(s.clone())
-            }
+            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(s)) => Some(s.clone()),
             _ => None,
         };
 
@@ -1896,11 +1825,7 @@ impl ReconcileCtx {
             let Some(port) = port else { continue };
 
             for ep in &slice.endpoints {
-                let ready = ep
-                    .conditions
-                    .as_ref()
-                    .and_then(|c| c.ready)
-                    .unwrap_or(true);
+                let ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
                 if !ready {
                     continue;
                 }
@@ -1931,13 +1856,7 @@ impl ReconcileCtx {
     ///
     /// `json` is the `{"status": {...}}` we computed; we wrap it into a full apply
     /// document (apiVersion/kind/metadata.name) as SSA requires.
-    async fn patch_status<K>(
-        &self,
-        api: &Api<K>,
-        name: &str,
-        kind: &str,
-        json: serde_json::Value,
-    ) -> Result<()>
+    async fn patch_status<K>(&self, api: &Api<K>, name: &str, kind: &str, json: serde_json::Value) -> Result<()>
     where
         K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
         K::DynamicType: Default,
@@ -1967,7 +1886,6 @@ impl ReconcileCtx {
     }
 }
 
-
 /// Validate one HTTPRoute rule for values that are CRD-valid but that torii
 /// can't honor. Returns `Some(message)` describing the first such problem, or `None`
 /// if the rule is fully supported. A rule that fails this is NOT programmed into the
@@ -1986,20 +1904,22 @@ fn validate_http_rule(
     for (mi, m) in rule.matches.iter().flatten().enumerate() {
         // Path: RegularExpression is implementation-specific and not implemented.
         if let Some(p) = &m.path
-            && matches!(p.r#type, Some(PType::RegularExpression)) {
-                return Some(format!(
-                    "{at}.matches[{mi}].path: RegularExpression path matching is not supported"
-                ));
-            }
+            && matches!(p.r#type, Some(PType::RegularExpression))
+        {
+            return Some(format!(
+                "{at}.matches[{mi}].path: RegularExpression path matching is not supported"
+            ));
+        }
         // Header match: a RegularExpression value must compile.
         for (hi, h) in m.headers.iter().flatten().enumerate() {
             if matches!(h.r#type, Some(HType::RegularExpression))
-                && let Err(e) = regex::Regex::new(&h.value) {
-                    return Some(format!(
-                        "{at}.matches[{mi}].headers[{hi}]: invalid RegularExpression {:?}: {e}",
-                        h.value
-                    ));
-                }
+                && let Err(e) = regex::Regex::new(&h.value)
+            {
+                return Some(format!(
+                    "{at}.matches[{mi}].headers[{hi}]: invalid RegularExpression {:?}: {e}",
+                    h.value
+                ));
+            }
         }
         // Query params: RegularExpression is not implemented (we match Exact only).
         for (qi, q) in m.query_params.iter().flatten().enumerate() {
@@ -2020,24 +1940,21 @@ fn validate_http_rule(
             | FType::UrlRewrite
             | FType::Cors => {}
             FType::RequestMirror => {
-                return Some(format!(
-                    "{at}.filters[{fi}]: RequestMirror is not supported"
-                ));
+                return Some(format!("{at}.filters[{fi}]: RequestMirror is not supported"));
             }
             FType::ExtensionRef => {
-                return Some(format!(
-                    "{at}.filters[{fi}]: ExtensionRef filters are not supported"
-                ));
+                return Some(format!("{at}.filters[{fi}]: ExtensionRef filters are not supported"));
             }
         }
         // Redirect status code must be a valid HTTP redirect code.
         if let Some(r) = &f.request_redirect
             && let Some(code) = r.status_code
-                && !matches!(code, 301 | 302 | 303 | 307 | 308) {
-                    return Some(format!(
-                        "{at}.filters[{fi}].requestRedirect.statusCode: unsupported value {code}"
-                    ));
-                }
+            && !matches!(code, 301 | 302 | 303 | 307 | 308)
+        {
+            return Some(format!(
+                "{at}.filters[{fi}].requestRedirect.statusCode: unsupported value {code}"
+            ));
+        }
     }
 
     // Timeouts: a present-but-unparseable GEP-2257 duration would otherwise be
@@ -2045,9 +1962,10 @@ fn validate_http_rule(
     if let Some(t) = &rule.timeouts {
         for (field, val) in [("request", &t.request), ("backendRequest", &t.backend_request)] {
             if let Some(s) = val
-                && parse_gep2257_duration(s).is_none() {
-                    return Some(format!("{at}.timeouts.{field}: invalid duration {s:?}"));
-                }
+                && parse_gep2257_duration(s).is_none()
+            {
+                return Some(format!("{at}.timeouts.{field}: invalid duration {s:?}"));
+            }
         }
     }
 
@@ -2055,9 +1973,7 @@ fn validate_http_rule(
 }
 
 /// Convert a Gateway API HTTPRouteMatch into our internal RouteMatch.
-fn route_match_from(
-    m: &gateway_api::apis::standard::httproutes::HttpRouteRulesMatches,
-) -> RouteMatch {
+fn route_match_from(m: &gateway_api::apis::standard::httproutes::HttpRouteRulesMatches) -> RouteMatch {
     use gateway_api::apis::standard::httproutes::{
         HttpRouteRulesMatchesHeadersType as HType, HttpRouteRulesMatchesPathType as PType,
     };
@@ -2131,10 +2047,7 @@ fn protocol_route_kinds(protocol: &str) -> &'static [&'static str] {
 /// PROTOCOL supports. So an HTTPRoute must not attach to a `protocol: TLS` listener
 /// just because that listener omitted `kinds` (it would otherwise be reported
 /// Accepted=True and inflate attachedRoutes, even though no traffic is served).
-fn listener_allows_kind(
-    listener: &gateway_api::apis::standard::gateways::GatewayListeners,
-    kind: &str,
-) -> bool {
+fn listener_allows_kind(listener: &gateway_api::apis::standard::gateways::GatewayListeners, kind: &str) -> bool {
     match listener.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref()) {
         None => protocol_route_kinds(&listener.protocol).contains(&kind),
         Some(kinds) => kinds.iter().any(|k| k.kind == kind),
@@ -2200,9 +2113,9 @@ fn wildcard_covers(pat: &str, host: &str) -> bool {
 /// so the data plane only serves the true intersection.
 fn effective_hostnames(route_hosts: &[String], listener_host: Option<&str>) -> Vec<String> {
     match (route_hosts.is_empty(), listener_host) {
-        (true, None) => vec![],                        // match any
-        (true, Some(lh)) => vec![lh.to_string()],      // inherit listener
-        (false, None) => route_hosts.to_vec(),         // route's own
+        (true, None) => vec![],                   // match any
+        (true, Some(lh)) => vec![lh.to_string()], // inherit listener
+        (false, None) => route_hosts.to_vec(),    // route's own
         (false, Some(lh)) => route_hosts
             .iter()
             .filter_map(|rh| hostname_intersection(lh, rh))
@@ -2299,11 +2212,7 @@ fn parse_gep2257_duration(s: &str) -> Option<Duration> {
 /// Build a [`PathRewrite`] from a redirect/url-rewrite path config. `is_full_path`
 /// selects ReplaceFullPath vs ReplacePrefixMatch; the two generated filter types
 /// share these field shapes, so both call sites funnel through here.
-fn path_rewrite(
-    is_full_path: bool,
-    replace_full: &Option<String>,
-    replace_prefix: &Option<String>,
-) -> PathRewrite {
+fn path_rewrite(is_full_path: bool, replace_full: &Option<String>, replace_prefix: &Option<String>) -> PathRewrite {
     if is_full_path {
         PathRewrite::ReplaceFullPath(replace_full.clone().unwrap_or_default())
     } else {
@@ -2312,12 +2221,9 @@ fn path_rewrite(
 }
 
 /// Parse a rule's filters into our pre-digested [`Filters`] form.
-fn filters_from(
-    filters: &[gateway_api::apis::standard::httproutes::HttpRouteRulesFilters],
-) -> Filters {
+fn filters_from(filters: &[gateway_api::apis::standard::httproutes::HttpRouteRulesFilters]) -> Filters {
     use gateway_api::apis::standard::httproutes::{
-        HttpRouteRulesFiltersRequestRedirectPathType as RPType,
-        HttpRouteRulesFiltersRequestRedirectScheme as RScheme,
+        HttpRouteRulesFiltersRequestRedirectPathType as RPType, HttpRouteRulesFiltersRequestRedirectScheme as RScheme,
         HttpRouteRulesFiltersUrlRewritePathType as RWType,
     };
 
@@ -2492,13 +2398,7 @@ fn condition(type_: &str, status: &str, reason: &str, observed_generation: i64) 
 /// it via `kubectl describe`/`get -o yaml` even without controller-log access. The
 /// conformance suite matches only on type/status/reason (helpers.go), so a detailed
 /// message is always safe to include and never breaks a test.
-fn condition_msg(
-    type_: &str,
-    status: &str,
-    reason: &str,
-    message: &str,
-    observed_generation: i64,
-) -> Condition {
+fn condition_msg(type_: &str, status: &str, reason: &str, message: &str, observed_generation: i64) -> Condition {
     Condition {
         type_: type_.to_string(),
         status: status.to_string(),
