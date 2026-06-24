@@ -170,17 +170,6 @@ impl ProxyHttp for GatewayProxy {
             return Ok(true);
         }
 
-        // Fire-and-forget RequestMirror: send a copy of the request to each mirror
-        // target's endpoint. The response is ignored; the primary request proceeds.
-        for mirror in &entry.filters.mirrors {
-            if !sample(mirror.percent) {
-                continue;
-            }
-            if let Some(ep) = mirror.endpoints.first() {
-                spawn_mirror(ep.ip, ep.port, &method, &path, &host, &headers);
-            }
-        }
-
         ctx.request_timeout = entry.request_timeout;
 
         match entry.pick_endpoint(next_rng()) {
@@ -390,58 +379,6 @@ fn expand_wildcard(allow: &[String], requested: &str) -> String {
     } else {
         allow.join(", ")
     }
-}
-
-/// Sample `percent`% of the time (0 = never, 100 = always).
-fn sample(percent: u8) -> bool {
-    if percent >= 100 {
-        return true;
-    }
-    if percent == 0 {
-        return false;
-    }
-    (next_rng() % 100) < percent as u64
-}
-
-/// Send a fire-and-forget copy of a request to a mirror endpoint. Best-effort:
-/// any error is ignored (mirroring must never affect the primary request).
-fn spawn_mirror(
-    ip: std::net::IpAddr,
-    port: u16,
-    method: &str,
-    path: &str,
-    host: &str,
-    headers: &http::HeaderMap,
-) {
-    // Build a minimal HTTP/1.1 request. The echo backend logs the path, which is
-    // what the conformance test asserts on; we forward method, path, Host, and
-    // the original headers, with no body.
-    let mut req = format!("{method} {path} HTTP/1.1\r\nHost: {host}\r\n");
-    for (name, value) in headers.iter() {
-        let n = name.as_str();
-        if n.eq_ignore_ascii_case("host") || n.eq_ignore_ascii_case("content-length") {
-            continue;
-        }
-        if let Ok(v) = value.to_str() {
-            req.push_str(&format!("{n}: {v}\r\n"));
-        }
-    }
-    req.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
-
-    tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        if let Ok(mut stream) = tokio::net::TcpStream::connect((ip, port)).await {
-            let _ = stream.write_all(req.as_bytes()).await;
-            let _ = stream.flush().await;
-            // Briefly drain so the backend finishes handling/logging, then drop.
-            let mut buf = [0u8; 1024];
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                tokio::io::AsyncReadExt::read(&mut stream, &mut buf),
-            )
-            .await;
-        }
-    });
 }
 
 /// A cheap per-request pseudo-random value for weighted backend selection.

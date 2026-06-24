@@ -27,8 +27,8 @@ conformance profile. Implemented and verified against the upstream suite:
   (Same/All/Selector) and kinds, hostname intersection, with correct `Accepted` reasons
   (`NoMatchingParent`, `NotAllowedByListeners`, `NoMatchingListenerHostname`).
 - **Multi-port + extended HTTP** — per-port listeners (`HTTPRouteParentRefPort`,
-  `GatewayPort8080`), HTTP-listener isolation, request/backend timeouts (→504), request
-  mirror (single/multiple/percentage), CORS, WebSocket upgrade passthrough.
+  `GatewayPort8080`), HTTP-listener isolation, request/backend timeouts (→504), CORS,
+  WebSocket upgrade passthrough.
 - **TLS (GATEWAY-TLS, partial)** — HTTPS listener termination with **per-SNI certificate
   selection** (certs loaded in-memory from `kubernetes.io/tls` Secrets, cross-namespace
   via ReferenceGrant; OpenSSL `certificate_callback`), listener cert-ref status
@@ -59,8 +59,8 @@ go test ./conformance -run TestConformance -count=1 \
   --conformance-profiles=GATEWAY-HTTP --allow-crds-mismatch
 ```
 
-→ **405 passed, 0 failed, 87 skipped.** The 87 skips are out-of-scope features we don't
-report in `supportedFeatures` (UDP/TCP/gRPC routes, retries, ListenerSet, static
+→ **0 failed.** The skips are out-of-scope features we don't report in
+`supportedFeatures` (UDP/TCP/gRPC routes, request mirroring, retries, ListenerSet, static
 addresses, frontend client-cert validation, mesh, h2c). Everything we declare
 support for passes — including TLS termination (HTTPS listeners, per-SNI certs,
 cross-namespace cert ReferenceGrants) and the full BackendTLSPolicy surface (re-encrypt,
@@ -179,6 +179,10 @@ Notes on a few out-of-scope / unimplemented items:
 - **HTTPRoute `retry`** is an *experimental-channel* feature in Gateway API v1.5 (absent
   from the standard CRDs), so the retry tests are not part of the standard GATEWAY-HTTP
   profile.
+- **HTTPRoute `RequestMirror`** (traffic shadowing) is not supported. A correct
+  implementation must mirror the whole request *including the body* — teeing every body
+  chunk to the mirror backend without stalling the primary request — which isn't worth the
+  complexity here, so the feature is not advertised and its tests are skipped.
 - **TLSRoute** (TLS passthrough) is designed but not implemented — see above.
 - **`HTTPRouteBackendProtocolH2C`** (cleartext HTTP/2 to the backend) is not implemented;
   it is not part of the GATEWAY-HTTP profile's required feature set.
