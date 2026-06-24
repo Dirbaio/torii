@@ -188,7 +188,7 @@ spec:
             - name: TORII_LOG
               value: "torii=info,kube=warn"
           ports:
-            - { name: http,  containerPort: 80,  protocol: TCP }
+            - { name: http, containerPort: 80, protocol: TCP }
             - { name: https, containerPort: 443, protocol: TCP }
           securityContext:
             allowPrivilegeEscalation: false
@@ -199,7 +199,7 @@ spec:
               add: ["NET_BIND_SERVICE"]
           resources:
             requests: { cpu: "100m", memory: "128Mi" }
-            limits:   { memory: "512Mi" }
+            limits: { memory: "512Mi" }
           # Liveness/readiness: torii has no HTTP health endpoint, so probe the
           # data-plane TCP port — if the proxy thread is up, the port accepts.
           livenessProbe:
@@ -228,8 +228,7 @@ spec:
   selector:
     app.kubernetes.io/name: torii
   ports:
-    - { name: http,  port: 80,  targetPort: http,  protocol: TCP }
+    - { name: http, port: 80, targetPort: http, protocol: TCP }
     - { name: https, port: 443, targetPort: https, protocol: TCP }
-  # Preserve the client source IP so X-Forwarded-For is accurate (and ACME
-  # challenge traffic reaches the right pod).
+  # Preserve the client source IP so X-Forwarded-For is accurate.
   externalTrafficPolicy: Local
