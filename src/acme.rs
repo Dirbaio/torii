@@ -169,6 +169,7 @@ pub async fn run(
         tokio::select! {
             _ = tokio::time::sleep(LEASE_RENEW) => {}
             _ = feed.notified() => {
+                tracing::debug!("ACME: woken by controller (target set changed); scanning");
                 last_scan = std::time::Instant::now()
                     .checked_sub(SCAN_INTERVAL)
                     .unwrap_or_else(std::time::Instant::now);
@@ -208,6 +209,14 @@ pub struct AcmeTarget {
     /// `attachedRoutes` on every listener-status entry; sending the controller's value
     /// keeps the apply a no-op for that field (no last-writer-wins flap).
     pub attached_routes: i32,
+    /// Whether a usable cert is currently loaded for this listener (the controller's
+    /// view, from its CertStore). NOT used to decide issuance — ACME does its own
+    /// `cert_check` for expiry — but it makes the target set change when the cert
+    /// Secret is created or DELETED, so deleting the Secret pokes ACME to re-issue
+    /// immediately instead of waiting for the renewal-scan timer. (The controller
+    /// already watches Secrets, so this flips on the same reconcile that the deletion
+    /// triggers.)
+    pub has_cert: bool,
 }
 
 impl AcmeTarget {
@@ -960,6 +969,7 @@ mod tests {
             secret_ns: "default".into(),
             secret_name: format!("{host}-tls"),
             attached_routes: 0,
+            has_cert: false,
         }
     }
 

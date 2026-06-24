@@ -521,6 +521,15 @@ impl ReconcileCtx {
                 let hostname = l.hostname.clone().unwrap_or_default();
                 let attached_routes =
                     counts.and_then(|c| c.get(&l.name)).copied().unwrap_or(0);
+                // Does a usable cert currently exist for this listener? From the same
+                // CertStore-resolution the controller just did. Flips when the cert
+                // Secret is created/deleted, so a deletion changes the target set and
+                // pokes ACME to re-issue immediately (the Secret name alone is static).
+                let has_cert = model
+                    .listeners
+                    .iter()
+                    .find(|o| o.name == l.name)
+                    .is_some_and(|o| o.resolved_cert.is_some());
                 for r in tls.certificate_refs.clone().unwrap_or_default() {
                     // Only manage core-Secret refs.
                     if r.group.clone().unwrap_or_default() != ""
@@ -540,6 +549,7 @@ impl ReconcileCtx {
                         secret_ns,
                         secret_name: r.name.clone(),
                         attached_routes,
+                        has_cert,
                     });
                 }
             }
