@@ -22,7 +22,12 @@ pub fn alpn_cert(host: &str, key_auth_digest: &[u8]) -> Result<(Vec<u8>, Vec<u8>
 /// Build a DER-encoded CSR for `host`, signed by `key` (whose private key we keep
 /// and pair with the issued cert).
 pub fn csr_der(key: &KeyPair, host: &str) -> Result<Vec<u8>> {
-    let params = CertificateParams::new(vec![host.to_string()]).context("CSR params")?;
+    let mut params = CertificateParams::new(vec![host.to_string()]).context("CSR params")?;
+    // rcgen defaults the subject to `CN=rcgen self signed cert`. Let's Encrypt reads
+    // the CSR's subject CN as a requested identifier and rejects it ("Cannot issue
+    // for \"rcgen self signed cert\""). The domain belongs in the SAN (set above), so
+    // clear the subject entirely — modern CAs issue purely from SANs.
+    params.distinguished_name = rcgen::DistinguishedName::new();
     let csr = params.serialize_request(key).context("serialize CSR")?;
     Ok(csr.der().to_vec())
 }
@@ -76,12 +81,17 @@ mod tests {
             x509_parser::certification_request::X509CertificationRequest::from_der(&der)
                 .expect("valid CSR DER");
         assert!(rest.is_empty(), "CSR consumes all DER");
-        let der_str = String::from_utf8_lossy(&der);
         // The requested SAN/subject hostname appears in the encoded request.
         assert!(
             der.windows(b"csr.example.com".len()).any(|w| w == b"csr.example.com"),
             "CSR encodes the host"
         );
-        let _ = (csr, der_str); // parsed successfully
+        // The subject MUST NOT carry rcgen's default CN — Let's Encrypt reads the
+        // CSR subject CN as a requested identifier and rejects "rcgen self signed cert".
+        assert!(
+            !der.windows(b"rcgen self signed cert".len()).any(|w| w == b"rcgen self signed cert"),
+            "CSR subject must not contain rcgen's default CN"
+        );
+        let _ = csr; // parsed successfully
     }
 }
