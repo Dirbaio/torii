@@ -778,6 +778,20 @@ const PIPE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// path effectively uses.
 const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
 
+/// Deadline for completing the downstream TLS handshake. A client that opens TCP and
+/// sends a ClientHello then stalls would otherwise pin a task forever.
+const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Idle timeout for an HTTP/2 connection on the terminate-then-HTTP path: if no new
+/// stream is requested within this window, the connection is closed. Without it, an
+/// idle h2 connection (handshake done, no active streams) is held FOREVER — the h2
+/// accept loop's `from_h2_conn().await` blocks with no bound. Real browsers prefer
+/// h2 (ALPN) and keep connections open, so without this they accumulate one live
+/// task + buffers each until the process OOMs (observed in prod: thousands of
+/// idle ESTABLISHED :443 connections). The h1 path is already bounded by its 60s
+/// keepalive; this gives h2 the equivalent. Matches nginx's ~75s keepalive_timeout.
+const H2_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
+
 /// The TLS data-plane application for a port that may carry TLSRoutes.
 ///
 /// On a **plain-TCP** listener (so Pingora does NOT terminate TLS for us), this
@@ -884,16 +898,27 @@ impl GatewayTlsApp {
     ) -> Option<pingora_core::protocols::Stream> {
         use pingora_core::protocols::tls::ALPN;
 
-        let tls_stream = match pingora_core::protocols::tls::server::handshake_with_callback(
-            &self.acceptor,
-            BoxedStream(stream),
-            &self.tls_callbacks,
+        // Bound the TLS handshake: a client can open TCP and send a ClientHello (so
+        // dispatch reaches here) then stall mid-handshake, leaving this awaiting
+        // forever. Without a deadline such connections accumulate unbounded. The peek
+        // stage has its own PEEK_TIMEOUT; this covers the rest of the handshake.
+        let tls_stream = match tokio::time::timeout(
+            TLS_HANDSHAKE_TIMEOUT,
+            pingora_core::protocols::tls::server::handshake_with_callback(
+                &self.acceptor,
+                BoxedStream(stream),
+                &self.tls_callbacks,
+            ),
         )
         .await
         {
-            Ok(s) => s,
-            Err(e) => {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
                 tracing::debug!(error = %e, "HTTPS terminate handshake failed");
+                return None;
+            }
+            Err(_) => {
+                tracing::debug!("HTTPS terminate handshake timed out; closing");
                 return None;
             }
         };
@@ -950,22 +975,68 @@ impl GatewayTlsApp {
         // options the proxy provides, then enforce our cap.
         let mut h2_options = self.proxy.h2_options().unwrap_or_default();
         h2_options.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
-        let mut conn = match server::handshake(stream, Some(h2_options)).await {
-            Ok(c) => c,
-            Err(e) => {
+        // Bound the h2 handshake: a client can negotiate the `h2` ALPN over TLS but then
+        // never send the HTTP/2 connection preface, leaving `server::handshake` awaiting
+        // forever. Such half-open connections (scanners, abandoned clients) would
+        // otherwise pile up unbounded. Reuse the idle window as the handshake deadline.
+        let mut conn = match tokio::time::timeout(H2_IDLE_TIMEOUT, server::handshake(stream, Some(h2_options))).await {
+            Ok(Ok(c)) => c,
+            Ok(Err(e)) => {
                 tracing::debug!(error = %e, "HTTPS h2 handshake failed");
+                return;
+            }
+            Err(_) => {
+                tracing::debug!("HTTPS h2 handshake timed out (no preface); closing");
                 return;
             }
         };
 
-        // Accept h2 streams until the client closes the connection. Each stream is
-        // an independent request; spawn it so concurrent streams aren't serialized.
+        // Accept h2 streams until the client closes the connection OR goes idle with
+        // no active streams. Each stream is an independent request; spawn it so
+        // concurrent streams aren't serialized.
+        //
+        // `from_h2_conn` drives the whole connection codec (so it must keep being
+        // polled while streams are in flight) and yields the next NEW stream. We bound
+        // the wait with H2_IDLE_TIMEOUT, but only TEAR DOWN the connection when the
+        // timeout fires AND no streams are active — otherwise a long-running stream
+        // (slow download) would be killed mid-transfer. While streams are active we
+        // just re-await (which keeps driving them). `active` is incremented before each
+        // spawn and decremented by a drop guard when the stream task ends.
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         loop {
-            match server::HttpSession::from_h2_conn(&mut conn, digest.clone()).await {
+            let next = match tokio::time::timeout(
+                H2_IDLE_TIMEOUT,
+                server::HttpSession::from_h2_conn(&mut conn, digest.clone()),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    // Idle window elapsed. Close only if nothing is in flight;
+                    // otherwise keep serving the active stream(s).
+                    if active.load(std::sync::atomic::Ordering::Acquire) == 0 {
+                        tracing::debug!("HTTPS h2 connection idle; closing");
+                        break;
+                    }
+                    continue;
+                }
+            };
+            match next {
                 Ok(Some(h2)) => {
                     let proxy = self.proxy.clone();
                     let shutdown = shutdown.clone();
+                    let active = active.clone();
+                    active.fetch_add(1, std::sync::atomic::Ordering::Release);
                     tokio::spawn(async move {
+                        // Decrement on completion (incl. panic) so the idle reaper sees
+                        // an accurate in-flight count.
+                        struct Guard(Arc<std::sync::atomic::AtomicUsize>);
+                        impl Drop for Guard {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, std::sync::atomic::Ordering::Release);
+                            }
+                        }
+                        let _g = Guard(active);
                         proxy.process_new_http(ServerSession::new_http2(h2), &shutdown).await;
                     });
                 }
