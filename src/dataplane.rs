@@ -1213,6 +1213,13 @@ fn build_tls_acceptor(
 
     let mut builder =
         SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).expect("failed to create TLS acceptor builder");
+    // Let OpenSSL free a connection's ~17KB record buffers whenever they're
+    // empty instead of holding them for the connection's lifetime (nginx sets
+    // the same mode). NOTE: on OpenSSL 3.5 (dev host) idle connections measure
+    // the same with or without this — but the prod runtime image is bookworm's
+    // OpenSSL 3.0, where retained record buffers are the classic idle-conn cost,
+    // so keep it: it is free and can only shrink idle memory.
+    builder.set_mode(pingora_core::tls::ssl::SslMode::RELEASE_BUFFERS);
     // ALPN: offer, in preference order, the ACME `acme-tls/1` challenge protocol,
     // then HTTP/2 (`h2`), then HTTP/1.1. We pick the first of OUR preferences that
     // the client also offered. NOACK only if the client offered none of them (it
@@ -1235,6 +1242,22 @@ fn build_tls_acceptor(
     (acceptor, Arc::new(callbacks))
 }
 
+/// Per-connection L4 read buffer size. Pingora's default is 64KB, allocated at
+/// accept() and held for the connection's lifetime — the single largest share of
+/// an idle downstream connection's memory (measured 2026-07-05: ~85KB total for a
+/// plain-HTTP conn, ~64KB of it this buffer). 16KB still fits a full TLS record /
+/// typical request headers per read; HTTP header parsing and the SNI peek do not
+/// depend on this size (the h1 session has its own header buffer, and
+/// `try_peek`'s rewind uses a separate side buffer).
+const L4_READ_BUFFER_SIZE: usize = 16 * 1024;
+
+/// Build a TCP listener config with our (smaller) per-connection read buffer.
+/// The write buffer keeps pingora's default (1460B, one TCP segment).
+fn tcp_listener(addr: &str) -> pingora_core::listeners::ListenerConfig {
+    use pingora_core::protocols::l4::stream::L4BufferSettings;
+    pingora_core::listeners::ListenerConfig::tcp(addr).l4_buffer(L4BufferSettings::default().read(L4_READ_BUFFER_SIZE))
+}
+
 /// Run the Pingora data-plane server.
 ///
 /// `http_ports` get plain-TCP listeners served by the HTTP proxy. `tls_ports` get
@@ -1255,7 +1278,7 @@ pub fn run(data_plane: DataPlane, bind_ip: &str, http_ports: &[u16], tls_ports: 
         GatewayProxy::new(data_plane.clone(), tls_ports.to_vec()),
     );
     for port in http_ports {
-        http_service.add_tcp(&format!("{bind_ip}:{port}"));
+        http_service.add_listener(tcp_listener(&format!("{bind_ip}:{port}")));
     }
     server.add_service(http_service);
 
@@ -1277,7 +1300,7 @@ pub fn run(data_plane: DataPlane, bind_ip: &str, http_ports: &[u16], tls_ports: 
         };
         let mut tls_service = pingora_core::services::listening::Service::new("tls-sni-dispatch".to_string(), app);
         for port in tls_ports {
-            tls_service.add_tcp(&format!("{bind_ip}:{port}"));
+            tls_service.add_listener(tcp_listener(&format!("{bind_ip}:{port}")));
         }
         server.add_service(tls_service);
     }
