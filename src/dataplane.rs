@@ -1257,9 +1257,21 @@ const H2_MIN_BODY_PROGRESS: u64 = 16 * 1024;
 /// The setting alone does not bound the tasks: a stream the client resets stops
 /// counting toward it at once, while its task runs on until the proxy notices, which
 /// takes as long as the upstream connect. So `GatewayTlsApp::serve_h2_streams` also
-/// runs at most this many stream tasks per connection, as Go does since
-/// CVE-2023-39325.
+/// caps the stream tasks, at [`H2_MAX_STREAM_TASKS`].
 const H2_MAX_CONCURRENT_STREAMS: u32 = 100;
+
+/// Cap on the stream tasks of one HTTP/2 connection, open streams or not (see
+/// [`H2_MAX_CONCURRENT_STREAMS`]): `GatewayTlsApp::serve_h2_streams` refuses a stream
+/// that arrives while this many run. Without it, a client that resets the streams it
+/// opens could pile up any number of tasks behind a slow upstream connect (the
+/// CVE-2023-39325 pattern).
+///
+/// It is twice the stream limit because a client at that limit may cancel a stream and
+/// open another at once (RFC 9113 §5.1.2), as proxies do when their user goes away:
+/// both frames usually come in one read, before the cancelled stream's task has even
+/// run to see the reset. The tasks over the limit are of streams already reset or
+/// ended, which hold no response: they are connecting upstream or about to end.
+const H2_MAX_STREAM_TASKS: usize = 2 * H2_MAX_CONCURRENT_STREAMS as usize;
 
 /// Cap on the decoded header list of an HTTP/2 request (SETTINGS_MAX_HEADER_LIST_SIZE,
 /// RFC 9113 §6.5.2), counted as name + value + 32 bytes per field. Larger requests
@@ -1298,14 +1310,14 @@ const H2_MAX_SEND_BUFFER_SIZE: usize = 64 * 1024;
 /// sends a ClientHello then stalls would otherwise pin a task forever.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-/// Idle timeout for an HTTP/2 connection on the terminate-then-HTTP path: if no new
-/// stream is requested within this window, the connection is closed. Without it, an
-/// idle h2 connection (handshake done, no active streams) is held FOREVER — the h2
-/// accept loop's `from_h2_conn().await` blocks with no bound. Real browsers prefer
-/// h2 (ALPN) and keep connections open, so without this they accumulate one live
-/// task + buffers each until the process OOMs (observed in prod: thousands of
-/// idle ESTABLISHED :443 connections). [`H1_IDLE_TIMEOUT`] is the h1 equivalent.
-/// Matches nginx's ~75s keepalive_timeout.
+/// Idle timeout for an HTTP/2 connection on the terminate-then-HTTP path: if no stream
+/// starts or ends within this window and none is in flight, the connection is closed.
+/// Without it, an idle h2 connection (handshake done, no active streams) is held
+/// FOREVER — the h2 accept loop's `from_h2_conn().await` blocks with no bound. Real
+/// browsers prefer h2 (ALPN) and keep connections open, so without this they
+/// accumulate one live task + buffers each until the process OOMs (observed in prod:
+/// thousands of idle ESTABLISHED :443 connections). [`H1_IDLE_TIMEOUT`] is the h1
+/// equivalent. Matches nginx's ~75s keepalive_timeout.
 const H2_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
 
 /// Idle timeout for an HTTP/1.x connection: how long it may wait for (each read of)
@@ -1599,15 +1611,20 @@ impl GatewayTlsApp {
         // but its task runs on until the proxy notices, i.e. until the upstream
         // connect ends. Resetting accepted streams would let one connection pile up
         // any number of tasks behind a slow upstream, so a stream that arrives while
-        // H2_MAX_CONCURRENT_STREAMS tasks run is refused (REFUSED_STREAM, which the
-        // client may retry), and a client that has had that many refused gets
+        // H2_MAX_STREAM_TASKS tasks run is refused (REFUSED_STREAM, which the client
+        // may retry). A client that has had H2_MAX_CONCURRENT_STREAMS refused while
+        // no task ended keeps opening streams into a full cap, and gets
         // GOAWAY(ENHANCE_YOUR_CALM). Leaving the loop drops `tasks`, which aborts the
         // ones still running: their client is gone.
         let mut tasks = tokio::task::JoinSet::new();
+        // Streams refused since a task last ended.
         let mut refused = 0;
         loop {
             let next = tokio::select! {
-                Some(_) = tasks.join_next() => continue,
+                Some(_) = tasks.join_next() => {
+                    refused = 0;
+                    continue;
+                }
                 next = tokio::time::timeout(
                     H2_IDLE_TIMEOUT,
                     server::HttpSession::from_h2_conn(&mut conn, digest.clone()),
@@ -1637,8 +1654,10 @@ impl GatewayTlsApp {
                         continue;
                     }
                     // A task that ended since the last poll is still in `tasks`.
-                    while tasks.try_join_next().is_some() {}
-                    if tasks.len() >= H2_MAX_CONCURRENT_STREAMS as usize {
+                    while tasks.try_join_next().is_some() {
+                        refused = 0;
+                    }
+                    if tasks.len() >= H2_MAX_STREAM_TASKS {
                         refused += 1;
                         if refused > H2_MAX_CONCURRENT_STREAMS {
                             tracing::debug!("HTTPS h2 client keeps opening streams over the task cap; closing");
@@ -2725,8 +2744,9 @@ mod tests {
     // MAX_CONCURRENT_STREAMS only counts open streams: one the client resets is freed
     // at once, while its task may still be stuck before the proxy watches the stream
     // (an upstream connect to a black hole). The accept loop must still run at most
-    // H2_MAX_CONCURRENT_STREAMS tasks per connection, refuse the streams over that,
-    // cut off a client that keeps at it, and abort the stuck tasks once it is gone.
+    // H2_MAX_STREAM_TASKS tasks per connection, refuse the streams over that, cut off
+    // a client that keeps at it while no task ends, and abort the stuck tasks once it
+    // is gone.
     #[tokio::test]
     async fn h2_reset_streams_keep_their_task_slots() {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2740,16 +2760,19 @@ mod tests {
         }
         let running = Arc::new(AtomicUsize::new(0));
         let peak = Arc::new(AtomicUsize::new(0));
+        // Ends one stuck task each time it is notified.
+        let release = Arc::new(tokio::sync::Notify::new());
 
         let (mut client, server_io) = tokio::io::duplex(64 * 1024);
         let serving = tokio::spawn({
-            let (running, peak) = (running.clone(), peak.clone());
+            let (running, peak, release) = (running.clone(), peak.clone(), release.clone());
             GatewayTlsApp::serve_h2_streams(Box::new(server_io), CLIENT_STALL_TIMEOUT, move |session| {
                 peak.fetch_max(running.fetch_add(1, Ordering::Relaxed) + 1, Ordering::Relaxed);
                 let running = Running(running.clone());
+                let release = release.clone();
                 async move {
                     let _stuck = (session, running);
-                    std::future::pending().await
+                    release.notified().await
                 }
             })
         });
@@ -2779,28 +2802,54 @@ mod tests {
             }
         }
 
-        // A full window of streams, all accepted, then all reset by the client.
+        // Two full windows of streams (the cap and its headroom), each accepted and
+        // then reset by the client.
+        assert_eq!(H2_MAX_STREAM_TASKS, 2 * n as usize);
         let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         req.extend(h2_frame(0x4, 0, 0, &[]));
-        req.extend((0..n).flat_map(get));
         client.write_all(&req).await.unwrap();
-        let accepted = tokio::time::timeout(Duration::from_secs(5), wait_running(n as usize)).await;
-        assert!(accepted.is_ok(), "the first window must be accepted");
-        let resets: Vec<u8> = (0..n).flat_map(cancel).collect();
-        client.write_all(&resets).await.unwrap();
+        for w in 0..2 {
+            let window: Vec<u8> = (w * n..(w + 1) * n).flat_map(get).collect();
+            client.write_all(&window).await.unwrap();
+            let want = ((w + 1) * n) as usize;
+            let accepted = tokio::time::timeout(Duration::from_secs(5), wait_running(want)).await;
+            assert!(accepted.is_ok(), "window {w} must be accepted");
+            let resets: Vec<u8> = (w * n..(w + 1) * n).flat_map(cancel).collect();
+            client.write_all(&resets).await.unwrap();
+        }
 
         // h2 has room for a whole window again, but the stream tasks are still there:
         // the loop must refuse every stream of it.
-        let window: Vec<u8> = (n..2 * n).flat_map(get).collect();
+        let window: Vec<u8> = (2 * n..3 * n).flat_map(get).collect();
         client.write_all(&window).await.unwrap();
         for _ in 0..n {
             let frame = tokio::time::timeout(Duration::from_secs(5), next_error(&mut client)).await;
             assert_eq!(frame, Ok((0x3, 0x7)), "expected RST_STREAM(REFUSED_STREAM)");
         }
-        assert_eq!(peak.load(Ordering::Relaxed), n as usize, "stream tasks over the cap");
+        assert_eq!(
+            peak.load(Ordering::Relaxed),
+            H2_MAX_STREAM_TASKS,
+            "stream tasks over the cap"
+        );
+
+        // A task that ends makes room for one stream, and the client is no longer
+        // opening streams into a full cap: a window of refusals starts over.
+        release.notify_one();
+        let ended = tokio::time::timeout(Duration::from_secs(5), wait_running(H2_MAX_STREAM_TASKS - 1)).await;
+        assert!(ended.is_ok(), "a released task must end");
+        client.write_all(&get(3 * n)).await.unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(5), wait_running(H2_MAX_STREAM_TASKS)).await;
+        assert!(accepted.is_ok(), "the freed task slot must be taken");
+        let mut window = cancel(3 * n);
+        window.extend((3 * n + 1..4 * n + 1).flat_map(get));
+        client.write_all(&window).await.unwrap();
+        for _ in 0..n {
+            let frame = tokio::time::timeout(Duration::from_secs(5), next_error(&mut client)).await;
+            assert_eq!(frame, Ok((0x3, 0x7)), "expected RST_STREAM(REFUSED_STREAM)");
+        }
 
         // One more is one refusal too many.
-        client.write_all(&get(2 * n)).await.unwrap();
+        client.write_all(&get(4 * n + 1)).await.unwrap();
         let frame = tokio::time::timeout(Duration::from_secs(5), next_error(&mut client)).await;
         assert_eq!(frame, Ok((0x7, 0xb)), "expected GOAWAY(ENHANCE_YOUR_CALM)");
 
@@ -2809,6 +2858,55 @@ mod tests {
         assert!(matches!(ended, Ok(Ok(()))), "the accept loop must end");
         let aborted = tokio::time::timeout(Duration::from_secs(5), wait_running(0)).await;
         assert!(aborted.is_ok(), "stuck stream tasks must be aborted");
+    }
+
+    // At the stream limit, a client may cancel a stream and open another at once (RFC
+    // 9113 §5.1.2). Both frames usually come in one read, so h2 hands out the new
+    // stream before the cancelled stream's task has run to see the reset. The accept
+    // loop must take the new stream, however often the client does this.
+    #[tokio::test]
+    async fn h2_cancel_and_replace_at_the_stream_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn({
+            let accepted = accepted.clone();
+            GatewayTlsApp::serve_h2_streams(Box::new(server_io), CLIENT_STALL_TIMEOUT, move |mut session| {
+                accepted.fetch_add(1, Ordering::Relaxed);
+                // As the proxy does while it waits for the backend: end once the
+                // client resets the stream.
+                async move {
+                    let _ = session.idle().await;
+                }
+            })
+        });
+        let wait_accepted = async |want: u32| {
+            while accepted.load(Ordering::Relaxed) != want as usize {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+
+        // GET https://a/ and RST_STREAM(CANCEL) on stream 2i+1, as above.
+        let n = H2_MAX_CONCURRENT_STREAMS;
+        let get = |i: u32| h2_frame(0x1, 0x5, 2 * i + 1, &[0x82, 0x87, 0x84, 0x41, 0x01, b'a']);
+        let cancel = |i: u32| h2_frame(0x3, 0, 2 * i + 1, &0x8u32.to_be_bytes());
+
+        let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        req.extend(h2_frame(0x4, 0, 0, &[]));
+        req.extend((0..n).flat_map(get));
+        client.write_all(&req).await.unwrap();
+        let full = tokio::time::timeout(Duration::from_secs(5), wait_accepted(n)).await;
+        assert!(full.is_ok(), "the first window must be accepted");
+
+        // More swaps than the cap has headroom, or the refusals before a GOAWAY.
+        for i in 0..2 * n {
+            let mut swap = cancel(i);
+            swap.extend(get(n + i));
+            client.write_all(&swap).await.unwrap();
+            let taken = tokio::time::timeout(Duration::from_secs(5), wait_accepted(n + i + 1)).await;
+            assert!(taken.is_ok(), "replacement stream {} was not accepted", 2 * (n + i) + 1);
+        }
     }
 
     // h2 flow control lets a client stall one stream's response (a zero window) while
