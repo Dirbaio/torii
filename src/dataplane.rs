@@ -1490,6 +1490,71 @@ mod tests {
         assert_eq!(first, Ok(Some("/ok".to_string())), "over-size request must be refused");
     }
 
+    // A client's SETTINGS_HEADER_TABLE_SIZE is a ceiling for the HPACK encoder, not a
+    // target (RFC 7541 §4.2). h2 < 0.4.17 sized the response encoder's dynamic table
+    // to whatever the client advertised (up to 4 GiB), so nothing was ever evicted and
+    // every distinct response field, a slice of its upstream head buffer, stayed
+    // pinned for the connection's lifetime. The table must stay capped at 4 KiB.
+    #[tokio::test]
+    async fn h2_hpack_encoder_table_ignores_client_size() {
+        use pingora_core::protocols::Digest;
+        use pingora_core::protocols::http::v2::server;
+
+        async fn read_frame(io: &mut tokio::io::DuplexStream) -> (u8, u8, u32, Vec<u8>) {
+            let mut head = [0u8; 9];
+            io.read_exact(&mut head).await.unwrap();
+            let mut payload = vec![0; u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize];
+            io.read_exact(&mut payload).await.unwrap();
+            let stream = u32::from_be_bytes(head[5..9].try_into().unwrap()) & 0x7fff_ffff;
+            (head[3], head[4], stream, payload)
+        }
+
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut conn = server::handshake(Box::new(server_io), Some(h2_server_options()))
+                .await
+                .unwrap();
+            while let Ok(Some(mut s)) = server::HttpSession::from_h2_conn(&mut conn, Arc::new(Digest::default())).await
+            {
+                let mut resp = ResponseHeader::build(200, None).unwrap();
+                resp.insert_header("x-big", "x".repeat(3500)).unwrap();
+                s.write_response_header(Box::new(resp), true).unwrap();
+            }
+        });
+
+        // Preface and SETTINGS_HEADER_TABLE_SIZE = 2^32-1. h2 applies it to the encoder
+        // when it ACKs, so wait for the ACK before sending the requests.
+        let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        req.extend(h2_frame(0x4, 0, 0, &[0x00, 0x01, 0xff, 0xff, 0xff, 0xff]));
+        client.write_all(&req).await.unwrap();
+        let blocks = tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(read_frame(&mut client).await, (0x4, 0x1, ..)) {}
+            // Two GET https://a/ (HPACK static indices 2, 7, 4 and :authority literal).
+            let mut req = h2_frame(0x1, 0x5, 1, &[0x82, 0x87, 0x84, 0x41, 0x01, b'a']);
+            req.extend(h2_frame(0x1, 0x5, 3, &[0x82, 0x87, 0x84, 0x41, 0x01, b'a']));
+            client.write_all(&req).await.unwrap();
+            let mut blocks = [0, 0];
+            while blocks.contains(&0) {
+                let (ty, _, stream, payload) = read_frame(&mut client).await;
+                if ty == 0x1 {
+                    blocks[stream as usize / 2] = payload.len();
+                }
+            }
+            blocks
+        })
+        .await
+        .expect("both responses");
+
+        // `x-big` (3537 bytes in HPACK accounting) is over 3/4 of a 4 KiB table, so h2
+        // must not index it: the second response carries the literal again. A table
+        // sized by the client would index it and send a 1-byte reference instead.
+        assert!(blocks[0] > 2000, "first response must carry x-big: {blocks:?}");
+        assert!(
+            blocks[1] > 2000,
+            "x-big was indexed, the encoder table exceeds 4 KiB: {blocks:?}"
+        );
+    }
+
     // split_host_port matches Go's net.SplitHostPort: it unbrackets IPv6 literals
     // and REQUIRES a port. These cases mirror the stdlib's own test table.
     #[test]
