@@ -1533,6 +1533,64 @@ mod tests {
         assert_eq!(first, Ok(Some("/ok".to_string())), "over-size request must be refused");
     }
 
+    // A request whose content-length does not match its DATA is malformed and must not
+    // be forwarded (RFC 9113 §8.1.1). h2 < 0.4.20 checked only the first content-length
+    // field, so `content-length: 5` + `content-length: 4` with 5 bytes of DATA reached
+    // the proxy, which sends both fields to the HTTP/1.1 upstream: a backend that frames
+    // the body by the last one reads the rest as a smuggled request. serve_h2 must reset
+    // such a stream with PROTOCOL_ERROR before the proxy sees it, and keep serving.
+    #[tokio::test]
+    async fn h2_conflicting_content_lengths_are_reset() {
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        let (accepted_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(GatewayTlsApp::serve_h2_streams(Box::new(server_io), move |session| {
+            let _ = accepted_tx.send(session.req_header().uri.path().to_string());
+            async {}
+        }));
+
+        // POST https://a/upload (HPACK static indices 3 and 7, then :path, :authority and
+        // two content-length (index 28) literals without indexing), 5 bytes of DATA, then
+        // GET https://a/ok on the next stream.
+        let mut post = vec![0x83, 0x87, 0x04, 7];
+        post.extend(b"/upload");
+        post.extend([0x01, 0x01, b'a']);
+        post.extend([0x0f, 0x0d, 0x01, b'5']);
+        post.extend([0x0f, 0x0d, 0x01, b'4']);
+        let mut get = vec![0x82, 0x87, 0x04, 3];
+        get.extend(b"/ok");
+        get.extend([0x01, 0x01, b'a']);
+
+        let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        req.extend(h2_frame(0x4, 0, 0, &[]));
+        req.extend(h2_frame(0x1, 0x4, 1, &post)); // HEADERS, END_HEADERS
+        req.extend(h2_frame(0x0, 0x1, 1, b"AAAAA")); // DATA, END_STREAM
+        req.extend(h2_frame(0x1, 0x5, 3, &get)); // HEADERS, END_STREAM|END_HEADERS
+        client.write_all(&req).await.unwrap();
+
+        // The POST never reaches the proxy; the next stream on the connection does.
+        let first = tokio::time::timeout(Duration::from_secs(5), accepted.recv()).await;
+        assert_eq!(
+            first,
+            Ok(Some("/ok".to_string())),
+            "request with conflicting content-lengths must be refused"
+        );
+
+        // The server's RST_STREAM for the POST: its error code.
+        let reset = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut head = [0u8; 9];
+            loop {
+                client.read_exact(&mut head).await.ok()?;
+                let mut payload = vec![0; u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize];
+                client.read_exact(&mut payload).await.ok()?;
+                if head[3] == 0x3 && u32::from_be_bytes(head[5..9].try_into().unwrap()) == 1 {
+                    return Some(u32::from_be_bytes(payload[..4].try_into().unwrap()));
+                }
+            }
+        })
+        .await;
+        assert_eq!(reset, Ok(Some(0x1)), "expected RST_STREAM(PROTOCOL_ERROR)");
+    }
+
     // A client's SETTINGS_HEADER_TABLE_SIZE is a ceiling for the HPACK encoder, not a
     // target (RFC 7541 §4.2). h2 < 0.4.17 sized the response encoder's dynamic table
     // to whatever the client advertised (up to 4 GiB), so nothing was ever evicted and
