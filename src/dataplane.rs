@@ -79,6 +79,20 @@ impl ProxyHttp for GatewayProxy {
         RequestCtx::default()
     }
 
+    /// Bound how long an h1 connection may idle before its next request. Pingora's
+    /// `read_request()` switches the connection's idle timeout to "infinite" for
+    /// HTTP/1.1 (and for `Connection: keep-alive`), and its keep-alive loop carries
+    /// that on to every later request: after one request, a client that sends nothing
+    /// more (or an unfinished head) held the connection forever. This runs right
+    /// after `read_request()` on both h1 paths, before any response.
+    async fn early_request_filter(&self, session: &mut Session, _ctx: &mut Self::CTX) -> Result<()> {
+        // None: the connection closes after this request. Also None for h2.
+        if session.get_keepalive().is_some() {
+            session.set_keepalive(Some(H1_IDLE_TIMEOUT.as_secs()));
+        }
+        Ok(())
+    }
+
     /// Match the request against the route table and stash the chosen backend.
     /// If nothing matches, send a 404 and short-circuit.
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
@@ -885,9 +899,14 @@ const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// accept loop's `from_h2_conn().await` blocks with no bound. Real browsers prefer
 /// h2 (ALPN) and keep connections open, so without this they accumulate one live
 /// task + buffers each until the process OOMs (observed in prod: thousands of
-/// idle ESTABLISHED :443 connections). The h1 path is already bounded by its 60s
-/// keepalive; this gives h2 the equivalent. Matches nginx's ~75s keepalive_timeout.
+/// idle ESTABLISHED :443 connections). [`H1_IDLE_TIMEOUT`] is the h1 equivalent.
+/// Matches nginx's ~75s keepalive_timeout.
 const H2_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
+
+/// Idle timeout for an HTTP/1.x connection: how long it may wait for (each read of)
+/// the next request head. A whole number of seconds (Pingora's keepalive unit). 60s
+/// is what Pingora's plain-HTTP accept loop uses for the first request.
+const H1_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long `GatewayTlsApp::serve_h2_streams` tries to flush the GOAWAY when it cuts
 /// off a client that keeps opening streams over the task cap. Such a client may not
@@ -1053,8 +1072,13 @@ impl GatewayTlsApp {
         use pingora_core::protocols::http::ServerSession;
 
         let mut session = ServerSession::new_http1(stream);
-        // Default keepalive (60s), or none while shutting down.
-        session.set_keepalive(if *shutdown.borrow() { None } else { Some(60) });
+        // Idle timeout for the first request, or none while shutting down. The later
+        // ones get it from `GatewayProxy::early_request_filter`.
+        session.set_keepalive(if *shutdown.borrow() {
+            None
+        } else {
+            Some(H1_IDLE_TIMEOUT.as_secs())
+        });
 
         let mut result = self.proxy.process_new_http(session, shutdown).await;
         while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
@@ -1614,6 +1638,41 @@ mod tests {
             .expect("the write must give up")
             .expect_err("must time out");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    // Pingora's read_request() turns the h1 idle timeout into "infinite" for HTTP/1.1
+    // and `Connection: keep-alive`, and the keep-alive loop hands the request's value
+    // on to the next one on the connection. early_request_filter must put the idle
+    // timeout back, and leave a connection that closes after the request closing.
+    #[tokio::test]
+    async fn h1_idle_timeout_survives_the_request() {
+        use pingora_core::apps::HttpPersistentSettings;
+        use pingora_core::protocols::http::ServerSession;
+
+        let proxy = GatewayProxy::new(DataPlane::new(), vec![]);
+        let idle = Some(H1_IDLE_TIMEOUT.as_secs());
+        for (head, want) in [
+            ("GET / HTTP/1.1\r\nHost: a\r\n\r\n", idle),
+            ("GET / HTTP/1.1\r\nHost: a\r\nConnection: keep-alive\r\n\r\n", idle),
+            ("GET / HTTP/1.0\r\nHost: a\r\nConnection: keep-alive\r\n\r\n", idle),
+            ("GET / HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n", None),
+            ("GET / HTTP/1.0\r\nHost: a\r\n\r\n", None),
+        ] {
+            let (mut client, server_io) = tokio::io::duplex(1024);
+            client.write_all(head.as_bytes()).await.unwrap();
+            let mut session = Session::new_h1(Box::new(server_io));
+            session.set_keepalive(idle);
+            assert!(session.read_request().await.unwrap());
+            proxy
+                .early_request_filter(&mut session, &mut proxy.new_ctx())
+                .await
+                .unwrap();
+            assert_eq!(session.get_keepalive(), want, "{head:?}");
+
+            let mut next = ServerSession::new_http1(Box::new(tokio::io::duplex(1).1));
+            HttpPersistentSettings::for_session(&session).apply_to_session(&mut next);
+            assert_eq!(next.get_keepalive(), want, "next request after {head:?}");
+        }
     }
 
     /// One raw HTTP/2 frame: 9-byte header (length, type, flags, stream id) + payload.
