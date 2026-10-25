@@ -2998,6 +2998,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "async-trait",
+ "bytes",
  "clap",
  "futures",
  "gateway-api",

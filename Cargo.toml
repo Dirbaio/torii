@@ -44,6 +44,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 anyhow = "1"
 async-trait = "0.1"
 arc-swap = "1"
+bytes = "1" # Pingora's body chunk type (ProxyHttp::request_body_filter)
 http = "1"
 futures = "0.3"
 regex = "1" # HTTPRoute header match type=RegularExpression
