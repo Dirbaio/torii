@@ -272,14 +272,33 @@ impl ProxyHttp for GatewayProxy {
     async fn request_body_filter(
         &self,
         session: &mut Session,
-        _body: &mut Option<Bytes>,
+        body: &mut Option<Bytes>,
         end_of_stream: bool,
         _ctx: &mut Self::CTX,
     ) -> Result<()>
     where
         Self::CTX: Send + Sync,
     {
-        H2BodyProgress::report(session.req_header(), end_of_stream);
+        H2BodyProgress::chunk(session.req_header(), body, end_of_stream);
+        Ok(())
+    }
+
+    /// Start the HTTP/2 request-body stall watchdog's clock (see [`H2BodyProgress`]):
+    /// the proxy reads the body only from here on.
+    async fn connected_to_upstream(
+        &self,
+        session: &mut Session,
+        _reused: bool,
+        _peer: &HttpPeer,
+        #[cfg(unix)] _fd: std::os::unix::io::RawFd,
+        #[cfg(windows)] _sock: std::os::windows::io::RawSocket,
+        _digest: Option<&pingora_core::protocols::Digest>,
+        _ctx: &mut Self::CTX,
+    ) -> Result<()>
+    where
+        Self::CTX: Send + Sync,
+    {
+        H2BodyProgress::reading(session.req_header());
         Ok(())
     }
 
@@ -373,8 +392,7 @@ impl ProxyHttp for GatewayProxy {
         Ok(Box::new(peer))
     }
 
-    /// Map upstream timeouts to HTTP 504 (Gateway Timeout) per Gateway API;
-    /// otherwise fall back to the default 502/5xx mapping.
+    /// Answer a request that could not be proxied (see [`fail_to_proxy_status`]).
     async fn fail_to_proxy(
         &self,
         session: &mut Session,
@@ -384,16 +402,7 @@ impl ProxyHttp for GatewayProxy {
     where
         Self::CTX: Send + Sync,
     {
-        use pingora_core::{ErrorSource, ErrorType};
-        let code = match e.etype() {
-            ErrorType::ReadTimedout | ErrorType::ConnectTimedout | ErrorType::WriteTimedout => 504,
-            ErrorType::HTTPStatus(c) => *c,
-            _ => match e.esource() {
-                ErrorSource::Upstream => 502,
-                ErrorSource::Downstream => 0, // connection already dead
-                _ => 500,
-            },
-        };
+        let code = fail_to_proxy_status(e);
         if code > 0 && session.response_written().is_none() {
             let _ = session.respond_error(code).await;
         }
@@ -401,6 +410,22 @@ impl ProxyHttp for GatewayProxy {
             error_code: code,
             can_reuse_downstream: false,
         }
+    }
+}
+
+/// The status for a request that failed to proxy with `e`, 0 for none: upstream
+/// timeouts are 504 (Gateway Timeout) per Gateway API, other upstream errors 502. A
+/// client that timed out is not a gateway timeout: one that stopped sending its
+/// request gets a 408, and one that stopped reading (or is gone) gets nothing.
+fn fail_to_proxy_status(e: &pingora_core::Error) -> u16 {
+    use pingora_core::{ErrorSource, ErrorType};
+    match (e.esource(), e.etype()) {
+        (_, ErrorType::HTTPStatus(c)) => *c,
+        (ErrorSource::Downstream, ErrorType::ReadTimedout) => 408,
+        (ErrorSource::Downstream, _) => 0,
+        (_, ErrorType::ReadTimedout | ErrorType::ConnectTimedout | ErrorType::WriteTimedout) => 504,
+        (ErrorSource::Upstream, _) => 502,
+        _ => 500,
     }
 }
 
@@ -817,8 +842,10 @@ fn install_cert(ssl: &mut pingora_core::tls::ssl::SslRef, ck: &crate::cert_store
 struct BoxedStream {
     stream: pingora_core::protocols::Stream,
     write_timeout: std::time::Duration,
-    /// Armed when a write first returns `Pending`, cleared when one completes.
-    write_stall: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    /// The deadline of a stalled write, armed when a write first returns `Pending`
+    /// (`stalled`) and disarmed when one completes.
+    write_stall: std::pin::Pin<Box<tokio::time::Sleep>>,
+    stalled: bool,
 }
 
 impl BoxedStream {
@@ -826,7 +853,8 @@ impl BoxedStream {
         BoxedStream {
             stream,
             write_timeout,
-            write_stall: None,
+            write_stall: Box::pin(tokio::time::sleep(write_timeout)),
+            stalled: false,
         }
     }
 
@@ -838,14 +866,14 @@ impl BoxedStream {
         poll: std::task::Poll<std::io::Result<T>>,
     ) -> std::task::Poll<std::io::Result<T>> {
         if poll.is_ready() {
-            self.write_stall = None;
+            self.stalled = false;
             return poll;
         }
-        let timeout = self.write_timeout;
-        let stall = self
-            .write_stall
-            .get_or_insert_with(|| Box::pin(tokio::time::sleep(timeout)));
-        stall.as_mut().poll(cx).map(|()| {
+        if !std::mem::replace(&mut self.stalled, true) {
+            let deadline = tokio::time::Instant::now() + self.write_timeout;
+            self.write_stall.as_mut().reset(deadline);
+        }
+        self.write_stall.as_mut().poll(cx).map(|()| {
             Err(std::io::Error::new(
                 std::io::ErrorKind::TimedOut,
                 "write to client stalled",
@@ -872,6 +900,18 @@ impl tokio::io::AsyncWrite for BoxedStream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         let poll = std::pin::Pin::new(&mut *self.stream).poll_write(cx, buf);
         self.bound_write(cx, poll)
+    }
+    // Pingora writes a chunk's size line, data and CRLF in one vectored write.
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        let poll = std::pin::Pin::new(&mut *self.stream).poll_write_vectored(cx, bufs);
+        self.bound_write(cx, poll)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
     }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
@@ -1060,6 +1100,16 @@ impl tokio::io::AsyncWrite for H1Stream {
     ) -> std::task::Poll<std::io::Result<usize>> {
         std::pin::Pin::new(&mut *self.stream).poll_write(cx, buf)
     }
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.stream).poll_write_vectored(cx, bufs)
+    }
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -1182,11 +1232,18 @@ const PIPE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 
 /// How long an HTTP client may stall an exchange before torii gives up on it: leave a
 /// response write without progress (it stopped reading, or keeps an h2 stream's
-/// flow-control window closed), or leave an announced h2 request body without data.
-/// Pingora waits forever on all of these, holding the upstream connection and up to
+/// flow-control window closed), or keep torii waiting on an h2 request body (see
+/// [`H2_MIN_BODY_PROGRESS`]). Pingora waits forever on all of these, holding the upstream connection and up to
 /// ~0.5 MB of buffered response per exchange. 60s is Pingora's h1 read timeout and
 /// nginx's `send_timeout` / `client_body_timeout`.
 const CLIENT_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The least an HTTP/2 request body must bring for each [`CLIENT_STALL_TIMEOUT`] that
+/// torii waits for it, unless it ends: one DATA frame of the default maximum size,
+/// ~270 B/s. If any data reset the clock, a client could send a
+/// byte per stream every minute and hold all of a connection's streams, each with its
+/// upstream connection, for as long as it liked. Apache asks 500 B/s of a request body.
+const H2_MIN_BODY_PROGRESS: u64 = 16 * 1024;
 
 /// Cap on concurrent HTTP/2 streams per connection (SETTINGS_MAX_CONCURRENT_STREAMS,
 /// RFC 9113 §6.5.2). Our terminate-then-HTTP h2 accept loop spawns one task per
@@ -1194,7 +1251,8 @@ const CLIENT_STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs
 /// many. 100 is Pingora's own default and the RFC's recommended minimum. It also
 /// bounds what one connection can hold: a client that does not read leaves up to
 /// ~0.5 MB of upstream response buffered per stream for `CLIENT_STALL_TIMEOUT`, so
-/// one connection pins at most ~50 MB and 100 upstream connections.
+/// one connection pins ~50 MB and 100 upstream connections that long (one that reads
+/// slowly holds ~0.7 MB a stream for as long as it reads).
 ///
 /// The setting alone does not bound the tasks: a stream the client resets stops
 /// counting toward it at once, while its task runs on until the proxy notices, which
@@ -1227,6 +1285,13 @@ const H2_MAX_HEADER_LIST_SIZE: u32 = 32 * 1024;
 /// 512 MiB torii). `GatewayTlsApp::serve_h2_streams` answers a longer head with a 431,
 /// as h2 does an over-size one, before the stream gets a task or the proxy copies it.
 const H2_MAX_HEADER_FIELDS: usize = 256;
+
+/// Cap on the response data h2 holds per stream that it has not written to the
+/// connection yet (h2's default is 400 KiB). A client that reads slowly fills it on
+/// every stream, on top of the ~0.5 MB the proxy reads ahead from the backend: one
+/// connection reading ~1 Mbit/s held 100 streams and ~100 MB. 64 KiB is one chunk of
+/// the proxy's body reads, and the chunks it reads ahead keep a fast stream fed.
+const H2_MAX_SEND_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Deadline for completing the downstream TLS handshake, on TLSRoute Terminate and the
 /// HTTPS fallback alike (see `GatewayTlsApp::tls_accept`). A client that opens TCP and
@@ -1275,6 +1340,7 @@ fn h2_server_options() -> pingora_core::protocols::http::v2::server::H2Options {
     let mut options = pingora_core::protocols::http::v2::server::default_h2_options();
     options.max_header_list_size(H2_MAX_HEADER_LIST_SIZE);
     options.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+    options.max_send_buffer_size(H2_MAX_SEND_BUFFER_SIZE);
     options
 }
 
@@ -1473,10 +1539,10 @@ impl GatewayTlsApp {
     /// work as a closure so tests can drive the loop without a proxy.
     ///
     /// A stream's client may stall it for at most `stall_timeout`: a response write
-    /// that makes no progress fails, and a request body that goes that long without
-    /// data (see [`H2BodyProgress`]) gets the stream reset. The connection's
-    /// [`BoxedStream`] cannot see either, as h2 flow control stalls a stream while the
-    /// connection itself keeps moving.
+    /// that makes no progress fails, and a request body that torii waits that long for
+    /// without getting [`H2_MIN_BODY_PROGRESS`] (see [`H2BodyProgress`]) gets the
+    /// stream reset. The connection's [`BoxedStream`] cannot see either, as h2 flow
+    /// control stalls a stream while the connection itself keeps moving.
     async fn serve_h2_streams<F, Fut>(
         stream: pingora_core::protocols::Stream,
         stall_timeout: std::time::Duration,
@@ -1586,7 +1652,7 @@ impl GatewayTlsApp {
                     }
                     // Bound how long the client can stall this stream (see above).
                     session.set_write_timeout(Some(stall_timeout));
-                    let (progress, body_done) = tokio::sync::watch::channel(session.is_body_done());
+                    let (progress, body) = tokio::sync::watch::channel(H2BodyState::new(session.is_body_done()));
                     session
                         .req_header_mut()
                         .extensions
@@ -1597,7 +1663,7 @@ impl GatewayTlsApp {
                         // upstream connection.
                         tokio::select! {
                             () = stream => {}
-                            () = h2_body_stalled(body_done, stall_timeout) => {
+                            () = h2_body_stalled(body, stall_timeout) => {
                                 tracing::debug!("HTTPS h2 request body stalled; resetting the stream");
                             }
                         }
@@ -1614,33 +1680,132 @@ impl GatewayTlsApp {
 }
 
 /// The request-body progress of an HTTP/2 stream, carried in its request's
-/// extensions: `true` once the body is complete. Pingora reads an h2 request body
-/// with no timeout (`set_read_timeout` does nothing for h2), so a stream that
-/// announces a body and never sends it would hold its task and upstream connection
-/// forever. The proxy reports each chunk it reads, and
-/// [`GatewayTlsApp::serve_h2_streams`] resets a stream whose body stalls.
+/// extensions. Pingora reads an h2 request body with no timeout (`set_read_timeout`
+/// does nothing for h2), so a stream that announces a body and never sends it, or
+/// sends it a byte at a time, would hold its task and upstream connection forever.
+/// The proxy reports when it starts reading the body and each chunk it reads, and
+/// [`GatewayTlsApp::serve_h2_streams`] resets a stream whose client stalls it (see
+/// [`h2_body_stalled`]).
 #[derive(Clone)]
-struct H2BodyProgress(Arc<tokio::sync::watch::Sender<bool>>);
+struct H2BodyProgress(Arc<tokio::sync::watch::Sender<H2BodyState>>);
 
 impl H2BodyProgress {
-    /// Report a chunk of `req`'s body, `end` for the last one. A no-op for requests
-    /// without a watchdog (HTTP/1, whose body reads Pingora times out itself).
-    fn report(req: &pingora_http::RequestHeader, end: bool) {
+    /// Report that the proxy is connected upstream, so it reads `req`'s body from now
+    /// on. A no-op for requests without a watchdog (HTTP/1, whose body reads Pingora
+    /// times out itself), as is [`Self::chunk`].
+    fn reading(req: &pingora_http::RequestHeader) {
         if let Some(progress) = req.extensions.get::<Self>() {
-            progress.0.send_replace(end);
+            progress
+                .0
+                .send_if_modified(|s| !std::mem::replace(&mut s.reading, true));
+        }
+    }
+
+    /// Report a chunk of `req`'s body that the proxy read, `end` for the last one, and
+    /// track `body` until the upstream side has taken it.
+    fn chunk(req: &pingora_http::RequestHeader, body: &mut Option<Bytes>, end: bool) {
+        let Some(progress) = req.extensions.get::<Self>() else {
+            return;
+        };
+        let len = body.as_ref().map_or(0, |b| b.len() as u64);
+        let track = !end && len > 0;
+        progress.0.send_modify(|s| {
+            s.done |= end;
+            s.owed = s.owed.saturating_sub(len);
+            if s.owed == 0 {
+                s.paid += 1;
+                s.owed = H2_MIN_BODY_PROGRESS;
+            }
+            s.in_flight += usize::from(track);
+        });
+        if track && let Some(data) = body.take() {
+            let progress = progress.clone();
+            *body = Some(Bytes::from_owner(H2BodyChunk { data, progress }));
         }
     }
 }
 
-/// Resolve once an h2 request body has gone `timeout` without a reported chunk.
-/// Never resolves once the body is complete.
-async fn h2_body_stalled(mut done: tokio::sync::watch::Receiver<bool>, timeout: std::time::Duration) {
-    while !*done.borrow_and_update() {
-        match tokio::time::timeout(timeout, done.changed()).await {
-            Ok(Ok(())) => {}
-            // The request is gone, and its stream with it.
-            Ok(Err(_)) => break,
-            Err(_) => return,
+/// What the stall watchdog of an h2 request body knows of it.
+#[derive(Clone, Copy, Debug)]
+struct H2BodyState {
+    /// The proxy reads the body: it is connected upstream. It reads none before.
+    reading: bool,
+    /// Chunks the proxy read that the upstream side has not taken yet. While there are
+    /// any, the proxy may be waiting on the backend (its body pipe there is full), and
+    /// h2 flow control then holds the client back through no fault of its own.
+    in_flight: usize,
+    /// What the client still owes of its current stretch of [`H2_MIN_BODY_PROGRESS`],
+    /// and how many stretches it has paid.
+    owed: u64,
+    paid: u64,
+    /// The body is complete.
+    done: bool,
+}
+
+impl H2BodyState {
+    fn new(done: bool) -> Self {
+        H2BodyState {
+            reading: false,
+            in_flight: 0,
+            owed: H2_MIN_BODY_PROGRESS,
+            paid: 0,
+            done,
+        }
+    }
+
+    /// Whether torii is waiting on the client for more of the body.
+    fn waiting_on_client(&self) -> bool {
+        self.reading && self.in_flight == 0 && !self.done
+    }
+}
+
+/// A chunk of an h2 request body on its way upstream. The proxy's upstream side drops
+/// it once it has written it to the backend.
+struct H2BodyChunk {
+    data: Bytes,
+    progress: H2BodyProgress,
+}
+
+impl AsRef<[u8]> for H2BodyChunk {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+impl Drop for H2BodyChunk {
+    fn drop(&mut self) {
+        self.progress.0.send_modify(|s| s.in_flight -= 1);
+    }
+}
+
+/// Resolve once the client has stalled an h2 request body: torii has waited
+/// `timeout` in all for its current stretch of [`H2_MIN_BODY_PROGRESS`], counting only
+/// the time it waits on the client (see [`H2BodyState::waiting_on_client`]), as
+/// Pingora's h1 body read timeout runs only while a read waits. Never resolves once
+/// the body is complete.
+async fn h2_body_stalled(mut body: tokio::sync::watch::Receiver<H2BodyState>, timeout: std::time::Duration) {
+    let (mut paid, mut left) = (0, timeout);
+    loop {
+        let state = *body.borrow_and_update();
+        if state.done {
+            break;
+        }
+        if state.paid != paid {
+            (paid, left) = (state.paid, timeout);
+        }
+        let changed = if state.waiting_on_client() {
+            let since = tokio::time::Instant::now();
+            let Ok(changed) = tokio::time::timeout(left, body.changed()).await else {
+                return;
+            };
+            left = left.saturating_sub(since.elapsed());
+            changed
+        } else {
+            body.changed().await
+        };
+        // The request is gone, and its stream with it.
+        if changed.is_err() {
+            break;
         }
     }
     std::future::pending().await
@@ -2081,7 +2246,7 @@ mod tests {
     // A downstream write fails once the client has accepted nothing for the write
     // timeout, so a client that stops reading can't hold the connection. One that
     // reads slowly keeps a write going for longer than that.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn downstream_write_times_out_when_client_stops_reading() {
         let (mut client, server) = tokio::io::duplex(64);
         let mut stream = BoxedStream::new(Box::new(server), Duration::from_millis(150));
@@ -2108,6 +2273,29 @@ mod tests {
             .expect("the write must give up")
             .expect_err("must time out");
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    // The streams torii runs a downstream connection on keep its vectored writes, which
+    // Pingora uses to send a body chunk's size line, data and CRLF in one syscall
+    // (instead of three, each a TCP segment of its own with TCP_NODELAY).
+    #[tokio::test]
+    async fn downstream_streams_write_vectored() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap());
+        let (client, server) = tokio::join!(client, listener.accept());
+        let (mut client, server) = (client.unwrap(), server.unwrap().0);
+        let server = pingora_core::protocols::l4::stream::Stream::from(server);
+        let boxed = BoxedStream::new(Box::new(server), CLIENT_STALL_TIMEOUT);
+        let mut stream = H1Stream::new(Box::new(boxed));
+        assert!(tokio::io::AsyncWrite::is_write_vectored(&stream));
+
+        let bufs = [b"5\r\n".as_slice(), b"hello", b"\r\n"].map(std::io::IoSlice::new);
+        let written = stream.write_vectored(&bufs).await.unwrap();
+        assert_eq!(written, 10, "one write must take every slice");
+        stream.flush().await.unwrap();
+        let mut got = [0; 10];
+        client.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"5\r\nhello\r\n");
     }
 
     // Pingora's read_request() turns the h1 idle timeout into "infinite" for HTTP/1.1
@@ -2658,60 +2846,30 @@ mod tests {
         assert!(start.elapsed() >= stall, "timed out early: {:?}", start.elapsed());
     }
 
-    // Pingora reads an h2 request body with no timeout. A stream whose body stops
-    // arriving must be reset once it has gone the stall timeout without data, while
-    // streams with a slow but steady body, or with no body, keep running.
-    #[tokio::test]
-    async fn h2_stalled_request_body_is_reset() {
-        let stall = Duration::from_millis(300);
-        let (client, server_io) = tokio::io::duplex(64 * 1024);
-        tokio::spawn(GatewayTlsApp::serve_h2_streams(
-            Box::new(server_io),
-            stall,
-            |mut session| async move {
-                // Like the proxy: read the body, reporting each chunk, then keep the
-                // stream open as a long response would.
-                while let Ok(Some(_)) = session.read_body_bytes().await {
-                    H2BodyProgress::report(session.req_header(), false);
-                }
-                H2BodyProgress::report(session.req_header(), true);
-                std::future::pending().await
-            },
-        ));
-        let (mut rd, mut wr) = tokio::io::split(client);
+    /// An h2 request head (HPACK): method (static 2 = GET, 3 = POST), :scheme https (7),
+    /// :path and :authority literals without indexing, then a content-length (name
+    /// index 28) if given.
+    fn h2_request(method: u8, path: &str, content_length: Option<usize>) -> Vec<u8> {
+        let mut block = vec![method, 0x87, 0x04, path.len() as u8];
+        block.extend(path.as_bytes());
+        block.extend([0x01, 0x01, b'a']);
+        if let Some(len) = content_length {
+            let len = len.to_string();
+            block.extend([0x0f, 0x0d, len.len() as u8]);
+            block.extend(len.as_bytes());
+        }
+        block
+    }
 
-        // HPACK: method (static 2 = GET, 3 = POST), :scheme https (7), :path and
-        // :authority literals without indexing, then for a POST content-length: 100
-        // (name index 28).
-        let request = |method: u8, path: &str| {
-            let mut block = vec![method, 0x87, 0x04, path.len() as u8];
-            block.extend(path.as_bytes());
-            block.extend([0x01, 0x01, b'a']);
-            if method == 0x83 {
-                block.extend([0x0f, 0x0d, 0x03, b'1', b'0', b'0']);
-            }
-            block
-        };
-        // Stream 1 announces a body and never sends it; stream 3 sends its body in 10
-        // bytes every 50 ms, for longer than the stall timeout; stream 5 has no body.
-        let start = tokio::time::Instant::now();
-        let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
-        req.extend(h2_frame(0x4, 0, 0, &[]));
-        req.extend(h2_frame(0x1, 0x4, 1, &request(0x83, "/stalled"))); // HEADERS, END_HEADERS
-        req.extend(h2_frame(0x1, 0x4, 3, &request(0x83, "/slow")));
-        req.extend(h2_frame(0x1, 0x5, 5, &request(0x82, "/get"))); // END_STREAM|END_HEADERS
-        wr.write_all(&req).await.unwrap();
-        tokio::spawn(async move {
-            for i in 0..10 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-                let end_stream = if i == 9 { 0x1 } else { 0 };
-                wr.write_all(&h2_frame(0x0, end_stream, 3, &[b'x'; 10])).await.unwrap();
-            }
-        });
-
-        // The server's RST_STREAMs within 4 stall timeouts: (stream, error code, when).
+    /// The RST_STREAMs an h2 server sends until `start + window`, sorted: (stream, error
+    /// code, when after `start`).
+    async fn h2_resets(
+        rd: &mut (impl tokio::io::AsyncRead + Unpin),
+        start: tokio::time::Instant,
+        window: Duration,
+    ) -> Vec<(u32, u32, Duration)> {
         let mut resets = Vec::new();
-        let _ = tokio::time::timeout(stall * 4, async {
+        let _ = tokio::time::timeout_at(start + window, async {
             let mut head = [0u8; 9];
             loop {
                 rd.read_exact(&mut head).await.unwrap();
@@ -2725,12 +2883,149 @@ mod tests {
             }
         })
         .await;
+        resets.sort();
+        resets
+    }
+
+    /// Read an h2 stream's request body as the proxy does: report that it is connected
+    /// upstream, then each chunk, which the upstream side takes at once.
+    async fn proxy_h2_body(session: &mut pingora_core::protocols::http::v2::server::HttpSession) {
+        H2BodyProgress::reading(session.req_header());
+        loop {
+            let mut chunk = session.read_body_bytes().await.ok().flatten();
+            let end = chunk.is_none() || session.is_body_done();
+            H2BodyProgress::chunk(session.req_header(), &mut chunk, end);
+            if end {
+                return;
+            }
+        }
+    }
+
+    // Pingora reads an h2 request body with no timeout. A stream whose body stops
+    // arriving, or trickles in at less than H2_MIN_BODY_PROGRESS per stall timeout,
+    // must be reset, while streams with a slow but steady body, or with no body, keep
+    // running.
+    #[tokio::test(start_paused = true)]
+    async fn h2_stalled_request_body_is_reset() {
+        let stall = Duration::from_millis(300);
+        let (client, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(GatewayTlsApp::serve_h2_streams(
+            Box::new(server_io),
+            stall,
+            |mut session| async move {
+                // Then keep the stream open as a long response would.
+                proxy_h2_body(&mut session).await;
+                std::future::pending().await
+            },
+        ));
+        let (mut rd, mut wr) = tokio::io::split(client);
+
+        // Stream 1 announces a body and never sends it; stream 3 sends 48 KiB in a
+        // 16 KiB frame every 200 ms; stream 5 has no body; stream 7 sends a byte every
+        // 50 ms, for as long as the test watches. Streams 3 and 7 go on for longer than
+        // the stall timeout.
+        let start = tokio::time::Instant::now();
+        let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        req.extend(h2_frame(0x4, 0, 0, &[]));
+        // HEADERS with END_HEADERS, and END_STREAM for the GET.
+        req.extend(h2_frame(0x1, 0x4, 1, &h2_request(0x83, "/stalled", Some(100))));
+        req.extend(h2_frame(0x1, 0x4, 3, &h2_request(0x83, "/slow", Some(48 * 1024))));
+        req.extend(h2_frame(0x1, 0x5, 5, &h2_request(0x82, "/get", None)));
+        req.extend(h2_frame(0x1, 0x4, 7, &h2_request(0x83, "/trickle", None)));
+        wr.write_all(&req).await.unwrap();
+        tokio::spawn(async move {
+            for tick in 1..=24 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                let mut frames = h2_frame(0x0, 0, 7, b"x");
+                if tick <= 12 && tick % 4 == 0 {
+                    let end_stream = if tick == 12 { 0x1 } else { 0 };
+                    frames.extend(h2_frame(0x0, end_stream, 3, &[b'x'; 16 * 1024]));
+                }
+                if wr.write_all(&frames).await.is_err() {
+                    return;
+                }
+            }
+        });
+
+        let resets = h2_resets(&mut rd, start, stall * 4).await;
         assert_eq!(
             resets.iter().map(|&(s, c, _)| (s, c)).collect::<Vec<_>>(),
-            [(1, 0x8)],
-            "expected only RST_STREAM(CANCEL) for the stalled body"
+            [(1, 0x8), (7, 0x8)],
+            "expected RST_STREAM(CANCEL) for the stalled and the trickled body only"
         );
-        assert!(resets[0].2 >= stall, "reset early: {:?}", resets[0].2);
+        for (stream, _, when) in resets {
+            assert!(when >= stall && when < stall * 2, "stream {stream} reset at {when:?}");
+        }
+    }
+
+    // The body watchdog charges the client only for the time torii waits on it: not
+    // before the proxy is connected upstream and reads the body, nor while a chunk it
+    // read waits for a backend that is slow to take it (h2 flow control then holds the
+    // client back), however long those take.
+    #[tokio::test(start_paused = true)]
+    async fn h2_request_body_clock_runs_only_while_waiting_on_client() {
+        let stall = Duration::from_millis(300);
+        let (client, server_io) = tokio::io::duplex(64 * 1024);
+        let (done_tx, mut done) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(GatewayTlsApp::serve_h2_streams(
+            Box::new(server_io),
+            stall,
+            move |mut session| {
+                let done_tx = done_tx.clone();
+                async move {
+                    // A slow connect, then a backend that takes the first chunk late.
+                    tokio::time::sleep(stall * 3).await;
+                    H2BodyProgress::reading(session.req_header());
+                    let mut first = session.read_body_bytes().await.unwrap();
+                    H2BodyProgress::chunk(session.req_header(), &mut first, session.is_body_done());
+                    tokio::time::sleep(stall * 3).await;
+                    drop(first);
+                    proxy_h2_body(&mut session).await;
+                    let path = session.req_header().uri.path().to_string();
+                    let _ = done_tx.send((path, session.body_bytes_read()));
+                    std::future::pending().await
+                }
+            },
+        ));
+        let (mut rd, mut wr) = tokio::io::split(client);
+
+        // Both streams send the first half of a 32 KiB body at once. Stream 1 sends the
+        // rest at once too, stream 3 never does.
+        let start = tokio::time::Instant::now();
+        let half = [b'x'; 16 * 1024];
+        let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        req.extend(h2_frame(0x4, 0, 0, &[]));
+        for (stream, path) in [(1, "/whole"), (3, "/half")] {
+            req.extend(h2_frame(0x1, 0x4, stream, &h2_request(0x83, path, Some(32 * 1024))));
+            req.extend(h2_frame(0x0, 0, stream, &half));
+        }
+        req.extend(h2_frame(0x0, 0x1, 1, &half)); // END_STREAM
+        wr.write_all(&req).await.unwrap();
+
+        let resets = h2_resets(&mut rd, start, stall * 10).await;
+        assert_eq!(done.try_recv(), Ok(("/whole".to_string(), 32 * 1024)));
+        // Stream 3's clock starts once the backend has taken its first chunk.
+        assert_eq!(resets.iter().map(|&(s, c, _)| (s, c)).collect::<Vec<_>>(), [(3, 0x8)]);
+        assert!(resets[0].2 >= stall * 7, "reset early: {:?}", resets[0].2);
+    }
+
+    // fail_to_proxy answers an upstream timeout with a 504, but a client that timed out
+    // is not a gateway timeout.
+    #[test]
+    fn fail_to_proxy_status_blames_the_side_that_failed() {
+        use pingora_core::ErrorType::*;
+        let status = |e: Box<pingora_core::Error>| fail_to_proxy_status(&e);
+        assert_eq!(status(pingora_core::Error::new_up(ReadTimedout)), 504);
+        assert_eq!(status(pingora_core::Error::new_up(ConnectTimedout)), 504);
+        assert_eq!(status(pingora_core::Error::new_up(WriteTimedout)), 504);
+        assert_eq!(status(pingora_core::Error::new_up(ConnectRefused)), 502);
+        assert_eq!(status(pingora_core::Error::new_in(HTTPStatus(503))), 503);
+        assert_eq!(status(pingora_core::Error::new_in(InternalError)), 500);
+        // The client stopped reading, or is gone: no response would reach it.
+        assert_eq!(status(pingora_core::Error::new_down(WriteTimedout)), 0);
+        assert_eq!(status(pingora_core::Error::new_down(ConnectionClosed)), 0);
+        // The client stopped sending its request body.
+        assert_eq!(status(pingora_core::Error::new_down(ReadTimedout)), 408);
     }
 
     /// A TLS app on an empty data plane (handshakes get the self-signed fallback cert).

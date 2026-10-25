@@ -45,7 +45,7 @@ rustls = { version = "0.23", default-features = false, features = ["ring"] }
 anyhow = "1"
 async-trait = "0.1"
 arc-swap = "1"
-bytes = "1" # Pingora's body chunk type (ProxyHttp::request_body_filter)
+bytes = "1.9" # Pingora's body chunk type (ProxyHttp::request_body_filter); 1.9 for Bytes::from_owner
 http = "1"
 futures = "0.3"
 regex = "1" # HTTPRoute header match type=RegularExpression
@@ -71,3 +71,6 @@ x509-parser = "0.16" # read cert notAfter for renewal scheduling
 # fragments far less and decays memory back to the OS, bounding steady-state RSS.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = "0.6"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] } # paused time for the timeout tests
