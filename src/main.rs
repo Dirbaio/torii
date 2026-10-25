@@ -101,13 +101,29 @@ struct Cli {
     #[arg(long, env = "TORII_MAX_CONNECTIONS_PER_SOURCE", default_value_t = 256)]
     max_connections_per_source: usize,
 
+    /// Most requests to backends one client may have in flight at once, on all ports
+    /// together, from routing to the end of the response (a WebSocket's lifetime);
+    /// its requests over this get a 503. A client is as for
+    /// `--max-connections-per-source`, and the same advice applies.
+    #[arg(long, env = "TORII_MAX_REQUESTS_PER_SOURCE", default_value_t = 128)]
+    max_requests_per_source: usize,
+
     /// Most connections open at once, on all ports together; new ones over this are
-    /// closed as they come. Defaults to one per 128 KiB of the memory limit
-    /// (`limits.memory`, from cgroup v2), about twice what an idle TLS connection
-    /// costs, so that connections cannot exhaust it. No limit without a memory
-    /// limit, or with `0`.
+    /// closed as they come, and in its last quarter, those from clients that already
+    /// have 1/16 of `--max-connections-per-source`. Defaults to one per 128 KiB of
+    /// the memory limit (`limits.memory`, from cgroup v2), about twice what an idle
+    /// TLS connection costs, so that connections cannot exhaust it. No limit without
+    /// a memory limit, or with `0`.
     #[arg(long, env = "TORII_MAX_CONNECTIONS")]
     max_connections: Option<usize>,
+
+    /// Most requests to backends in flight at once, on all ports together; new ones
+    /// over this get a 503, and in its last quarter, those from clients that already
+    /// have 1/16 of `--max-requests-per-source` in flight. Defaults to one per 2 MiB
+    /// of the memory limit, about twice what one holds while its client does not
+    /// read the response. No limit without a memory limit, or with `0`.
+    #[arg(long, env = "TORII_MAX_REQUESTS")]
+    max_requests: Option<usize>,
 
     /// Enable automatic TLS certificate issuance via ACME (TLS-ALPN-01).
     /// OFF by default; even when on, a Gateway must opt in by carrying the
@@ -175,13 +191,31 @@ async fn run(args: Cli) -> Result<()> {
         response: enabled(args.upstream_timeout),
     };
     let allow_encoded_slashes = args.allow_encoded_slashes;
+    let memory_limit = conn_limit::memory_limit();
+    let cap = |n: usize| Some(n).filter(|&n| n > 0);
     let limits = conn_limit::ConnLimits {
-        per_source: Some(args.max_connections_per_source).filter(|&n| n > 0),
-        total: match args.max_connections {
-            Some(n) => Some(n).filter(|&n| n > 0),
-            None => conn_limit::default_max_connections(),
+        connections: conn_limit::Caps {
+            per_source: cap(args.max_connections_per_source),
+            total: match args.max_connections {
+                Some(n) => cap(n),
+                None => memory_limit.map(conn_limit::default_max_connections),
+            },
+        },
+        requests: conn_limit::Caps {
+            per_source: cap(args.max_requests_per_source),
+            total: match args.max_requests {
+                Some(n) => cap(n),
+                None => memory_limit.map(conn_limit::default_max_requests),
+            },
         },
     };
+    if memory_limit.is_none() && (args.max_connections.is_none() || args.max_requests.is_none()) {
+        tracing::warn!(
+            "no memory limit found (limits.memory, read from cgroup v2), so the connections and requests that \
+             --max-connections and --max-requests do not cap have no global cap: a flood from many clients can \
+             exhaust memory"
+        );
+    }
     std::thread::Builder::new()
         .name("dataplane".into())
         .spawn(move || {

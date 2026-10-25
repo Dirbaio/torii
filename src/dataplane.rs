@@ -31,6 +31,9 @@ pub struct GatewayProxy {
     timeouts: UpstreamTimeouts,
     /// Forward request paths with an encoded `/` or `\` (see [`normalize_path`]).
     allow_encoded_slashes: bool,
+    /// The request caps, counted together with the other proxy's (see
+    /// [`RequestCtx::slot`]).
+    limiter: Arc<ConnLimiter>,
 }
 
 /// Deadlines for torii's connections and requests to backends (the `--upstream-*`
@@ -69,6 +72,10 @@ pub struct RequestCtx {
     /// attacker-controlled and must not be honored (it would let a client spoof
     /// its source IP past rate-limits / geo-blocking).
     fwd: Forwarded,
+    /// The request's slot under the request caps, taken once it is routed to a
+    /// backend and held until it ends (see `conn_limit`): while its client does not
+    /// read the response, it holds ~1 MB of it.
+    slot: Option<ConnPermit>,
 }
 
 /// Values for the `X-Forwarded-*` headers, captured from the inbound request.
@@ -91,12 +98,14 @@ impl GatewayProxy {
         tls_ports: Vec<u16>,
         timeouts: UpstreamTimeouts,
         allow_encoded_slashes: bool,
+        limiter: Arc<ConnLimiter>,
     ) -> Self {
         GatewayProxy {
             data_plane,
             tls_ports,
             timeouts,
             allow_encoded_slashes,
+            limiter,
         }
     }
 }
@@ -250,6 +259,13 @@ impl ProxyHttp for GatewayProxy {
                 Ok(true)
             }
             Some((ep, backend)) => {
+                let peer = session.client_addr().and_then(|a| a.as_inet()).map(|a| a.ip());
+                let Some(slot) = self.limiter.admit_request(peer) else {
+                    tracing::debug!(%host, %path, "over the request caps -> 503");
+                    session.respond_error(503).await?;
+                    return Ok(true);
+                };
+                ctx.slot = Some(slot);
                 tracing::debug!(%host, %path, %method, ip = %ep.ip, port = ep.port, "matched route");
                 // Rule-level filters plus the chosen backend's per-backendRef filters.
                 ctx.filters = entry.filters.merged_with(&backend.filters);
@@ -1230,6 +1246,17 @@ const PEEK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// would otherwise keep the pipe active forever (see [`BoxedStream`]).
 const PIPE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
+/// Most response data the kernel may hold unsent on a downstream connection
+/// (`TCP_NOTSENT_LOWAT`): a write waits while the socket has this much it could not
+/// send yet. Without it, the send buffer takes as much as autotuning grows it to (up
+/// to 4 MB by default), and a client that stops reading leaves it full: 2.5 MB per
+/// connection on loopback, more than the proxy itself held for the stalled request,
+/// and still held once a response that fit in it had ended. Data in flight is not
+/// limited, so neither is throughput (the same on loopback: ~3.3 GB/s plain, 1.6
+/// GB/s over TLS, 1.2 GB/s over HTTP/2).
+#[cfg(target_os = "linux")]
+const CLIENT_NOTSENT_LOWAT: u32 = 128 * 1024;
+
 /// How long an HTTP client may stall an exchange before torii gives up on it: leave a
 /// response write without progress (it stopped reading, or keeps an h2 stream's
 /// flow-control window closed), or keep torii waiting on an h2 request body (see
@@ -1252,7 +1279,8 @@ const H2_MIN_BODY_PROGRESS: u64 = 16 * 1024;
 /// bounds what one connection can hold: a client that does not read leaves up to
 /// ~0.5 MB of upstream response buffered per stream for `CLIENT_STALL_TIMEOUT`, so
 /// one connection pins ~50 MB and 100 upstream connections that long (one that reads
-/// slowly holds ~0.7 MB a stream for as long as it reads).
+/// slowly holds ~0.7 MB a stream for as long as it reads). The request caps bound how
+/// many such streams a client has on all its connections (see `conn_limit`).
 ///
 /// The setting alone does not bound the tasks: a stream the client resets stops
 /// counting toward it at once, while its task runs on until the proxy notices, which
@@ -1892,15 +1920,37 @@ impl pingora_core::apps::ServerApp for GatewayHttpApp {
 }
 
 /// Take a slot under the connection caps for a new downstream connection, by its
-/// peer address. Both apps take it before any work for the connection (the SNI
-/// peek, the TLS handshake, the HTTP session) and hold it until the connection
-/// ends: they never hand the stream back to Pingora for reuse. Pingora accepts and
-/// spawns a task for every connection, so `None` (over a cap) means closing it.
+/// peer address, and bound what the kernel holds unsent for it (see
+/// [`CLIENT_NOTSENT_LOWAT`]). Both apps take it before any work for the connection
+/// (the SNI peek, the TLS handshake, the HTTP session) and hold it until the
+/// connection ends: they never hand the stream back to Pingora for reuse. Pingora
+/// accepts and spawns a task for every connection, so `None` (over a cap) means
+/// closing it.
 fn admit(limiter: &Arc<ConnLimiter>, stream: &pingora_core::protocols::Stream) -> Option<ConnPermit> {
     let peer = stream
         .get_socket_digest()
         .and_then(|d| d.peer_addr().and_then(|a| a.as_inet()).map(|a| a.ip()));
-    limiter.admit(peer)
+    let permit = limiter.admit(peer)?;
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = tcp_socket(stream)
+        && let Err(e) = socket2::SockRef::from(&fd).set_tcp_notsent_lowat(CLIENT_NOTSENT_LOWAT)
+    {
+        tracing::debug!(error = %e, "setting TCP_NOTSENT_LOWAT failed");
+    }
+    Some(permit)
+}
+
+/// The TCP socket of a downstream connection as Pingora's listener accepted it, or
+/// `None` for another kind of stream.
+#[cfg(target_os = "linux")]
+fn tcp_socket(stream: &pingora_core::protocols::Stream) -> Option<std::os::fd::BorrowedFd<'_>> {
+    use std::os::fd::AsRawFd;
+
+    let tcp = stream
+        .as_any()
+        .downcast_ref::<pingora_core::protocols::l4::stream::Stream>()?;
+    // SAFETY: `tcp` owns the fd and keeps it open for as long as it is borrowed.
+    Some(unsafe { std::os::fd::BorrowedFd::borrow_raw(tcp.as_raw_fd()) })
 }
 
 /// Connect to a TLSRoute backend the way Pingora connects to an HTTP one: within
@@ -2157,14 +2207,21 @@ pub fn run(
     let mut server = Server::new(None).expect("failed to create pingora server");
     server.bootstrap();
 
-    // One count for all ports, so that a source's share is for all of them.
+    // One count for all ports and both proxies, so that a source's share is for all
+    // of them.
     let limiter = ConnLimiter::new(limits);
 
     // Plain-HTTP proxy service. The proxy routes per-port via server_addr().
     let http_app = GatewayHttpApp {
         proxy: Arc::new(http_proxy(
             &server.configuration,
-            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec(), timeouts, allow_encoded_slashes),
+            GatewayProxy::new(
+                data_plane.clone(),
+                tls_ports.to_vec(),
+                timeouts,
+                allow_encoded_slashes,
+                limiter.clone(),
+            ),
         )),
         limiter: limiter.clone(),
     };
@@ -2182,7 +2239,13 @@ pub fn run(
         // Arc<HttpProxy>, not a Service, so we use the http_proxy() factory.
         let proxy = Arc::new(http_proxy(
             &server.configuration,
-            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec(), timeouts, allow_encoded_slashes),
+            GatewayProxy::new(
+                data_plane.clone(),
+                tls_ports.to_vec(),
+                timeouts,
+                allow_encoded_slashes,
+                limiter.clone(),
+            ),
         ));
         let app = GatewayTlsApp {
             data_plane: data_plane.clone(),
@@ -2211,6 +2274,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+    use crate::conn_limit::Caps;
 
     /// Upstream timeouts for the tests whose requests never reach a backend.
     const NO_TIMEOUTS: UpstreamTimeouts = UpstreamTimeouts {
@@ -2218,9 +2282,13 @@ mod tests {
         response: None,
     };
 
-    const NO_LIMITS: ConnLimits = ConnLimits {
+    const NO_CAPS: Caps = Caps {
         per_source: None,
         total: None,
+    };
+    const NO_LIMITS: ConnLimits = ConnLimits {
+        connections: NO_CAPS,
+        requests: NO_CAPS,
     };
 
     // copy_bidirectional_idle relays bytes both ways and ends cleanly on EOF.
@@ -2326,7 +2394,13 @@ mod tests {
         use pingora_core::apps::HttpPersistentSettings;
         use pingora_core::protocols::http::ServerSession;
 
-        let proxy = GatewayProxy::new(DataPlane::new(), vec![], NO_TIMEOUTS, false);
+        let proxy = GatewayProxy::new(
+            DataPlane::new(),
+            vec![],
+            NO_TIMEOUTS,
+            false,
+            ConnLimiter::new(NO_LIMITS),
+        );
         let idle = Some(H1_IDLE_TIMEOUT.as_secs());
         for (head, want) in [
             ("GET / HTTP/1.1\r\nHost: a\r\n\r\n", idle),
@@ -3134,7 +3208,13 @@ mod tests {
         GatewayTlsApp {
             proxy: Arc::new(http_proxy(
                 &conf,
-                GatewayProxy::new(data_plane.clone(), vec![], NO_TIMEOUTS, false),
+                GatewayProxy::new(
+                    data_plane.clone(),
+                    vec![],
+                    NO_TIMEOUTS,
+                    false,
+                    ConnLimiter::new(NO_LIMITS),
+                ),
             )),
             data_plane,
             acceptor,
@@ -3248,8 +3328,11 @@ mod tests {
         }
 
         let limiter = ConnLimiter::new(ConnLimits {
-            per_source: Some(2),
-            total: None,
+            connections: Caps {
+                per_source: Some(2),
+                total: None,
+            },
+            requests: NO_CAPS,
         });
         let http = Arc::new(GatewayHttpApp {
             proxy: route_proxy(NO_TIMEOUTS, vec![], Filters::default(), None),
@@ -3297,6 +3380,98 @@ mod tests {
         admitted.abort();
     }
 
+    // A request to a backend holds a slot under the request caps from routing to its
+    // end, whatever connection it comes on. One from a source that already has its
+    // share in flight gets a 503 at once, and one that ends frees its slot.
+    #[tokio::test]
+    async fn requests_over_the_source_cap_get_503() {
+        use pingora_core::apps::ServerApp;
+        use tokio::io::AsyncBufReadExt;
+
+        type Client = tokio::io::BufReader<tokio::net::TcpStream>;
+
+        // Open a connection to `app`, serve it, and send `GET /` on it.
+        async fn get(
+            app: &Arc<GatewayHttpApp>,
+            listener: &tokio::net::TcpListener,
+            shutdown: &pingora_core::server::ShutdownWatch,
+        ) -> (Client, tokio::task::JoinHandle<()>) {
+            let (mut client, stream) = accept_tcp(listener).await;
+            let (app, shutdown) = (app.clone(), shutdown.clone());
+            let serving = tokio::spawn(async move {
+                app.process_new(stream, &shutdown).await;
+            });
+            client.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
+            (tokio::io::BufReader::new(client), serving)
+        }
+        // The response's status line, or None if there is none after `wait`.
+        async fn status(client: &mut Client, wait: Duration) -> Option<String> {
+            let mut line = String::new();
+            tokio::time::timeout(wait, client.read_line(&mut line))
+                .await
+                .ok()?
+                .unwrap();
+            Some(line.trim_end().to_string())
+        }
+
+        let (backend, _closed) = silent_backend().await;
+        let backend = crate::route_table::Backend {
+            weight: 1,
+            endpoints: vec![backend],
+            filters: Filters::default(),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let limiter = ConnLimiter::new(ConnLimits {
+            connections: NO_CAPS,
+            requests: Caps {
+                per_source: Some(1),
+                total: None,
+            },
+        });
+        let proxy = route_proxy_on(
+            port,
+            NO_TIMEOUTS,
+            vec![backend],
+            Filters::default(),
+            None,
+            limiter.clone(),
+        );
+        let app = Arc::new(GatewayHttpApp { proxy, limiter });
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+
+        // The backend never answers, so the first request stays in flight.
+        let (mut first, first_conn) = get(&app, &listener, &shutdown).await;
+        let (mut second, _second_conn) = get(&app, &listener, &shutdown).await;
+        let refused = status(&mut second, Duration::from_secs(5)).await;
+        assert!(
+            refused.as_deref().is_some_and(|s| s.starts_with("HTTP/1.1 503")),
+            "{refused:?}"
+        );
+        assert_eq!(status(&mut first, Duration::from_millis(100)).await, None);
+
+        first_conn.abort();
+        let _ = first_conn.await;
+        let (mut third, _third_conn) = get(&app, &listener, &shutdown).await;
+        assert_eq!(
+            status(&mut third, Duration::from_millis(300)).await,
+            None,
+            "a request that ended frees its slot"
+        );
+    }
+
+    // An admitted connection's socket holds at most CLIENT_NOTSENT_LOWAT unsent.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn admitted_connections_bound_unsent_data() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_client, stream) = accept_tcp(&listener).await;
+        let lowat = |stream| socket2::SockRef::from(&tcp_socket(stream).unwrap()).tcp_notsent_lowat();
+        assert_ne!(lowat(&stream).unwrap(), CLIENT_NOTSENT_LOWAT);
+        let _permit = admit(&ConnLimiter::new(NO_LIMITS), &stream).unwrap();
+        assert_eq!(lowat(&stream).unwrap(), CLIENT_NOTSENT_LOWAT);
+    }
+
     /// A backend that accepts connections and never sends a byte (so as a TLS backend
     /// it never answers the ClientHello). The receiver yields once for each
     /// connection torii closes.
@@ -3330,12 +3505,26 @@ mod tests {
         filters: Filters,
         rule_timeout: Option<Duration>,
     ) -> Arc<pingora_proxy::HttpProxy<GatewayProxy>> {
+        // A connection over a duplex has no local address, so its listener port is 0.
+        let limiter = ConnLimiter::new(NO_LIMITS);
+        route_proxy_on(0, timeouts, backends, filters, rule_timeout, limiter)
+    }
+
+    /// [`route_proxy`] for connections to the listener port `port`, under the request
+    /// caps of `limiter`.
+    fn route_proxy_on(
+        port: u16,
+        timeouts: UpstreamTimeouts,
+        backends: Vec<crate::route_table::Backend>,
+        filters: Filters,
+        rule_timeout: Option<Duration>,
+        limiter: Arc<ConnLimiter>,
+    ) -> Arc<pingora_proxy::HttpProxy<GatewayProxy>> {
         use crate::route_table::{RouteEntry, RouteMatch, RouteTable};
 
-        // A connection over a duplex has no local address, so its listener port is 0.
         let mut routes = RouteTable::default();
         routes.entries.push(RouteEntry {
-            listener_port: 0,
+            listener_port: port,
             listener_hostname: None,
             hostnames: vec![],
             r#match: RouteMatch::default(),
@@ -3356,7 +3545,7 @@ mod tests {
         let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
         Arc::new(http_proxy(
             &conf,
-            GatewayProxy::new(data_plane, vec![], timeouts, false),
+            GatewayProxy::new(data_plane, vec![], timeouts, false, limiter),
         ))
     }
 
@@ -3714,7 +3903,13 @@ mod tests {
         let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
         Arc::new(http_proxy(
             &conf,
-            GatewayProxy::new(data_plane, vec![], NO_TIMEOUTS, allow_encoded_slashes),
+            GatewayProxy::new(
+                data_plane,
+                vec![],
+                NO_TIMEOUTS,
+                allow_encoded_slashes,
+                ConnLimiter::new(NO_LIMITS),
+            ),
         ))
     }
 

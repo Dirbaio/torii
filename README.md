@@ -36,6 +36,28 @@ behind a load balancer. It requires no supporting infrastructure other than Kube
 
     kubectl apply -f torii.yaml
 
+### Connection limits
+
+torii caps what clients can hold open at once, so that a flood gets refused instead of using up the
+pod's memory and getting it OOM-killed, controller included. An idle connection costs ~20-75 KB, and a
+request to a backend ~1 MB while its client does not read the response.
+
+| Flag (env var) | Default | Caps | Over it |
+|---|---|---|---|
+| `--max-connections-per-source` (`TORII_MAX_CONNECTIONS_PER_SOURCE`) | 256 | connections from one client | closed |
+| `--max-requests-per-source` (`TORII_MAX_REQUESTS_PER_SOURCE`) | 128 | requests to backends in flight from one client | 503 |
+| `--max-connections` (`TORII_MAX_CONNECTIONS`) | 1 per 128 KiB of `limits.memory` | connections in all | closed |
+| `--max-requests` (`TORII_MAX_REQUESTS`) | 1 per 2 MiB of `limits.memory` | requests to backends in flight in all | 503 |
+
+- A client is an IPv4 address or an IPv6 /64. If many clients share an address (a NAT, or a load balancer
+  that does not keep client addresses, such as a Service without `externalTrafficPolicy: Local`), raise
+  the per-source caps or set them to `0`, which disables a cap.
+- The global defaults come from the pod's memory limit (read from cgroup v2). Without one there are no
+  global caps unless set explicitly, and torii warns at startup.
+- The last quarter of each global cap is kept for clients that hold less than 1/16 of their per-source
+  cap, so a few clients cannot lock everyone else out.
+- Refusals are logged as a warning at most once a minute, with how many there were since the last one.
+
 ## Automatic TLS certificates (ACME)
 
 torii can obtain and renew TLS certificates automatically via **ACME TLS-ALPN-01**

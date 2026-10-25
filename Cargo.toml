@@ -35,6 +35,8 @@ pingora-http = { git = "https://github.com/cloudflare/pingora" }
 # Pingora's HTTP/2 implementation; the h2 accept loop resets streams and the
 # connection with its error codes.
 h2 = "0.4.20"
+# TCP_NOTSENT_LOWAT on downstream sockets (Pingora has no setter for it).
+socket2 = { version = "0.6", features = ["all"] }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 tokio-util = { version = "0.7", features = ["io"] } # poll_read_buf
