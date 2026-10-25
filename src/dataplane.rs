@@ -18,7 +18,7 @@ use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session, http_proxy};
 
 use crate::conn_limit::{ConnLimiter, ConnLimits, ConnPermit};
-use crate::route_table::{BackendTls, Endpoint, Filters, HeaderMods};
+use crate::route_table::{BackendTls, Endpoint, Filters, HeaderMods, normalize_path, without_path_params};
 use crate::snapshot::DataPlane;
 use crate::tls_table::TlsDecision;
 
@@ -29,6 +29,8 @@ pub struct GatewayProxy {
     /// HTTPS listener default their scheme to `https`.
     tls_ports: Vec<u16>,
     timeouts: UpstreamTimeouts,
+    /// Forward request paths with an encoded `/` or `\` (see [`normalize_path`]).
+    allow_encoded_slashes: bool,
 }
 
 /// Deadlines for torii's connections and requests to backends (the `--upstream-*`
@@ -84,11 +86,17 @@ struct Forwarded {
 }
 
 impl GatewayProxy {
-    pub fn new(data_plane: DataPlane, tls_ports: Vec<u16>, timeouts: UpstreamTimeouts) -> Self {
+    pub fn new(
+        data_plane: DataPlane,
+        tls_ports: Vec<u16>,
+        timeouts: UpstreamTimeouts,
+        allow_encoded_slashes: bool,
+    ) -> Self {
         GatewayProxy {
             data_plane,
             tls_ports,
             timeouts,
+            allow_encoded_slashes,
         }
     }
 }
@@ -118,8 +126,13 @@ impl ProxyHttp for GatewayProxy {
     /// Match the request against the route table and stash the chosen backend.
     /// If nothing matches, send a 404 and short-circuit.
     async fn request_filter(&self, session: &mut Session, ctx: &mut Self::CTX) -> Result<bool> {
+        // From here on, routing, filters and the backend all see the path's normal form.
+        let Some(path) = normalize_request_path(session.req_header_mut(), self.allow_encoded_slashes) else {
+            tracing::debug!(uri = %session.req_header().uri, "malformed request path -> 400");
+            session.respond_error(400).await?;
+            return Ok(true);
+        };
         let req = session.req_header();
-        let path = req.uri.path().to_string();
         let query = req.uri.query().unwrap_or("").to_string();
         let method = req.method.as_str().to_string();
         // Determine the request's target host. HTTP/2 carries it in the `:authority`
@@ -161,10 +174,25 @@ impl ProxyHttp for GatewayProxy {
         };
 
         let snapshot = self.data_plane.load();
-        let Some(entry) = snapshot
+        let entry = snapshot
             .routes
-            .match_request(port, &host, &path, &method, &headers, &query)
-        else {
+            .match_request(port, &host, &path, &method, &headers, &query);
+        // Tomcat, Jetty and others drop `;params` from path segments before they route
+        // (`/admin;x/panel` is their `/admin/panel`), and most backends don't. Where
+        // the params decide the rule, one kind of backend gets a path its rule was not
+        // meant to let through, so refuse the request.
+        if path.contains(';') {
+            let bare = without_path_params(&path);
+            let bare_entry = snapshot
+                .routes
+                .match_request(port, &host, &bare, &method, &headers, &query);
+            if entry.map(std::ptr::from_ref) != bare_entry.map(std::ptr::from_ref) {
+                tracing::debug!(%host, %path, "path parameters change the route -> 400");
+                session.respond_error(400).await?;
+                return Ok(true);
+            }
+        }
+        let Some(entry) = entry else {
             tracing::debug!(%host, %path, %method, "no route matched -> 404");
             session.respond_error(404).await?;
             return Ok(true);
@@ -384,6 +412,25 @@ impl ProxyHttp for GatewayProxy {
             can_reuse_downstream: false,
         }
     }
+}
+
+/// Put the request path in its normal form ([`normalize_path`]), keeping the query
+/// as it is, and return it; None if the request must be refused.
+fn normalize_request_path(req: &mut pingora_http::RequestHeader, allow_encoded_slashes: bool) -> Option<String> {
+    // Pingora refuses CONNECT, the only request without a path, and request-targets
+    // that are not UTF-8, so the URI holds the target that Pingora forwards.
+    let target = req.uri.path_and_query()?.as_str();
+    let (path, query) = target.split_at(target.find('?').unwrap_or(target.len()));
+    let normal = normalize_path(path.as_bytes(), allow_encoded_slashes)?;
+    if normal != path {
+        let target = format!("{normal}{query}");
+        // Keep the scheme and authority of an h2 request: Pingora takes the upstream
+        // Host from them.
+        let mut uri = req.uri.clone().into_parts();
+        uri.path_and_query = Some(target.parse().ok()?);
+        req.set_uri(http::Uri::from_parts(uri).ok()?);
+    }
+    Some(normal)
 }
 
 /// Write CORS headers for an allowed *actual* (non-preflight) request.
@@ -1826,6 +1873,7 @@ pub fn run(
     http_ports: &[u16],
     tls_ports: &[u16],
     timeouts: UpstreamTimeouts,
+    allow_encoded_slashes: bool,
     limits: ConnLimits,
 ) -> ! {
     // Pass None so Pingora doesn't parse our process argv as its own options.
@@ -1839,7 +1887,7 @@ pub fn run(
     let http_app = GatewayHttpApp {
         proxy: Arc::new(http_proxy(
             &server.configuration,
-            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec(), timeouts),
+            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec(), timeouts, allow_encoded_slashes),
         )),
         limiter: limiter.clone(),
     };
@@ -1857,7 +1905,7 @@ pub fn run(
         // Arc<HttpProxy>, not a Service, so we use the http_proxy() factory.
         let proxy = Arc::new(http_proxy(
             &server.configuration,
-            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec(), timeouts),
+            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec(), timeouts, allow_encoded_slashes),
         ));
         let app = GatewayTlsApp {
             data_plane: data_plane.clone(),
@@ -1977,7 +2025,7 @@ mod tests {
         use pingora_core::apps::HttpPersistentSettings;
         use pingora_core::protocols::http::ServerSession;
 
-        let proxy = GatewayProxy::new(DataPlane::new(), vec![], NO_TIMEOUTS);
+        let proxy = GatewayProxy::new(DataPlane::new(), vec![], NO_TIMEOUTS, false);
         let idle = Some(H1_IDLE_TIMEOUT.as_secs());
         for (head, want) in [
             ("GET / HTTP/1.1\r\nHost: a\r\n\r\n", idle),
@@ -2558,7 +2606,7 @@ mod tests {
         GatewayTlsApp {
             proxy: Arc::new(http_proxy(
                 &conf,
-                GatewayProxy::new(data_plane.clone(), vec![], NO_TIMEOUTS),
+                GatewayProxy::new(data_plane.clone(), vec![], NO_TIMEOUTS, false),
             )),
             data_plane,
             acceptor,
@@ -2777,7 +2825,10 @@ mod tests {
             ..Default::default()
         });
         let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
-        Arc::new(http_proxy(&conf, GatewayProxy::new(data_plane, vec![], timeouts)))
+        Arc::new(http_proxy(
+            &conf,
+            GatewayProxy::new(data_plane, vec![], timeouts, false),
+        ))
     }
 
     /// Send `GET /` over HTTP/1.1 through a proxy whose one route forwards to
@@ -2907,6 +2958,227 @@ mod tests {
             .expect("the connect must give up");
         assert!(second.is_none());
         assert!(start.elapsed() >= deadline, "gave up early: {:?}", start.elapsed());
+    }
+
+    /// A backend that answers each request with its request head.
+    async fn echo_backend() -> Endpoint {
+        use tokio::io::AsyncBufReadExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut conn = tokio::io::BufReader::new(conn);
+                    let mut head = Vec::new();
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if conn.read_until(b'\n', &mut head).await.unwrap_or(0) == 0 {
+                            return;
+                        }
+                    }
+                    let resp = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", head.len());
+                    let _ = conn.write_all(&[resp.as_bytes(), &head].concat()).await;
+                });
+            }
+        });
+        Endpoint {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: BackendTls::Plaintext,
+        }
+    }
+
+    /// A proxy whose routes send `/admin` to a redirect, `/public` to `backend` as
+    /// `/static`, and the rest to `backend`.
+    fn paths_proxy(backend: Endpoint, allow_encoded_slashes: bool) -> Arc<pingora_proxy::HttpProxy<GatewayProxy>> {
+        use crate::route_table::{
+            Backend, PathMatch, PathRewrite, Redirect, RouteEntry, RouteMatch, RouteTable, UrlRewrite,
+        };
+
+        let backends = vec![Backend {
+            weight: 1,
+            endpoints: vec![backend],
+            filters: Filters::default(),
+        }];
+        let redirect = Filters {
+            redirect: Some(Redirect {
+                hostname: Some("login.example".into()),
+                status_code: 302,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let rewrite = Filters {
+            url_rewrite: Some(UrlRewrite {
+                hostname: None,
+                path: Some(PathRewrite::ReplacePrefixMatch("/static".into())),
+            }),
+            ..Default::default()
+        };
+        let mut routes = RouteTable::default();
+        for (prefix, filters, backends) in [
+            ("/admin", redirect, vec![]),
+            ("/public", rewrite, backends.clone()),
+            ("/", Filters::default(), backends),
+        ] {
+            routes.entries.push(RouteEntry {
+                listener_port: 0,
+                listener_hostname: None,
+                hostnames: vec![],
+                r#match: RouteMatch {
+                    path: Some(PathMatch::Prefix(prefix.into())),
+                    ..Default::default()
+                },
+                backends,
+                filters,
+                request_timeout: None,
+                route_creation: 0,
+                route_key: format!("ns{prefix}"),
+                rule_order: 0,
+                match_order: 0,
+            });
+        }
+        routes.sort();
+        let data_plane = DataPlane::new();
+        data_plane.store(crate::snapshot::Snapshot {
+            routes,
+            ..Default::default()
+        });
+        let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
+        Arc::new(http_proxy(
+            &conf,
+            GatewayProxy::new(data_plane, vec![], NO_TIMEOUTS, allow_encoded_slashes),
+        ))
+    }
+
+    /// The request line the backend got for `GET <target>` over HTTP/1.1 through
+    /// `proxy`, or the response's status code if it is not 200.
+    async fn h1_path(proxy: &Arc<pingora_proxy::HttpProxy<GatewayProxy>>, target: &[u8]) -> Vec<u8> {
+        use pingora_core::apps::HttpServerApp;
+        use pingora_core::protocols::http::ServerSession;
+
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        let proxy = proxy.clone();
+        let serving = tokio::spawn(async move {
+            let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+            proxy
+                .process_new_http(ServerSession::new_http1(Box::new(server_io)), &shutdown)
+                .await;
+        });
+        let req = [b"GET ", target, b" HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n"].concat();
+        client.write_all(&req).await.unwrap();
+        let mut resp = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut resp)).await;
+        serving.abort();
+        read.expect("no response").unwrap();
+        let line = |b: &[u8]| b.split(|&c| c == b'\r').next().unwrap().to_vec();
+        match resp.strip_prefix(b"HTTP/1.1 200 OK\r\n") {
+            Some(rest) => line(&rest[rest.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4..]),
+            None => resp[9..12].to_vec(),
+        }
+    }
+
+    // Routes match the normal form of the request path, and the backend gets that same
+    // path: no other form of `/admin` may skip its rule (to reach the backend, which
+    // would take it for `/admin`), and no `..` may leave a rewritten prefix.
+    #[tokio::test]
+    async fn request_paths_are_normalized() {
+        let proxy = paths_proxy(echo_backend().await, false);
+        for (target, want) in [
+            (&b"/admin/panel"[..], &b"302"[..]),
+            (b"/%61dmin/panel", b"302"),
+            (b"/x/../admin/panel", b"302"),
+            (b"/./admin/panel", b"302"),
+            (b"/x/%2e%2e/admin/panel", b"302"),
+            (b"//admin/panel", b"302"),
+            (b"/x/..;y/admin", b"302"),
+            (b"/public/../admin", b"302"),
+            (b"/public/%2e%2e/x", b"GET /x HTTP/1.1"),
+            (
+                b"/public/a/./b;v=1?q=/../%2e",
+                b"GET /static/a/b;v=1?q=/../%2e HTTP/1.1",
+            ),
+            (b"/caf%c3%a9/%7e", b"GET /caf%C3%A9/~ HTTP/1.1"),
+            ("/café/.?q=é".as_bytes(), "GET /caf%C3%A9/?q=é HTTP/1.1".as_bytes()),
+            // Pingora refuses a target that is not UTF-8, so the URI is the target.
+            (b"/caf\xe9", b"400"),
+            // `;params` that do not change the route are forwarded.
+            (b"/app;v=1/x", b"GET /app;v=1/x HTTP/1.1"),
+            (b"/admin;x=1/panel", b"400"),
+            (b"/;x/admin", b"400"),
+            (b"/public/..%2fadmin", b"400"),
+            (b"/a%5Cb", b"400"),
+            (b"/a\\b", b"400"),
+            (b"/a%00", b"400"),
+            (b"/a%zz", b"400"),
+        ] {
+            let got = h1_path(&proxy, target).await;
+            assert_eq!(
+                got.escape_ascii().to_string(),
+                want.escape_ascii().to_string(),
+                "{}",
+                target.escape_ascii()
+            );
+        }
+
+        // Encoded slashes, when allowed, are data, never separators.
+        let proxy = paths_proxy(echo_backend().await, true);
+        assert_eq!(
+            h1_path(&proxy, b"/public/..%2fadmin").await,
+            b"GET /static/..%2Fadmin HTTP/1.1"
+        );
+        assert_eq!(h1_path(&proxy, b"/a%00").await, b"400");
+    }
+
+    // The same over HTTP/2, whose request URI also has the authority that becomes the
+    // upstream Host: normalizing the path must keep it.
+    #[tokio::test]
+    async fn h2_request_paths_are_normalized() {
+        use pingora_core::apps::HttpServerApp;
+        use pingora_core::protocols::http::ServerSession;
+
+        let proxy = paths_proxy(echo_backend().await, false);
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(GatewayTlsApp::serve_h2_streams(
+            Box::new(server_io),
+            CLIENT_STALL_TIMEOUT,
+            move |h2| {
+                let proxy = proxy.clone();
+                async move {
+                    let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+                    proxy.process_new_http(ServerSession::new_http2(h2), &shutdown).await;
+                }
+            },
+        ));
+        let (client, conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(conn);
+        for (uri, want) in [
+            ("https://a.example/x/%2e%2e/y?q", "200 GET /y?q HTTP/1.1"),
+            ("https://a.example/%61dmin", "302 "),
+            ("https://a.example/a%2fb", "400 "),
+        ] {
+            let mut client = client.clone().ready().await.unwrap();
+            let (resp, _) = client
+                .send_request(http::Request::get(uri).body(()).unwrap(), true)
+                .unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(5), resp)
+                .await
+                .unwrap()
+                .unwrap();
+            let status = resp.status();
+            let mut body = resp.into_body();
+            let mut head = Vec::new();
+            while let Some(chunk) = body.data().await {
+                head.extend(chunk.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let got = format!("{} {}", status.as_u16(), head.lines().next().unwrap_or(""));
+            assert_eq!(got, want, "{uri}");
+            if status == 200 {
+                let host = head.to_ascii_lowercase().contains("\r\nhost: a.example\r\n");
+                assert!(host, "{uri}: the backend got no Host: {head}");
+            }
+        }
     }
 
     // split_host_port matches Go's net.SplitHostPort: it unbrackets IPv6 literals

@@ -566,6 +566,97 @@ fn path_prefix_matches(prefix: &str, path: &str) -> bool {
     }
 }
 
+/// The normal form of a request path, which routes match, filters rewrite and the
+/// backend gets; None if the request must be refused (400). Backends resolve a path
+/// before routing on it, so without this `/%61dmin` or `/x/../admin` skipped the
+/// rules for `/admin` and still reached it, and `..` escaped a ReplacePrefixMatch.
+///
+/// - Escapes of unreserved characters are decoded, other escapes get uppercase hex,
+///   and bytes a path may not hold raw (`"`, `|`, non-ASCII, ...) are escaped
+///   (RFC 3986 §6.2.2.1-2).
+/// - Then `.` and `..` segments are removed (§5.2.4), also when they carry
+///   `;params` (`..;x` is `..` to Tomcat and Jetty), and `//` is merged, as nginx
+///   and Envoy do.
+/// - An encoded `/` or `\` (`%2F`, `%5C`) is refused unless `allow_encoded_slashes`:
+///   nginx and Python's http.server decode them before resolving `..`. Allowed ones
+///   stay escaped, so they never split segments here. `%00`, a raw `\` or `#`, and
+///   a `%` that starts no escape are always refused.
+pub fn normalize_path(path: &[u8], allow_encoded_slashes: bool) -> Option<String> {
+    use std::fmt::Write;
+
+    let path: &[u8] = match path {
+        [] => b"/",
+        [b'/', ..] => path,
+        _ => return None,
+    };
+    let unreserved = |b: u8| b.is_ascii_alphanumeric() || b"-._~".contains(&b);
+    let mut escaped = String::with_capacity(path.len());
+    let mut i = 0;
+    while i < path.len() {
+        let mut b = path[i];
+        i += 1;
+        if b == b'%' {
+            let hex = |i: usize| path.get(i).and_then(|&h| char::from(h).to_digit(16));
+            b = ((hex(i)? << 4) | hex(i + 1)?) as u8;
+            i += 2;
+            match b {
+                0 => return None,
+                b'/' | b'\\' if !allow_encoded_slashes => return None,
+                _ if unreserved(b) => escaped.push(char::from(b)),
+                _ => {
+                    let _ = write!(escaped, "%{b:02X}");
+                }
+            }
+        } else if b == b'\\' || b == b'#' {
+            return None;
+        } else if unreserved(b) || b"/!$&'()*+,;=:@".contains(&b) {
+            escaped.push(char::from(b));
+        } else {
+            let _ = write!(escaped, "%{b:02X}");
+        }
+    }
+    Some(remove_dot_segments(&escaped))
+}
+
+/// The normal form of `path` (itself in normal form) without the `;params` of its
+/// segments: the path that Tomcat, Jetty and others route on.
+pub fn without_path_params(path: &str) -> String {
+    let segments: Vec<&str> = path.split('/').map(path_segment_name).collect();
+    remove_dot_segments(&segments.join("/"))
+}
+
+/// A path segment without its `;params`.
+fn path_segment_name(segment: &str) -> &str {
+    segment.split_once(';').map_or(segment, |(name, _)| name)
+}
+
+/// Remove the `.` and `..` segments of a path that starts with `/` (RFC 3986
+/// §5.2.4, judging a segment by its name, see [`path_segment_name`]), and its empty
+/// segments. A path that ends in one of them keeps a trailing `/`.
+fn remove_dot_segments(path: &str) -> String {
+    let mut segments = Vec::new();
+    let mut trailing_slash = false;
+    for segment in path.strip_prefix('/').unwrap_or(path).split('/') {
+        let name = path_segment_name(segment);
+        if name == ".." {
+            segments.pop();
+        }
+        trailing_slash = segment.is_empty() || name == "." || name == "..";
+        if !trailing_slash {
+            segments.push(segment);
+        }
+    }
+    let mut normal = String::with_capacity(path.len());
+    for segment in &segments {
+        normal.push('/');
+        normal.push_str(segment);
+    }
+    if trailing_slash || segments.is_empty() {
+        normal.push('/');
+    }
+    normal
+}
+
 /// Hostname match supporting a single leading wildcard label (`*.example.com`).
 /// Case-INSENSITIVE on both sides (RFC 3986 §3.2.2 / RFC 9110 §4.2.3 — host
 /// comparison is case-insensitive). The wildcard branch previously used a
@@ -604,6 +695,65 @@ mod tests {
         // From HTTPRouteMatching: /v2 must not match /v2example
         assert!(!path_prefix_matches("/v2", "/v2example"));
         assert!(path_prefix_matches("/v2", "/v2/example"));
+    }
+
+    // Every form of a path that a backend resolves to the same path has the same
+    // normal form, so that routes match what the backend will serve.
+    #[test]
+    fn path_normal_form() {
+        let normal = |path: &[u8]| normalize_path(path, false);
+        for (path, want) in [
+            (&b"/admin/panel"[..], "/admin/panel"),
+            (b"/%61dmin/panel", "/admin/panel"),
+            (b"/secre%74", "/secret"),
+            (b"/x/../admin/panel", "/admin/panel"),
+            (b"/./admin/panel", "/admin/panel"),
+            (b"/x/%2e%2E/admin/panel", "/admin/panel"),
+            (b"//admin//panel", "/admin/panel"),
+            (b"/x/..;y/admin", "/admin"),
+            (b"/x/.;y/admin", "/x/admin"),
+            (b"/public/../../..", "/"),
+            (b"/a/b/..", "/a/"),
+            (b"/a/.", "/a/"),
+            (b"/a/", "/a/"),
+            (b"/", "/"),
+            (b"", "/"),
+            // Escapes of other characters stay, in uppercase; raw bytes a path may
+            // not hold get escaped.
+            (b"/a%3fb%7e", "/a%3Fb~"),
+            (b"/caf%c3%a9", "/caf%C3%A9"),
+            ("/café".as_bytes(), "/caf%C3%A9"),
+            (b"/caf\xe9", "/caf%E9"),
+            (b"/a|b\"{}", "/a%7Cb%22%7B%7D"),
+            // `;params` are data, but not on a dot segment.
+            (b"/admin;x=1/panel", "/admin;x=1/panel"),
+            (b"/app/;jsessionid=1", "/app/;jsessionid=1"),
+        ] {
+            assert_eq!(normal(path).as_deref(), Some(want), "{}", path.escape_ascii());
+        }
+        for path in [
+            &b"/a%2Fb"[..],
+            b"/..%2fadmin",
+            b"/a%5cb",
+            b"/a\\b",
+            b"/a%00",
+            b"/a%",
+            b"/a%4",
+            b"/a%zz",
+            b"/a%+1",
+            b"/a#b",
+            b"*",
+        ] {
+            assert_eq!(normal(path), None, "{}", path.escape_ascii());
+        }
+        // Allowed encoded slashes are data: `..%2F` is no `..`.
+        assert_eq!(normalize_path(b"/x/..%2fadmin", true).as_deref(), Some("/x/..%2Fadmin"));
+        assert_eq!(normalize_path(b"/a%5cb", true).as_deref(), Some("/a%5Cb"));
+        assert_eq!(normalize_path(b"/a%00", true), None);
+
+        assert_eq!(without_path_params("/admin;x=1/panel"), "/admin/panel");
+        assert_eq!(without_path_params("/;x/admin"), "/admin");
+        assert_eq!(without_path_params("/app/;jsessionid=1"), "/app/");
     }
 
     #[test]

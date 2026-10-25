@@ -84,6 +84,15 @@ struct Cli {
     #[arg(long, env = "TORII_UPSTREAM_TIMEOUT", default_value = "60s", value_parser = parse_duration)]
     upstream_timeout: Duration,
 
+    /// Forward request paths that contain an encoded `/` or `\` (`%2F`, `%5C`),
+    /// which are otherwise answered with 400. torii keeps them encoded and routes
+    /// them as data, but a backend that decodes them before it resolves `..` (nginx,
+    /// Python's http.server) can then be led outside the paths its routes send it.
+    /// Turn on only for backends that need them, such as an npm registry's
+    /// `/@scope%2Fname`.
+    #[arg(long, env = "TORII_ALLOW_ENCODED_SLASHES")]
+    allow_encoded_slashes: bool,
+
     /// Most connections one client may have open at once, on all ports together. A
     /// client is an IPv4 address or an IPv6 /64; its connections over this are
     /// closed as they come. Raise it, or set `0` to disable it, if many clients
@@ -165,6 +174,7 @@ async fn run(args: Cli) -> Result<()> {
         connect: enabled(args.upstream_connect_timeout),
         response: enabled(args.upstream_timeout),
     };
+    let allow_encoded_slashes = args.allow_encoded_slashes;
     let limits = conn_limit::ConnLimits {
         per_source: Some(args.max_connections_per_source).filter(|&n| n > 0),
         total: match args.max_connections {
@@ -174,7 +184,17 @@ async fn run(args: Cli) -> Result<()> {
     };
     std::thread::Builder::new()
         .name("dataplane".into())
-        .spawn(move || dataplane::run(dp, &bind_ip, &http_ports, &tls_ports, timeouts, limits))
+        .spawn(move || {
+            dataplane::run(
+                dp,
+                &bind_ip,
+                &http_ports,
+                &tls_ports,
+                timeouts,
+                allow_encoded_slashes,
+                limits,
+            )
+        })
         .context("failed to spawn data-plane thread")?;
 
     // ACME (optional): only spawned with --acme. When off, `acme_feed` is None and the

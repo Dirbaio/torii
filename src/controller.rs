@@ -42,7 +42,7 @@ use serde::de::DeserializeOwned;
 use crate::cert_store::{CertKey, CertStore};
 use crate::route_table::{
     Backend, Endpoint, Filters, HeaderMatch, HeaderMods, HeaderValueMatch, PathMatch, PathRewrite, QueryMatch,
-    Redirect, RouteEntry, RouteMatch, RouteTable, UrlRewrite,
+    Redirect, RouteEntry, RouteMatch, RouteTable, UrlRewrite, normalize_path,
 };
 use crate::snapshot::{DataPlane, Snapshot};
 use crate::tls_table::{TlsAction, TlsBackend, TlsBackends, TlsTable};
@@ -2008,6 +2008,15 @@ fn validate_http_rule(
                 "{at}.matches[{mi}].path: RegularExpression path matching is not supported"
             ));
         }
+        // Path: the data plane refuses a request whose `;params` decide its route (see
+        // `GatewayProxy::request_filter`), so a value with them would only refuse.
+        if let Some(p) = &m.path
+            && p.value.as_deref().is_some_and(|v| v.contains(';'))
+        {
+            return Some(format!(
+                "{at}.matches[{mi}].path: ';' path parameters are not supported"
+            ));
+        }
         // Header match: a RegularExpression value must compile.
         for (hi, h) in m.headers.iter().flatten().enumerate() {
             if matches!(h.r#type, Some(HType::RegularExpression))
@@ -2078,6 +2087,9 @@ fn route_match_from(m: &gateway_api::apis::standard::httproutes::HttpRouteRulesM
 
     let path = m.path.as_ref().map(|p| {
         let value = p.value.clone().unwrap_or_else(|| "/".into());
+        // Requests are matched in their normal form, so the value must be in it too:
+        // `/%61dmin` is `/admin`. Values that have none match no request anyway.
+        let value = normalize_path(value.as_bytes(), true).unwrap_or(value);
         match p.r#type {
             Some(PType::Exact) => PathMatch::Exact(value),
             _ => PathMatch::Prefix(value), // PathPrefix is the default
@@ -2584,6 +2596,29 @@ mod tests {
         assert_eq!(timeout(Some("1m"), Some("0s")), Some(Duration::from_secs(60)));
         assert_eq!(timeout(Some("0s"), None), Some(Duration::ZERO));
         assert_eq!(timeout(None, Some("0s")), Some(Duration::ZERO));
+    }
+
+    // Requests are matched in their normal form, so path values are normalized too. A
+    // value with `;params` could only get its requests refused: it is unsupported.
+    #[test]
+    fn route_path_values() {
+        use gateway_api::apis::standard::httproutes::{HttpRouteRules, HttpRouteRulesMatches};
+
+        let path = |r#type: &str, value: &str| {
+            let m: HttpRouteRulesMatches =
+                serde_json::from_value(serde_json::json!({ "path": { "type": r#type, "value": value } })).unwrap();
+            route_match_from(&m).path
+        };
+        assert!(matches!(path("PathPrefix", "/%61dmin/%7e"), Some(PathMatch::Prefix(p)) if p == "/admin/~"));
+        assert!(matches!(path("Exact", "/a%3fb"), Some(PathMatch::Exact(p)) if p == "/a%3Fb"));
+
+        let rule = |value: &str| {
+            let rule: HttpRouteRules =
+                serde_json::from_value(serde_json::json!({ "matches": [{ "path": { "value": value } }] })).unwrap();
+            validate_http_rule(0, &rule)
+        };
+        assert_eq!(rule("/a"), None);
+        assert!(rule("/a;b").is_some());
     }
 
     fn http_route(name: &str, filter: serde_json::Value) -> serde_json::Value {
