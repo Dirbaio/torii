@@ -1915,11 +1915,14 @@ impl ReconcileCtx {
         Some(ca.clone().into_bytes())
     }
 
-    /// Resolve a Service's backing pod endpoints, mapping the Service port to the
-    /// pod targetPort via the Service spec, and finding ready pod IPs from
-    /// EndpointSlices.
+    /// Resolve a Service port's ready endpoints from the Service's EndpointSlices,
+    /// as kube-proxy does: in each slice, the port named like the Service port (the
+    /// EndpointSlice controller names slice ports after Service ports, and resolves
+    /// `targetPort` into their numbers per pod). `targetPort` is never read here: a
+    /// named one is a container port name, and a selector-less Service's slices are
+    /// written by hand with any port.
     fn resolve_endpoints(&self, ns: &str, svc_name: &str, svc_port: u16) -> Option<Vec<Endpoint>> {
-        // Find the Service to map svc_port -> targetPort name/number.
+        // Find the Service port, for its name and protocol.
         let svc = find_in(&self.stores.services, ns, svc_name)?;
 
         let port_spec = svc
@@ -1931,15 +1934,8 @@ impl ReconcileCtx {
             .find(|p| p.port == svc_port as i32)?
             .clone();
 
-        // targetPort: if numeric, use it; if a name, resolve via EndpointSlice port name.
-        let target_port_num: Option<i32> = match &port_spec.target_port {
-            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(n)) => Some(*n),
-            _ => None, // named ports resolved per-endpoint-slice below
-        };
-        let target_port_name: Option<String> = match &port_spec.target_port {
-            Some(k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::String(s)) => Some(s.clone()),
-            _ => None,
-        };
+        let port_name = port_spec.name.as_deref().unwrap_or_default();
+        let port_protocol = port_spec.protocol.as_deref().unwrap_or("TCP");
 
         // Collect ready endpoint IPs from EndpointSlices for this service.
         let mut endpoints = Vec::new();
@@ -1963,20 +1959,15 @@ impl ReconcileCtx {
                 continue;
             }
 
-            // Determine the port number on this slice.
-            let port: Option<i32> = slice.ports.as_ref().and_then(|ports| {
-                if let Some(n) = target_port_num {
-                    Some(n)
-                } else if let Some(name) = &target_port_name {
-                    ports
-                        .iter()
-                        .find(|p| p.name.as_deref() == Some(name.as_str()))
-                        .and_then(|p| p.port)
-                } else {
-                    ports.first().and_then(|p| p.port)
-                }
+            // The Service port's number on this slice; a slice without it serves
+            // other ports of the Service only.
+            let port = slice.ports.iter().flatten().find(|p| {
+                p.name.as_deref().unwrap_or_default() == port_name
+                    && p.protocol.as_deref().unwrap_or("TCP") == port_protocol
             });
-            let Some(port) = port else { continue };
+            let Some(port) = port.and_then(|p| p.port) else {
+                continue;
+            };
 
             for ep in &slice.endpoints {
                 let ready = ep.conditions.as_ref().and_then(|c| c.ready).unwrap_or(true);
@@ -2975,6 +2966,126 @@ mod tests {
             reasons(status.conditions.as_deref().unwrap()),
             ["Accepted=True/ListenersNotValid", "Programmed=False/Invalid"]
         );
+    }
+
+    // A Service port's endpoints come from the slice port named like it, with that
+    // slice port's number, as in kube-proxy; never from `targetPort`.
+    #[tokio::test]
+    async fn endpoints_follow_the_slice_port_named_like_the_service_port() {
+        let service = |name: &str, ports: serde_json::Value| -> Service {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": name, "namespace": "ns" },
+                "spec": { "ports": ports },
+            }))
+            .unwrap()
+        };
+        let slice = |svc: &str, ip: &str, ports: serde_json::Value| -> EndpointSlice {
+            serde_json::from_value(serde_json::json!({
+                "metadata": {
+                    "name": format!("{svc}-{ip}"),
+                    "namespace": "ns",
+                    "labels": { "kubernetes.io/service-name": svc },
+                },
+                "addressType": "IPv4",
+                "endpoints": [{ "addresses": [ip], "conditions": { "ready": true } }],
+                "ports": ports,
+            }))
+            .unwrap()
+        };
+        let services = vec![
+            // A named targetPort, under another name: the slice port is "http".
+            service(
+                "named",
+                serde_json::json!([{ "name": "http", "port": 80, "targetPort": "web" }]),
+            ),
+            // An unnamed port with a named targetPort: the slice port is "".
+            service("unnamed", serde_json::json!([{ "port": 80, "targetPort": "http" }])),
+            // Names crossed with targetPorts.
+            service(
+                "crossed",
+                serde_json::json!([
+                    { "name": "a", "port": 80, "targetPort": "b" },
+                    { "name": "b", "port": 81, "targetPort": "a" },
+                ]),
+            ),
+            // Selector-less, with a hand-written slice on another port.
+            service(
+                "external",
+                serde_json::json!([{ "name": "http", "port": 80, "targetPort": 80 }]),
+            ),
+        ];
+        let slices = vec![
+            slice(
+                "named",
+                "10.0.0.1",
+                serde_json::json!([{ "name": "http", "port": 8080 }]),
+            ),
+            // Pods whose named port resolves to another number are in their own slice.
+            slice(
+                "named",
+                "10.0.0.2",
+                serde_json::json!([{ "name": "http", "port": 9090 }]),
+            ),
+            slice("unnamed", "10.0.0.3", serde_json::json!([{ "name": "", "port": 8081 }])),
+            slice(
+                "crossed",
+                "10.0.0.4",
+                serde_json::json!([{ "name": "b", "port": 7002 }, { "name": "a", "port": 7001 }]),
+            ),
+            slice(
+                "external",
+                "10.0.0.5",
+                serde_json::json!([{ "name": "http", "port": 8443 }]),
+            ),
+            // A slice for another protocol of the port's name is not used.
+            slice(
+                "external",
+                "10.0.0.6",
+                serde_json::json!([{ "name": "http", "port": 53, "protocol": "UDP" }]),
+            ),
+        ];
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let client = Client::try_from(kube::Config::new("http://127.0.0.1:1".parse().unwrap())).unwrap();
+        let ctx = ReconcileCtx {
+            client,
+            data_plane: DataPlane::new(),
+            config: ControllerConfig {
+                advertise_address: "127.0.0.1".into(),
+                acme_feed: None,
+                acme_default_issuer: None,
+                acme_default_email: None,
+            },
+            stores: Arc::new(Stores {
+                gateway_classes: store_of(vec![]),
+                gateways: store_of(vec![]),
+                routes: store_of(vec![]),
+                tls_routes: store_of(vec![]),
+                services: store_of(services),
+                endpoint_slices: store_of(slices),
+                reference_grants: store_of(vec![]),
+                namespaces: store_of(vec![]),
+                secrets: store_of(vec![]),
+                config_maps: store_of(vec![]),
+                backend_tls_policies: store_of(vec![]),
+            }),
+        };
+        let resolve = |svc: &str, port: u16| -> Vec<String> {
+            let mut eps: Vec<String> = ctx
+                .resolve_endpoints("ns", svc, port)
+                .unwrap()
+                .iter()
+                .map(|e| format!("{}:{}", e.ip, e.port))
+                .collect();
+            eps.sort();
+            eps
+        };
+        assert_eq!(resolve("named", 80), ["10.0.0.1:8080", "10.0.0.2:9090"]);
+        assert_eq!(resolve("unnamed", 80), ["10.0.0.3:8081"]);
+        assert_eq!(resolve("crossed", 80), ["10.0.0.4:7001"]);
+        assert_eq!(resolve("crossed", 81), ["10.0.0.4:7002"]);
+        assert_eq!(resolve("external", 80), ["10.0.0.5:8443"]);
+        assert!(ctx.resolve_endpoints("ns", "named", 81).is_none());
     }
 
     fn lbls(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
