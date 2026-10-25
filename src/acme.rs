@@ -22,12 +22,13 @@
 //! - issued certs: each listener's own `certificateRefs` Secret (`tls.crt/tls.key`).
 
 use std::collections::{BTreeMap, HashMap};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
-use futures::StreamExt;
+use futures::{FutureExt, StreamExt};
 use gateway_api::apis::standard::gateways::Gateway;
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
@@ -127,6 +128,29 @@ pub async fn run(client: Client, data_plane: DataPlane, feed: AcmeFeed, config: 
 
     tracing::info!(namespace = %config.namespace, "ACME subsystem started");
 
+    // A panic in the leader loop would otherwise end ACME for every Gateway while
+    // the rest of the process keeps serving. Issuance panics are already caught per
+    // target in `scan_and_issue`; this catches the rest and starts the loop over.
+    loop {
+        match AssertUnwindSafe(lead(&client, &lease, &feed, &config))
+            .catch_unwind()
+            .await
+        {
+            Ok(r) => return r,
+            Err(panic) => {
+                tracing::error!(
+                    panic = panic_message(&*panic),
+                    "ACME leader loop panicked; restarting it in {}s",
+                    BACKOFF_BASE.as_secs()
+                );
+                tokio::time::sleep(BACKOFF_BASE).await;
+            }
+        }
+    }
+}
+
+/// The leader loop: renew the lease, and scan while leader. Runs forever.
+async fn lead(client: &Client, lease: &LeaseLock, feed: &AcmeFeed, config: &AcmeConfig) -> Result<()> {
     let mut last_scan = std::time::Instant::now()
         .checked_sub(SCAN_INTERVAL)
         .unwrap_or_else(std::time::Instant::now);
@@ -150,7 +174,7 @@ pub async fn run(client: Client, data_plane: DataPlane, feed: AcmeFeed, config: 
         if is_leader && last_scan.elapsed() >= SCAN_INTERVAL {
             last_scan = std::time::Instant::now();
             let targets = feed.load();
-            if let Err(e) = scan_and_issue(&client, &targets, &config, &mut backoff).await {
+            if let Err(e) = scan_and_issue(client, &targets, config, &mut backoff).await {
                 tracing::warn!(error = format!("{e:#}"), "ACME scan/issue failed");
             }
         }
@@ -449,6 +473,15 @@ async fn scan_and_issue(
             continue;
         }
 
+        // An issuer that is not a usable URL is a config error too. instant-acme
+        // panics on a URL it can't parse, and no fix of ours can make it work.
+        if let Some(directory) = &target.directory
+            && let Err(detail) = check_directory_url(directory)
+        {
+            patch_acme_status(client, target, &AcmeState::Failed { detail, retry_in_s: 0 }).await;
+            continue;
+        }
+
         // Wildcard / empty hostname → can never validate via TLS-ALPN-01. Report it.
         if target.hostname.starts_with("*.") || target.hostname.is_empty() {
             patch_acme_status(
@@ -492,7 +525,13 @@ async fn scan_and_issue(
             },
         )
         .await;
-        match issue(client, config, target).await {
+        // instant-acme panics on some bad URLs from the ACME server itself (an
+        // unparseable `newNonce`), so a panic is this target's failure, not the loop's.
+        let result = match AssertUnwindSafe(issue(client, config, target)).catch_unwind().await {
+            Ok(result) => result,
+            Err(panic) => Err(anyhow!("ACME client panicked: {}", panic_message(&*panic))),
+        };
+        match result {
             Ok(not_after) => {
                 backoff.record_success(target);
                 patch_acme_status(client, target, &AcmeState::Issued { not_after }).await;
@@ -517,6 +556,31 @@ async fn scan_and_issue(
         }
     }
     Ok(())
+}
+
+/// Check that an ACME directory URL is an absolute `https://` URL with a host
+/// (RFC 8555 §6.1 requires HTTPS). Returns the condition message otherwise.
+fn check_directory_url(directory: &str) -> Result<(), String> {
+    let ok = directory
+        .parse::<http::Uri>()
+        .is_ok_and(|u| u.scheme_str() == Some("https") && u.host().is_some_and(|h| !h.is_empty()));
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "invalid ACME issuer URL {directory:?} (--acme-issuer or torii.dirba.io/acme-issuer): need an \
+             absolute https:// URL"
+        ))
+    }
+}
+
+/// The message of a caught panic, when it is a string.
+fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+    panic
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
 }
 
 /// The current state of a cert Secret for ACME purposes.
@@ -955,6 +1019,34 @@ mod tests {
     #[test]
     fn cert_not_after_rejects_garbage() {
         assert!(cert_not_after(b"not a pem").is_none());
+    }
+
+    #[test]
+    fn directory_url_must_be_absolute_https() {
+        assert!(check_directory_url("https://acme-v02.api.letsencrypt.org/directory").is_ok());
+        assert!(check_directory_url("https://127.0.0.1:14000/dir").is_ok());
+        for bad in [
+            "",
+            " ",
+            "https://acme.example/dir ",
+            "https://acme.example/dir\n",
+            "not a uri",
+            "/directory",
+            "http://acme.example/dir",
+            "acme.example/dir",
+        ] {
+            assert!(check_directory_url(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn panic_in_issuance_is_caught() {
+        let r = AssertUnwindSafe(async { panic!("infallible error should not occur") })
+            .catch_unwind()
+            .await;
+        assert_eq!(panic_message(&*r.unwrap_err()), "infallible error should not occur");
+        let r = AssertUnwindSafe(async { panic!("{}", 42) }).catch_unwind().await;
+        assert_eq!(panic_message(&*r.unwrap_err()), "42");
     }
 
     fn target(host: &str) -> AcmeTarget {
