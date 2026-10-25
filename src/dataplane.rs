@@ -778,6 +778,17 @@ const PIPE_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30
 /// path effectively uses.
 const H2_MAX_CONCURRENT_STREAMS: u32 = 256;
 
+/// Cap on the decoded header list of an HTTP/2 request (SETTINGS_MAX_HEADER_LIST_SIZE,
+/// RFC 9113 §6.5.2), counted as name + value + 32 bytes per field. Larger requests
+/// get a 431 (far larger ones a GOAWAY) before reaching the proxy. Without an
+/// explicit cap h2 accepts 16 MiB, and HPACK lets a client repeat a ~4 KB
+/// dynamic-table entry for one byte each, so ~8 KB on the wire decodes to a ~16 MB
+/// request that the proxy then serializes into one HTTP/1.1 head per stream: a few
+/// hundred KB of traffic OOMs the process. 64 KiB is Pingora's own default (Envoy
+/// uses 60 KiB), and bounds a connection's request heads to about
+/// `H2_MAX_CONCURRENT_STREAMS` × 64 KiB.
+const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+
 /// Deadline for completing the downstream TLS handshake. A client that opens TCP and
 /// sends a ClientHello then stalls would otherwise pin a task forever.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -791,6 +802,16 @@ const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// idle ESTABLISHED :443 connections). The h1 path is already bounded by its 60s
 /// keepalive; this gives h2 the equivalent. Matches nginx's ~75s keepalive_timeout.
 const H2_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
+
+/// h2 server settings for the terminate-then-HTTP path. Starts from Pingora's bounded
+/// defaults (`server::handshake` only applies them when given `None`) and sets the
+/// security-relevant limits explicitly, so they can't be dropped by accident.
+fn h2_server_options() -> pingora_core::protocols::http::v2::server::H2Options {
+    let mut options = pingora_core::protocols::http::v2::server::default_h2_options();
+    options.max_header_list_size(H2_MAX_HEADER_LIST_SIZE);
+    options.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+    options
+}
 
 /// The TLS data-plane application for a port that may carry TLSRoutes.
 ///
@@ -970,11 +991,10 @@ impl GatewayTlsApp {
             socket_digest: stream.get_socket_digest(),
         });
 
-        // Advertise a bounded max_concurrent_streams so a single connection can't
-        // open unboundedly many streams (each a spawned task). Start from any
-        // options the proxy provides, then enforce our cap.
-        let mut h2_options = self.proxy.h2_options().unwrap_or_default();
-        h2_options.max_concurrent_streams(H2_MAX_CONCURRENT_STREAMS);
+        // Advertise bounded max_concurrent_streams and max_header_list_size so a
+        // single connection can't open unboundedly many streams (each a spawned task)
+        // or send huge (HPACK-amplified) request heads.
+        let h2_options = h2_server_options();
         // Bound the h2 handshake: a client can negotiate the `h2` ALPN over TLS but then
         // never send the HTTP/2 connection preface, leaving `server::handshake` awaiting
         // forever. Such half-open connections (scanners, abandoned clients) would
@@ -1356,6 +1376,15 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
+    /// One raw HTTP/2 frame: 9-byte header (length, type, flags, stream id) + payload.
+    fn h2_frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+        f.extend([ty, flags]);
+        f.extend(stream.to_be_bytes());
+        f.extend(payload);
+        f
+    }
+
     // RUSTSEC-2026-0258: h2 < 0.4.16 queued every zero-length DATA frame until the
     // body was read, so a client that stalls the proxy's body read could stream 9-byte
     // empty frames (no flow-control cost) until OOM. The h2 server serve_h2 runs must
@@ -1364,14 +1393,6 @@ mod tests {
     async fn h2_empty_data_frame_flood_gets_goaway() {
         use pingora_core::protocols::Digest;
         use pingora_core::protocols::http::v2::server;
-
-        fn frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
-            let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
-            f.extend([ty, flags]);
-            f.extend(stream.to_be_bytes());
-            f.extend(payload);
-            f
-        }
 
         let (mut client, server_io) = tokio::io::duplex(64 * 1024);
         tokio::spawn(async move {
@@ -1387,10 +1408,10 @@ mod tests {
         // Preface, SETTINGS, HEADERS(END_HEADERS) for POST https://a/ (HPACK static
         // indices 3, 7, 4 and :authority literal), then 1000 empty DATA frames.
         let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
-        req.extend(frame(0x4, 0, 0, &[]));
-        req.extend(frame(0x1, 0x4, 1, &[0x83, 0x87, 0x84, 0x41, 0x01, b'a']));
+        req.extend(h2_frame(0x4, 0, 0, &[]));
+        req.extend(h2_frame(0x1, 0x4, 1, &[0x83, 0x87, 0x84, 0x41, 0x01, b'a']));
         for _ in 0..1000 {
-            req.extend(frame(0x0, 0, 1, &[]));
+            req.extend(h2_frame(0x0, 0, 1, &[]));
         }
         client.write_all(&req).await.unwrap();
 
@@ -1407,6 +1428,66 @@ mod tests {
         })
         .await;
         assert_eq!(goaway, Ok(Some(0xb)), "expected GOAWAY(ENHANCE_YOUR_CALM)");
+    }
+
+    // HPACK bomb: a header inserted into the dynamic table once, then repeated with
+    // 1-byte indexed fields, decodes to far more than its wire size. The h2 options
+    // serve_h2 runs must advertise a bounded SETTINGS_MAX_HEADER_LIST_SIZE and refuse
+    // such a request before it reaches the proxy, while the connection keeps serving.
+    #[tokio::test]
+    async fn h2_header_list_bomb_is_refused() {
+        use pingora_core::protocols::Digest;
+        use pingora_core::protocols::http::v2::server;
+
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        let (accepted_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut conn = server::handshake(Box::new(server_io), Some(h2_server_options()))
+                .await
+                .unwrap();
+            while let Ok(Some(s)) = server::HttpSession::from_h2_conn(&mut conn, Arc::new(Digest::default())).await {
+                let _ = accepted_tx.send(s.req_header().uri.path().to_string());
+            }
+        });
+
+        // GET https://a<path>: HPACK static indices 2 and 7, then :path and :authority
+        // literals without indexing, so the bomb's entry lands at dynamic index 62.
+        let request = |path: &str| {
+            let mut block = vec![0x82, 0x87, 0x04, path.len() as u8];
+            block.extend(path.as_bytes());
+            block.extend([0x01, 0x01, b'a']);
+            block
+        };
+        // `x: <100 bytes>` counts 133 bytes toward the list; 600 more references
+        // (0xbe = index 62) make ~80 KB decoded from ~700 B on the wire. That is over
+        // the 64 KiB cap but under h2's 4x threshold that tears down the connection.
+        let mut bomb = request("/bomb");
+        bomb.extend([0x40, 0x01, b'x', 100]);
+        bomb.extend([b'A'; 100]);
+        bomb.extend([0xbe; 600]);
+
+        let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        req.extend(h2_frame(0x4, 0, 0, &[]));
+        req.extend(h2_frame(0x1, 0x5, 1, &bomb)); // HEADERS, END_STREAM|END_HEADERS
+        req.extend(h2_frame(0x1, 0x5, 3, &request("/ok")));
+        client.write_all(&req).await.unwrap();
+
+        // The server's SETTINGS advertise both caps.
+        let mut head = [0u8; 9];
+        client.read_exact(&mut head).await.unwrap();
+        assert_eq!(head[3], 0x4, "server must open with SETTINGS");
+        let mut payload = vec![0; u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize];
+        client.read_exact(&mut payload).await.unwrap();
+        let setting = |id: u16| {
+            let s = payload.chunks(6).find(|s| s[..2] == id.to_be_bytes())?;
+            Some(u32::from_be_bytes(s[2..6].try_into().unwrap()))
+        };
+        assert_eq!(setting(0x6), Some(H2_MAX_HEADER_LIST_SIZE), "MAX_HEADER_LIST_SIZE");
+        assert_eq!(setting(0x3), Some(H2_MAX_CONCURRENT_STREAMS), "MAX_CONCURRENT_STREAMS");
+
+        // The bomb never reaches the proxy; the next stream on the connection does.
+        let first = tokio::time::timeout(Duration::from_secs(5), accepted.recv()).await;
+        assert_eq!(first, Ok(Some("/ok".to_string())), "over-size request must be refused");
     }
 
     // split_host_port matches Go's net.SplitHostPort: it unbrackets IPv6 literals
