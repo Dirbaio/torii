@@ -365,6 +365,24 @@ struct ListenerOutcome {
     /// *different* mode (Terminate vs Passthrough) and we don't support mixed
     /// termination → Accepted=False/ProtocolConflict. Computed across the port.
     protocol_conflict: bool,
+    /// The Gateway's `spec.tls.frontend` asks for client-certificate validation on
+    /// this HTTPS listener (see [`frontend_validation_requested`]). torii does not
+    /// implement it, so instead of serving the listener to every client it rejects
+    /// it (Accepted=False/UnsupportedValue) and serves none of it: no certificate,
+    /// no routes.
+    frontend_validation: bool,
+}
+
+impl ListenerOutcome {
+    /// Accepted: torii can serve the listener as specified.
+    fn accepted(&self) -> bool {
+        self.protocol_supported && !self.protocol_conflict && !self.frontend_validation
+    }
+
+    /// Programmed: accepted, with its route kinds and certificate refs valid.
+    fn programmed(&self) -> bool {
+        self.accepted() && self.tls_failure.is_none() && !self.invalid_kind
+    }
 }
 
 /// A `protocol: TLS` listener's mode, which decides the TLSRoute data path.
@@ -486,9 +504,10 @@ impl ReconcileCtx {
         let mut models: Vec<GatewayModel> = Vec::with_capacity(gateways.len());
         for gw in &gateways {
             let model = self.build_gateway_model(gw);
-            // Only a usable Gateway contributes certs to the data plane.
+            // Only a usable Gateway contributes certs to the data plane, and not
+            // for a listener that asks for client-certificate validation.
             if model.usable {
-                for l in &model.listeners {
+                for l in model.listeners.iter().filter(|l| !l.frontend_validation) {
                     if let Some((host, ck)) = &l.resolved_cert {
                         cert_store.insert(host.clone(), ck.clone());
                     }
@@ -510,13 +529,8 @@ impl ReconcileCtx {
         // (gw_ns, gw_name) → (listener_name → count).
         let mut attach_counts: BTreeMap<(String, String), BTreeMap<String, i32>> = BTreeMap::new();
         for route in &routes {
-            if let Some(patch) = self.process_route(
-                route,
-                &usable_gateways,
-                &upstream_tls,
-                &mut route_table,
-                &mut attach_counts,
-            ) {
+            if let Some(patch) = self.process_route(route, &models, &upstream_tls, &mut route_table, &mut attach_counts)
+            {
                 patches.push(patch);
             }
         }
@@ -821,6 +835,7 @@ impl ReconcileCtx {
             port: l.port as u16,
             tls_mode,
             protocol_conflict: false, // filled in across the port in build_gateway_model
+            frontend_validation: frontend_validation_requested(gw, l),
         }
     }
 
@@ -903,6 +918,13 @@ impl ReconcileCtx {
                 } else if o.protocol_conflict {
                     // Two TLS modes share this port and we don't support mixed.
                     condition("Accepted", "False", "ProtocolConflict", generation)
+                } else if o.frontend_validation {
+                    let msg = format!(
+                        "spec.tls.frontend asks for client certificate validation on port {}, which torii does \
+                         not support: the listener is not served",
+                        o.port
+                    );
+                    condition_msg("Accepted", "False", "UnsupportedValue", &msg, generation)
                 } else {
                     condition("Accepted", "True", "Accepted", generation)
                 };
@@ -914,12 +936,11 @@ impl ReconcileCtx {
                 } else {
                     condition("ResolvedRefs", "True", "ResolvedRefs", generation)
                 };
-                let programmed =
-                    if o.protocol_supported && o.tls_failure.is_none() && !o.invalid_kind && !o.protocol_conflict {
-                        condition("Programmed", "True", "Programmed", generation)
-                    } else {
-                        condition("Programmed", "False", "Invalid", generation)
-                    };
+                let programmed = if o.programmed() {
+                    condition("Programmed", "True", "Programmed", generation)
+                } else {
+                    condition("Programmed", "False", "Invalid", generation)
+                };
                 // A protocol-conflicted listener (mixed TLS termination, which we
                 // don't support) is rejected and advertises NO supported kinds —
                 // the conformance suite asserts an empty SupportedKinds for it.
@@ -947,7 +968,7 @@ impl ReconcileCtx {
             .collect();
 
         // Gateway-level conditions from the OUTCOME DATA (not from the listener
-        // conditions above). Listener Accepted depends on protocol_supported alone;
+        // conditions above), with the same `accepted`/`programmed` as each listener's:
         // invalid_kind/tls_failure affect ResolvedRefs/Programmed, not Accepted.
         let conditions = if model.invalid_parameters {
             vec![
@@ -955,21 +976,9 @@ impl ReconcileCtx {
                 condition("Programmed", "False", "InvalidParameters", generation),
             ]
         } else {
-            // A protocol-conflicted listener (mixed TLS termination, unsupported) is
-            // itself Accepted=False/Programmed=False, so it must not count as accepted
-            // or programmed in the Gateway-level rollup either.
-            let any_accepted = model
-                .listeners
-                .iter()
-                .any(|o| o.protocol_supported && !o.protocol_conflict);
-            let all_accepted = model
-                .listeners
-                .iter()
-                .all(|o| o.protocol_supported && !o.protocol_conflict);
-            let all_programmed = model
-                .listeners
-                .iter()
-                .all(|o| o.protocol_supported && o.tls_failure.is_none() && !o.invalid_kind && !o.protocol_conflict);
+            let any_accepted = model.listeners.iter().any(ListenerOutcome::accepted);
+            let all_accepted = model.listeners.iter().all(ListenerOutcome::accepted);
+            let all_programmed = model.listeners.iter().all(ListenerOutcome::programmed);
             let accepted = if any_accepted {
                 let reason = if all_accepted { "Accepted" } else { "ListenersNotValid" };
                 condition("Accepted", "True", reason, generation)
@@ -1035,7 +1044,7 @@ impl ReconcileCtx {
     fn process_route(
         &self,
         route: &HTTPRoute,
-        gateways: &[Arc<Gateway>],
+        models: &[GatewayModel],
         upstream_tls: &UpstreamTlsMap,
         table: &mut RouteTable,
         attach_counts: &mut BTreeMap<(String, String), BTreeMap<String, i32>>,
@@ -1048,18 +1057,18 @@ impl ReconcileCtx {
         for pref in route.spec.parent_refs.iter().flatten() {
             // Find the parent Gateway among the usable ones we own.
             let parent_ns = pref.namespace.clone().unwrap_or_else(|| route_ns.clone());
-            let Some(gw) = gateways
-                .iter()
-                .find(|g| g.name_any() == pref.name && g.namespace().unwrap_or_default() == parent_ns)
-            else {
+            let Some(model) = models.iter().find(|m| {
+                m.usable && m.gw.name_any() == pref.name && m.gw.namespace().unwrap_or_default() == parent_ns
+            }) else {
                 continue; // not ours / not found / not usable — don't claim status
             };
+            let gw = &model.gw;
 
             // Determine which of the Gateway's listeners this route attaches to,
             // honoring sectionName, port, allowedRoutes (namespaces + kinds), and
             // listener hostname. Returns the attached listeners and, if none, the
             // Accepted=False reason. Computed ONCE; drives both counts and routing.
-            let (attached_listeners, accept_reason) = self.attached_listeners(route, gw, pref);
+            let (attached_listeners, accept_reason) = self.attached_listeners(route, model, pref);
 
             // attachedRoutes counts: ensure every listener has a 0 entry, then
             // increment the ones this route attached to.
@@ -1233,16 +1242,18 @@ impl ReconcileCtx {
     ///
     /// Returns the attached listeners and, when none attach, the Accepted=False
     /// reason to report (NoMatchingParent for sectionName/port mismatch;
-    /// NotAllowedByListeners for namespace/kind/hostname rejection).
+    /// NotAllowedByListeners for namespace/kind/hostname rejection). A listener
+    /// that asks for client-certificate validation takes no routes.
     fn attached_listeners(
         &self,
         route: &HTTPRoute,
-        gw: &Gateway,
+        model: &GatewayModel,
         pref: &gateway_api::apis::standard::httproutes::HttpRouteParentRefs,
     ) -> (
         Vec<gateway_api::apis::standard::gateways::GatewayListeners>,
         Option<&'static str>,
     ) {
+        let gw = &model.gw;
         let route_ns = route.namespace().unwrap_or_default();
         let route_hostnames: &[String] = route.spec.hostnames.as_deref().unwrap_or_default();
 
@@ -1269,6 +1280,14 @@ impl ReconcileCtx {
         let mut rejected_by_allow = false; // namespace/kind → NotAllowedByListeners
         let mut rejected_by_hostname = false; // hostname → NoMatchingListenerHostname
         for l in candidates {
+            if model
+                .listeners
+                .iter()
+                .any(|o| o.name == l.name && o.frontend_validation)
+            {
+                rejected_by_allow = true;
+                continue;
+            }
             if !self.listener_allows_namespace(&l, gw, &route_ns) {
                 rejected_by_allow = true;
                 continue;
@@ -2183,6 +2202,26 @@ fn listener_allows_kind(listener: &gateway_api::apis::standard::gateways::Gatewa
     }
 }
 
+/// Does the Gateway's `spec.tls.frontend` ask for client-certificate validation
+/// (mutual TLS) on this listener? It covers the HTTPS listeners of a port: by the
+/// `perPort` entry for that port when there is one, which replaces the default even
+/// without a `validation`, and by the `default` otherwise (GEP-91).
+fn frontend_validation_requested(
+    gw: &Gateway,
+    listener: &gateway_api::apis::standard::gateways::GatewayListeners,
+) -> bool {
+    let Some(frontend) = gw.spec.tls.as_ref().and_then(|t| t.frontend.as_ref()) else {
+        return false;
+    };
+    if listener.protocol != "HTTPS" {
+        return false;
+    }
+    match frontend.per_port.iter().flatten().find(|p| p.port == listener.port) {
+        Some(p) => p.tls.validation.is_some(),
+        None => frontend.default.validation.is_some(),
+    }
+}
+
 /// Does the listener hostname overlap with the route's hostnames? A listener with
 /// no hostname matches anything; route with no hostnames matches the listener.
 fn listener_hostname_overlaps(listener_host: Option<&str>, route_hosts: &[String]) -> bool {
@@ -2764,6 +2803,153 @@ mod tests {
         writer.apply_watcher_event(&decode_event(watcher::Event::Apply(gateway("Bogus"))).unwrap());
         assert!(find_in(&store, "ns", "gw").is_none());
         assert!(decode_event::<Gateway>(watcher::Event::InitApply(gateway("Bogus"))).is_none());
+    }
+
+    /// A store holding `objects`.
+    fn store_of<K>(objects: Vec<K>) -> Store<K>
+    where
+        K: Resource + Clone + 'static,
+        K::DynamicType: Eq + std::hash::Hash + Clone + Default,
+    {
+        let (store, mut writer) = reflector::store::<K>();
+        for obj in objects {
+            writer.apply_watcher_event(&watcher::Event::Apply(obj));
+        }
+        store
+    }
+
+    // GEP-91 client-certificate validation is not implemented, so torii must not
+    // serve the HTTPS listeners it covers to clients without a certificate: they
+    // are rejected and get neither their certificate nor routes. A `perPort` entry
+    // replaces the default for its port, and HTTP listeners are not covered.
+    #[tokio::test]
+    async fn frontend_validation_rejects_the_https_listeners() {
+        let ca_refs = serde_json::json!([{ "group": "", "kind": "ConfigMap", "name": "ca" }]);
+        let https = |name: &str, port: u16, hostname: &str| {
+            serde_json::json!({
+                "name": name, "port": port, "protocol": "HTTPS", "hostname": hostname,
+                "tls": { "certificateRefs": [{ "name": "cert" }] },
+            })
+        };
+        let gw: Gateway = serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "Gateway",
+            "metadata": { "name": "gw", "namespace": "ns", "generation": 2 },
+            "spec": {
+                "gatewayClassName": "torii",
+                "tls": { "frontend": {
+                    "default": { "validation": { "caCertificateRefs": ca_refs } },
+                    "perPort": [
+                        { "port": 8443, "tls": {} },
+                        { "port": 9443, "tls": { "validation": {
+                            "caCertificateRefs": ca_refs, "mode": "AllowInsecureFallback",
+                        } } },
+                    ],
+                } },
+                "listeners": [
+                    https("https", 443, "a.example"),
+                    https("https-8443", 8443, "b.example"),
+                    https("https-9443", 9443, "c.example"),
+                    { "name": "http", "port": 80, "protocol": "HTTP" },
+                ],
+            },
+        }))
+        .unwrap();
+        let class: GatewayClass = serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "GatewayClass",
+            "metadata": { "name": "torii" },
+            "spec": { "controllerName": CONTROLLER_NAME },
+        }))
+        .unwrap();
+        let route: HTTPRoute = serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": { "name": "route", "namespace": "ns" },
+            "spec": { "parentRefs": [{ "name": "gw" }], "rules": [{}] },
+        }))
+        .unwrap();
+        let ck = CertKey::generate_self_signed().unwrap();
+        let mut secret = Secret::default();
+        secret.metadata.name = Some("cert".into());
+        secret.metadata.namespace = Some("ns".into());
+        secret.data = Some(BTreeMap::from([
+            ("tls.crt".to_string(), k8s_openapi::ByteString(ck.cert_pem)),
+            ("tls.key".to_string(), k8s_openapi::ByteString(ck.key_pem)),
+        ]));
+
+        // The API server is a closed port: the status writes fail, and are only logged.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let closed = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let client = Client::try_from(kube::Config::new(format!("http://{closed}").parse().unwrap())).unwrap();
+        let ctx = ReconcileCtx {
+            client,
+            data_plane: DataPlane::new(),
+            config: ControllerConfig {
+                advertise_address: "127.0.0.1".into(),
+                acme_feed: None,
+                acme_default_issuer: None,
+                acme_default_email: None,
+            },
+            stores: Arc::new(Stores {
+                gateway_classes: store_of(vec![class]),
+                gateways: store_of(vec![gw.clone()]),
+                routes: store_of(vec![route]),
+                tls_routes: store_of(vec![]),
+                services: store_of(vec![]),
+                endpoint_slices: store_of(vec![]),
+                reference_grants: store_of(vec![]),
+                namespaces: store_of(vec![]),
+                secrets: store_of(vec![secret]),
+                config_maps: store_of(vec![]),
+                backend_tls_policies: store_of(vec![]),
+            }),
+        };
+
+        // Served: only the HTTP listener and the HTTPS one on the port whose
+        // `perPort` entry turns validation off.
+        ctx.reconcile_all().await.unwrap();
+        let snapshot = ctx.data_plane.load();
+        let ports: std::collections::BTreeSet<u16> = snapshot.routes.entries.iter().map(|e| e.listener_port).collect();
+        assert_eq!(ports, [80, 8443].into());
+        assert!(snapshot.certs.select(Some("b.example")).is_some());
+        assert!(snapshot.certs.select(Some("a.example")).is_none());
+        assert!(snapshot.certs.select(Some("c.example")).is_none());
+
+        // Reported: the others are not accepted, so neither is the whole Gateway.
+        let mut patch = ctx.gateway_patch(&ctx.build_gateway_model(&gw), &BTreeMap::new());
+        let status: GatewayStatus = serde_json::from_value(patch.json["status"].take()).unwrap();
+        let reasons = |conditions: &[Condition]| -> Vec<String> {
+            conditions
+                .iter()
+                .map(|c| format!("{}={}/{}", c.type_, c.status, c.reason))
+                .collect()
+        };
+        let listener = |name: &str| {
+            let listeners = status.listeners.as_deref().unwrap();
+            reasons(&listeners.iter().find(|l| l.name == name).unwrap().conditions)
+        };
+        let rejected = [
+            "Accepted=False/UnsupportedValue",
+            "Programmed=False/Invalid",
+            "ResolvedRefs=True/ResolvedRefs",
+        ];
+        let served = [
+            "Accepted=True/Accepted",
+            "Programmed=True/Programmed",
+            "ResolvedRefs=True/ResolvedRefs",
+        ];
+        assert_eq!(listener("https"), rejected);
+        assert_eq!(listener("https-8443"), served);
+        assert_eq!(listener("https-9443"), rejected);
+        assert_eq!(listener("http"), served);
+        assert_eq!(
+            reasons(status.conditions.as_deref().unwrap()),
+            ["Accepted=True/ListenersNotValid", "Programmed=False/Invalid"]
+        );
     }
 
     fn lbls(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
