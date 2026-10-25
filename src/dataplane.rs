@@ -1209,10 +1209,24 @@ const H2_MAX_CONCURRENT_STREAMS: u32 = 100;
 /// explicit cap h2 accepts 16 MiB, and HPACK lets a client repeat a ~4 KB
 /// dynamic-table entry for one byte each, so ~8 KB on the wire decodes to a ~16 MB
 /// request that the proxy then serializes into one HTTP/1.1 head per stream: a few
-/// hundred KB of traffic OOMs the process. 64 KiB is Pingora's own default (Envoy
-/// uses 60 KiB), and bounds a connection's request heads to about
-/// `H2_MAX_CONCURRENT_STREAMS` × 64 KiB.
-const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
+/// hundred KB of traffic OOMs the process.
+///
+/// The 32 bytes undercount a decoded field, which takes ~70-100 bytes in a
+/// `HeaderMap`, and an empty field repeated costs one byte on the wire: ~1 KB fits
+/// ~1,000 fields into this list. [`H2_MAX_HEADER_FIELDS`] keeps such a head from the
+/// proxy, but not request trailers, which Pingora never reads, so h2 keeps them
+/// decoded until the stream ends. That is why this is half Pingora's 64 KiB default:
+/// it bounds held trailers to ~75 KB a stream. Backends seldom take more anyway:
+/// Tomcat and Jetty refuse heads over 8 KiB by default, Node over 16 KiB.
+const H2_MAX_HEADER_LIST_SIZE: u32 = 32 * 1024;
+
+/// Cap on the fields of an HTTP/2 request head: 256, as Pingora's h1 parser allows.
+/// The proxy keeps two copies of a head while it forwards it (three for a moment), so
+/// the ~1,000 one-byte fields that fit [`H2_MAX_HEADER_LIST_SIZE`] would hold ~150 KB
+/// a stream (with a 64 KiB list, 16 connections of such streams, 3 MB sent, OOMed a
+/// 512 MiB torii). `GatewayTlsApp::serve_h2_streams` answers a longer head with a 431,
+/// as h2 does an over-size one, before the stream gets a task or the proxy copies it.
+const H2_MAX_HEADER_FIELDS: usize = 256;
 
 /// Deadline for completing the downstream TLS handshake, on TLSRoute Terminate and the
 /// HTTPS fallback alike (see `GatewayTlsApp::tls_accept`). A client that opens TCP and
@@ -1547,6 +1561,15 @@ impl GatewayTlsApp {
             };
             match next {
                 Ok(Some(mut session)) => {
+                    // Too many fields to forward (see H2_MAX_HEADER_FIELDS): answer it
+                    // as h2 answers an over-size head. Dropping the session frees it.
+                    if session.req_header().headers.len() > H2_MAX_HEADER_FIELDS {
+                        tracing::debug!("HTTPS h2 request has too many header fields -> 431");
+                        if let Ok(resp) = ResponseHeader::build(431, None) {
+                            let _ = session.write_response_header(Box::new(resp), true);
+                        }
+                        continue;
+                    }
                     // A task that ended since the last poll is still in `tasks`.
                     while tasks.try_join_next().is_some() {}
                     if tasks.len() >= H2_MAX_CONCURRENT_STREAMS as usize {
@@ -2284,24 +2307,21 @@ mod tests {
     }
 
     // HPACK bomb: a header inserted into the dynamic table once, then repeated with
-    // 1-byte indexed fields, decodes to far more than its wire size. The h2 options
-    // serve_h2 runs must advertise a bounded SETTINGS_MAX_HEADER_LIST_SIZE and refuse
-    // such a request before it reaches the proxy, while the connection keeps serving.
+    // 1-byte indexed fields, decodes to far more than its wire size. serve_h2's accept
+    // loop must advertise a bounded SETTINGS_MAX_HEADER_LIST_SIZE and refuse such a
+    // request before it reaches the proxy, while the connection keeps serving.
     #[tokio::test]
     async fn h2_header_list_bomb_is_refused() {
-        use pingora_core::protocols::Digest;
-        use pingora_core::protocols::http::v2::server;
-
         let (mut client, server_io) = tokio::io::duplex(64 * 1024);
         let (accepted_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
-        tokio::spawn(async move {
-            let mut conn = server::handshake(Box::new(server_io), Some(h2_server_options()))
-                .await
-                .unwrap();
-            while let Ok(Some(s)) = server::HttpSession::from_h2_conn(&mut conn, Arc::new(Digest::default())).await {
-                let _ = accepted_tx.send(s.req_header().uri.path().to_string());
-            }
-        });
+        tokio::spawn(GatewayTlsApp::serve_h2_streams(
+            Box::new(server_io),
+            CLIENT_STALL_TIMEOUT,
+            move |session| {
+                let _ = accepted_tx.send(session.req_header().uri.path().to_string());
+                async {}
+            },
+        ));
 
         // GET https://a<path>: HPACK static indices 2 and 7, then :path and :authority
         // literals without indexing, so the bomb's entry lands at dynamic index 62.
@@ -2311,13 +2331,14 @@ mod tests {
             block.extend([0x01, 0x01, b'a']);
             block
         };
-        // `x: <100 bytes>` counts 133 bytes toward the list; 600 more references
-        // (0xbe = index 62) make ~80 KB decoded from ~700 B on the wire. That is over
-        // the 64 KiB cap but under h2's 4x threshold that tears down the connection.
+        // `x: <1000 bytes>` (7f e9 06 is 1000 as an HPACK integer) counts 1033 bytes
+        // toward the list; 39 more references (0xbe = index 62) make ~41 KB decoded
+        // from ~1 KB on the wire, in fewer fields than H2_MAX_HEADER_FIELDS. That is
+        // over the 32 KiB cap but under h2's 4x threshold that tears down the connection.
         let mut bomb = request("/bomb");
-        bomb.extend([0x40, 0x01, b'x', 100]);
-        bomb.extend([b'A'; 100]);
-        bomb.extend([0xbe; 600]);
+        bomb.extend([0x40, 0x01, b'x', 0x7f, 0xe9, 0x06]);
+        bomb.extend([b'A'; 1000]);
+        bomb.extend([0xbe; 39]);
 
         let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
         req.extend(h2_frame(0x4, 0, 0, &[]));
@@ -2341,6 +2362,49 @@ mod tests {
         // The bomb never reaches the proxy; the next stream on the connection does.
         let first = tokio::time::timeout(Duration::from_secs(5), accepted.recv()).await;
         assert_eq!(first, Ok(Some("/ok".to_string())), "over-size request must be refused");
+    }
+
+    // The header list's 32 bytes per field undercount what a decoded field costs, and
+    // HPACK repeats a field for one byte: ~1,000 empty fields fit in 32 KiB from ~1 KB
+    // on the wire. A head with more fields than H2_MAX_HEADER_FIELDS must get a 431
+    // before it reaches the proxy, while one at the cap is served.
+    #[tokio::test]
+    async fn h2_too_many_header_fields_are_refused() {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let (accepted_tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(GatewayTlsApp::serve_h2_streams(
+            Box::new(server_io),
+            CLIENT_STALL_TIMEOUT,
+            move |mut session| {
+                let _ = accepted_tx.send(session.req_header().uri.path().to_string());
+                let resp = ResponseHeader::build(200, None).unwrap();
+                session.write_response_header(Box::new(resp), true).unwrap();
+                async {}
+            },
+        ));
+        let (client, conn) = h2::client::handshake(client_io).await.unwrap();
+        tokio::spawn(conn);
+
+        // GET https://a<path> with `fields` copies of `x: ''` (33 bytes in the list).
+        let get = async |path: &str, fields: usize| {
+            let mut req = http::Request::get(format!("https://a{path}")).body(()).unwrap();
+            for _ in 0..fields {
+                req.headers_mut().append("x", http::HeaderValue::from_static(""));
+            }
+            let mut client = client.clone().ready().await.unwrap();
+            let (resp, _) = client.send_request(req, true).unwrap();
+            let resp = tokio::time::timeout(Duration::from_secs(5), resp).await.unwrap();
+            resp.unwrap().status().as_u16()
+        };
+        // As many as fit the header list, with room for the pseudo-headers.
+        let fit = (H2_MAX_HEADER_LIST_SIZE as usize - 512) / 33;
+        assert_eq!(get("/bomb", fit).await, 431, "{fit} fields");
+        assert_eq!(get("/cap", H2_MAX_HEADER_FIELDS).await, 200, "fields at the cap");
+        assert_eq!(get("/over", H2_MAX_HEADER_FIELDS + 1).await, 431, "over the cap");
+
+        // Only the head within the cap reached the proxy.
+        assert_eq!(accepted.try_recv(), Ok("/cap".to_string()));
+        assert!(accepted.try_recv().is_err(), "a refused head reached the proxy");
     }
 
     // A request whose content-length does not match its DATA is malformed and must not
