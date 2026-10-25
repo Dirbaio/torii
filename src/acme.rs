@@ -5,10 +5,10 @@
 //! value is ignored). The ACME directory URL and contact email come from the CLI
 //! (`--acme-issuer` / `--acme-email`), optionally overridden per-Gateway by the
 //! `torii.dirba.io/acme-issuer` / `-email` annotations. For each HTTPS/TLS-terminate
-//! listener with a (single, non-wildcard) hostname and a `certificateRefs` Secret,
-//! we obtain a cert and write it into that Secret — the controller's existing Secret
-//! watcher + cert store then serve it, no special data-plane path for the *issued*
-//! cert.
+//! listener with a (single, non-wildcard) hostname and a `certificateRefs` Secret in
+//! `--acme-namespace`, we obtain a cert and write it into that Secret — the
+//! controller's existing Secret watcher + cert store then serve it, no special
+//! data-plane path for the *issued* cert.
 //!
 //! ## Multi-instance
 //! Issuance is driven by a single leader (a `coordination.k8s.io` Lease). But the
@@ -19,7 +19,8 @@
 //! ## State (all in k8s, in `--acme-namespace`)
 //! - account key: Secret `torii-acme-account` (`credentials.json`).
 //! - in-flight challenge certs: Secret `torii-acme-challenge` (`<host>.crt/.key`).
-//! - issued certs: each listener's own `certificateRefs` Secret (`tls.crt/tls.key`).
+//! - issued certs: each listener's own `certificateRefs` Secret (`tls.crt/tls.key`),
+//!   which must be in this namespace too: torii writes Secrets nowhere else.
 
 use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
@@ -507,6 +508,18 @@ async fn scan_and_issue(
                 },
             )
             .await;
+            continue;
+        }
+
+        // torii may write Secrets only in its own namespace (the shipped RBAC
+        // grants no more: writing Secrets anywhere is cluster-admin equivalent).
+        if target.secret_ns != config.namespace {
+            let detail = format!(
+                "certificateRef Secret {}/{} is outside {}, the only namespace ACME writes certificates to \
+                 (--acme-namespace); reference a Secret there",
+                target.secret_ns, target.secret_name, config.namespace
+            );
+            patch_acme_status(client, target, &AcmeState::Failed { detail, retry_in_s: 0 }).await;
             continue;
         }
 

@@ -87,8 +87,14 @@ spec:
       tls:
         mode: Terminate
         certificateRefs:
-          - { kind: Secret, name: app-tls }   # Torii creates/populates this Secret
+          # Torii creates/populates this Secret. It must be in --acme-namespace.
+          - { kind: Secret, name: app-tls, namespace: torii-system }
 ```
+
+- torii writes certificates only into Secrets in `--acme-namespace`, the only namespace where its RBAC allows
+  writing Secrets. A listener whose certificateRef is elsewhere reports the ACME issuance as failed. A Gateway in
+  another namespace needs a ReferenceGrant in `--acme-namespace` for its certificateRef, as for any
+  cross-namespace Secret.
 
 - Issuance status is reported in the `status` field of the `Gateway` and is visible with `kubectl describe`.
 - Certificates are automatically renewed 30 days before expiry.

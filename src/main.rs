@@ -132,8 +132,8 @@ struct Cli {
     acme: bool,
 
     /// Namespace where ACME state Secrets are stored (account key, in-flight
-    /// challenge cert). The issued certs go into each listener's own
-    /// certificateRefs Secret, not here.
+    /// challenge cert), and the only one ACME writes issued certs to: a listener's
+    /// certificateRefs Secret must be here.
     #[arg(long, env = "TORII_ACME_NAMESPACE", default_value = "torii-system")]
     acme_namespace: String,
 

@@ -60,7 +60,8 @@ rules:
       - httproutes/status
       - tlsroutes/status
       - backendtlspolicies/status
-    verbs: ["get", "patch", "update"]
+    # Status is written with server-side apply only.
+    verbs: ["patch"]
   # --- Core resources used for routing/backends/certs (read-only) ---
   - apiGroups: [""]
     resources: ["services", "namespaces", "configmaps"]
@@ -69,16 +70,14 @@ rules:
     resources: ["endpointslices"]
     verbs: ["get", "list", "watch"]
   # --- Secrets: read everywhere (TLS cert Secrets referenced by listeners /
-  #     BackendTLSPolicy can live in any namespace via ReferenceGrant). ---
+  #     BackendTLSPolicy can live in any namespace via ReferenceGrant).
+  #     Never grant torii Secret writes cluster-wide: whoever can create
+  #     Secrets in a namespace can mint a token for any ServiceAccount in it
+  #     (kube-system has ones that can escalate to cluster-admin). ACME writes
+  #     only in --acme-namespace, with the Role below. ---
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get", "list", "watch"]
-  # --- Secrets WRITE (ACME only): torii writes each issued cert into the
-  #     listener's own certificateRefs Secret, which may be in ANY namespace.
-  #     Drop this rule if you don't run with --acme. ---
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["create", "update", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
@@ -95,8 +94,9 @@ subjects:
     name: torii
     namespace: torii-system
 ---
-# Namespaced permissions for ACME state (account key, in-flight challenge cert)
-# and leader election — all confined to torii-system (--acme-namespace).
+# Namespaced permissions for ACME state (account key, in-flight challenge cert),
+# issued certs (listener certificateRefs Secrets must be here) and leader
+# election — all confined to torii-system (--acme-namespace).
 # Harmless to keep even when --acme is off.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -111,7 +111,7 @@ rules:
     verbs: ["get", "list", "watch", "create", "update", "patch"]
   - apiGroups: ["coordination.k8s.io"]
     resources: ["leases"]
-    verbs: ["get", "list", "watch", "create", "update", "patch"]
+    verbs: ["get", "create", "patch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
