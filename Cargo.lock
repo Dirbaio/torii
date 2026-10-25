@@ -3018,6 +3018,7 @@ dependencies = [
  "serde_json",
  "tikv-jemallocator",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber",
  "x509-parser 0.16.0",

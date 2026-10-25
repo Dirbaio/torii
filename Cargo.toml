@@ -37,6 +37,7 @@ pingora-http = { git = "https://github.com/cloudflare/pingora" }
 h2 = "0.4.20"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio-util = { version = "0.7", features = ["io"] } # poll_read_buf
 clap = { version = "4", features = ["derive", "env"] }
 # kube's `rustls-tls` leaves the crypto backend to the app; we pick `ring` and
 # install it as the process default before building any client.

@@ -861,6 +861,218 @@ impl pingora_core::protocols::Peek for BoxedStream {
     }
 }
 
+/// The stream an HTTP/1.x connection runs on (see [`serve_h1`]): it hands Pingora each
+/// request head in a few reads, however many pieces the client splits it into.
+///
+/// Pingora's `read_request()` runs httparse over the whole buffered head again after
+/// every read that leaves it incomplete, so a head of H bytes that arrives in k reads
+/// costs about k·H/2 of parsing, up to Pingora's 1 MiB head limit. A client gets
+/// 1-byte reads for free over TLS (OpenSSL returns one record per read, and a record
+/// may carry one byte), or with one TCP segment per byte: one client sending a long
+/// head that way held the TLS ports' only thread for over a minute.
+///
+/// While it reads a head, this holds back what it reads until the head is complete
+/// (see [`HeadScan`]) or it holds as many bytes as Pingora already has, so Pingora
+/// parses a head in sizes that double: linear in all. The first bytes go through at
+/// once, so Pingora still rejects a malformed head as soon as it arrives, and its
+/// 1 MiB limit still applies. After the head, reads pass straight through (the body,
+/// an upgraded connection) until [`Self::arm`] is called for the next request.
+#[derive(Debug)]
+struct H1Stream {
+    stream: pingora_core::protocols::Stream,
+    /// Bytes read from `stream` that Pingora has not taken yet.
+    buf: bytes::BytesMut,
+    /// How many of the leading bytes of `buf` Pingora may take.
+    released: usize,
+    /// While a request head is being read: where its end-of-head scan stands, and
+    /// how many of its bytes Pingora has taken.
+    head: Option<(HeadScan, usize)>,
+}
+
+impl H1Stream {
+    fn new(stream: pingora_core::protocols::Stream) -> Self {
+        H1Stream {
+            stream,
+            buf: bytes::BytesMut::new(),
+            released: 0,
+            head: Some(Default::default()),
+        }
+    }
+
+    /// Start reading the next request head. What Pingora has not taken yet is its
+    /// start, and goes through at once, like the first bytes of any head.
+    fn arm(&mut self) {
+        let mut scan = HeadScan::default();
+        self.head = (!scan.feed(&self.buf)).then_some((scan, 0));
+        self.released = self.buf.len();
+    }
+}
+
+/// How much [`H1Stream`] reads at a time while it holds back a request head; the
+/// size of the buffer Pingora starts a head in.
+const H1_HEAD_READ_SIZE: usize = 4096;
+
+impl tokio::io::AsyncRead for H1Stream {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        out: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::task::{Poll, ready};
+
+        use bytes::Buf;
+
+        let this = &mut *self;
+        loop {
+            if this.released > 0 {
+                let n = this.released.min(out.remaining());
+                out.put_slice(&this.buf[..n]);
+                this.buf.advance(n);
+                this.released -= n;
+                match &mut this.head {
+                    Some((_, taken)) => *taken += n,
+                    // Don't keep the buffer on an idle connection.
+                    None if this.buf.is_empty() => this.buf = bytes::BytesMut::new(),
+                    None => {}
+                }
+                return Poll::Ready(Ok(()));
+            }
+            let Some((scan, taken)) = &mut this.head else {
+                return std::pin::Pin::new(&mut *this.stream).poll_read(cx, out);
+            };
+            // Everything in `buf` is held back. A client can feed one byte per read
+            // without end, so take part in Tokio's cooperative scheduling.
+            let coop = ready!(tokio::task::coop::poll_proceed(cx));
+            let held = this.buf.len();
+            this.buf.reserve(H1_HEAD_READ_SIZE);
+            let n = ready!(tokio_util::io::poll_read_buf(
+                std::pin::Pin::new(&mut *this.stream),
+                cx,
+                &mut this.buf
+            ))?;
+            coop.made_progress();
+            // At EOF, Pingora gets what there is, then the EOF.
+            if n == 0 || scan.feed(&this.buf[held..]) {
+                this.head = None;
+                if this.buf.is_empty() {
+                    return Poll::Ready(Ok(()));
+                }
+            } else if this.buf.len() < *taken {
+                continue;
+            }
+            this.released = this.buf.len();
+        }
+    }
+}
+
+impl tokio::io::AsyncWrite for H1Stream {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut *self.stream).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.stream).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut *self.stream).poll_shutdown(cx)
+    }
+}
+
+#[async_trait]
+impl pingora_core::protocols::Shutdown for H1Stream {
+    async fn shutdown(&mut self) {
+        pingora_core::protocols::Shutdown::shutdown(&mut *self.stream).await
+    }
+}
+
+impl pingora_core::protocols::UniqueID for H1Stream {
+    fn id(&self) -> pingora_core::protocols::UniqueIDType {
+        self.stream.id()
+    }
+}
+
+impl pingora_core::protocols::Ssl for H1Stream {
+    fn get_ssl(&self) -> Option<&pingora_core::protocols::tls::TlsRef> {
+        self.stream.get_ssl()
+    }
+    fn get_ssl_digest(&self) -> Option<std::sync::Arc<pingora_core::protocols::tls::SslDigest>> {
+        self.stream.get_ssl_digest()
+    }
+    fn selected_alpn_proto(&self) -> Option<pingora_core::protocols::ALPN> {
+        self.stream.selected_alpn_proto()
+    }
+}
+
+impl pingora_core::protocols::GetTimingDigest for H1Stream {
+    fn get_timing_digest(&self) -> Vec<Option<pingora_core::protocols::TimingDigest>> {
+        self.stream.get_timing_digest()
+    }
+    fn get_read_pending_time(&self) -> std::time::Duration {
+        self.stream.get_read_pending_time()
+    }
+    fn get_write_pending_time(&self) -> std::time::Duration {
+        self.stream.get_write_pending_time()
+    }
+}
+
+impl pingora_core::protocols::GetProxyDigest for H1Stream {
+    fn get_proxy_digest(&self) -> Option<std::sync::Arc<pingora_core::protocols::raw_connect::ProxyDigest>> {
+        self.stream.get_proxy_digest()
+    }
+}
+
+impl pingora_core::protocols::GetSocketDigest for H1Stream {
+    fn get_socket_digest(&self) -> Option<std::sync::Arc<pingora_core::protocols::SocketDigest>> {
+        self.stream.get_socket_digest()
+    }
+}
+
+/// Peeking is not supported: it would have to see past the held-back bytes.
+impl pingora_core::protocols::Peek for H1Stream {}
+
+/// The scan for the end of an HTTP/1.x request head, fed its bytes as they arrive:
+/// the first empty line after the request line, as httparse finds it. Lines end in
+/// LF or CRLF, and empty lines before the request line are skipped. Bytes httparse
+/// would reject (a CR not followed by LF) never end the head here, so a scan never
+/// ends early, and Pingora rejects such a head when it gets it.
+#[derive(Clone, Copy, Debug, Default)]
+enum HeadScan {
+    /// No request line yet.
+    #[default]
+    Start,
+    /// Inside a line.
+    Line,
+    /// At the start of a line after the request line.
+    LineStart,
+    /// After a CR at the start of a line.
+    LineStartCr,
+}
+
+impl HeadScan {
+    /// Feed the next bytes of the head; true if they complete it.
+    fn feed(&mut self, bytes: &[u8]) -> bool {
+        for &b in bytes {
+            *self = match (*self, b) {
+                (Self::Start, b'\r' | b'\n') => Self::Start,
+                (Self::Line, b'\n') => Self::LineStart,
+                (Self::LineStart, b'\r') => Self::LineStartCr,
+                (Self::LineStart | Self::LineStartCr, b'\n') => return true,
+                _ => Self::Line,
+            };
+        }
+        false
+    }
+}
+
 /// Maximum ClientHello we'll peek when extracting the SNI. A real ClientHello is
 /// well under this; capping bounds the `read_exact`-based peek so a malicious or
 /// broken client can't make us wait for bytes that never arrive.
@@ -931,8 +1143,9 @@ const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 const H2_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(75);
 
 /// Idle timeout for an HTTP/1.x connection: how long it may wait for (each read of)
-/// the next request head. A whole number of seconds (Pingora's keepalive unit). 60s
-/// is what Pingora's plain-HTTP accept loop uses for the first request.
+/// the next request head, where [`H1Stream`] ends a read only once the head is
+/// complete or has doubled. A whole number of seconds (Pingora's keepalive unit). 60s
+/// is what Pingora's own accept loop uses for the first request.
 const H1_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long `GatewayTlsApp::serve_h2_streams` tries to flush the GOAWAY when it cuts
@@ -1096,33 +1309,9 @@ impl GatewayTlsApp {
         if matches!(stream.selected_alpn_proto(), Some(ALPN::H2)) {
             self.serve_h2(stream, shutdown).await;
         } else {
-            self.serve_h1(stream, shutdown).await;
+            serve_h1(&self.proxy, stream, shutdown).await;
         }
         None
-    }
-
-    /// HTTP/1.1 accept loop with keepalive reuse.
-    async fn serve_h1(&self, stream: pingora_core::protocols::Stream, shutdown: &pingora_core::server::ShutdownWatch) {
-        use pingora_core::apps::HttpServerApp;
-        use pingora_core::protocols::http::ServerSession;
-
-        let mut session = ServerSession::new_http1(stream);
-        // Idle timeout for the first request, or none while shutting down. The later
-        // ones get it from `GatewayProxy::early_request_filter`.
-        session.set_keepalive(if *shutdown.borrow() {
-            None
-        } else {
-            Some(H1_IDLE_TIMEOUT.as_secs())
-        });
-
-        let mut result = self.proxy.process_new_http(session, shutdown).await;
-        while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
-            let mut session = ServerSession::new_http1(stream);
-            if let Some(ps) = persistent_settings {
-                ps.apply_to_session(&mut session);
-            }
-            result = self.proxy.process_new_http(session, shutdown).await;
-        }
     }
 
     /// HTTP/2: drive each stream of the connection through the proxy.
@@ -1312,8 +1501,44 @@ async fn h2_body_stalled(mut done: tokio::sync::watch::Receiver<bool>, timeout: 
     std::future::pending().await
 }
 
-/// The application for the plain-HTTP ports: Pingora's own HTTP accept loop, run on a
-/// [`BoxedStream`] so that writes to the client are bounded.
+/// HTTP/1.x accept loop with keepalive reuse, for the plain-HTTP ports and the HTTPS
+/// fallback. It is Pingora's own (`HttpServerApp::process_new` in `apps/mod.rs`,
+/// without the h2c and request-limit options torii does not set), run on an
+/// [`H1Stream`] that is armed for each request head.
+async fn serve_h1(
+    proxy: &Arc<pingora_proxy::HttpProxy<GatewayProxy>>,
+    stream: pingora_core::protocols::Stream,
+    shutdown: &pingora_core::server::ShutdownWatch,
+) {
+    use pingora_core::apps::HttpServerApp;
+    use pingora_core::protocols::http::ServerSession;
+
+    let mut session = ServerSession::new_http1(Box::new(H1Stream::new(stream)));
+    // Idle timeout for the first request, or none while shutting down. The later
+    // ones get it from `GatewayProxy::early_request_filter`.
+    session.set_keepalive(if *shutdown.borrow() {
+        None
+    } else {
+        Some(H1_IDLE_TIMEOUT.as_secs())
+    });
+
+    let mut result = proxy.process_new_http(session, shutdown).await;
+    while let Some((stream, persistent_settings)) = result.map(|r| r.consume()) {
+        let mut stream = stream
+            .into_any()
+            .downcast::<H1Stream>()
+            .expect("an h1 session hands back the stream it ran on");
+        stream.arm();
+        let mut session = ServerSession::new_http1(stream);
+        if let Some(ps) = persistent_settings {
+            ps.apply_to_session(&mut session);
+        }
+        result = proxy.process_new_http(session, shutdown).await;
+    }
+}
+
+/// The application for the plain-HTTP ports: [`serve_h1`] on a [`BoxedStream`], so
+/// that writes to the client are bounded.
 struct GatewayHttpApp {
     proxy: Arc<pingora_proxy::HttpProxy<GatewayProxy>>,
 }
@@ -1326,7 +1551,8 @@ impl pingora_core::apps::ServerApp for GatewayHttpApp {
         shutdown: &pingora_core::server::ShutdownWatch,
     ) -> Option<pingora_core::protocols::Stream> {
         let stream = Box::new(BoxedStream::new(stream, CLIENT_STALL_TIMEOUT));
-        pingora_core::apps::ServerApp::process_new(&self.proxy, stream, shutdown).await
+        serve_h1(&self.proxy, stream, shutdown).await;
+        None
     }
 
     async fn cleanup(&self) {
@@ -1745,6 +1971,113 @@ mod tests {
             HttpPersistentSettings::for_session(&session).apply_to_session(&mut next);
             assert_eq!(next.get_keepalive(), want, "next request after {head:?}");
         }
+    }
+
+    // The end-of-head scan must end a head exactly where httparse does: earlier would
+    // let the rest of the head reach Pingora a byte at a time, later would hold back a
+    // complete request.
+    #[test]
+    fn head_scan_finds_the_end_of_the_head() {
+        for (head, complete) in [
+            ("GET / HTTP/1.1\r\nHost: a\r\n\r\n", true),
+            ("GET / HTTP/1.1\r\n\r\n", true),
+            ("GET / HTTP/1.1\nHost: a\n\n", true),
+            ("GET / HTTP/1.1\nHost: a\n\r\n", true),
+            // httparse skips empty lines before the request line.
+            ("\r\n\n\r\nGET / HTTP/1.1\r\n\r\n", true),
+            ("GET / HTTP/1.1\r\nHost: a\r\n", false),
+            ("\r\n\r\n", false),
+            // httparse rejects a CR not followed by LF.
+            ("GET / HTTP/1.1\r\nHost: a\r\n\r\r\n", false),
+        ] {
+            let input = format!("{head}body");
+            let mut scan = HeadScan::default();
+            let end = input.bytes().position(|b| scan.feed(&[b])).map(|i| i + 1);
+            assert_eq!(end, complete.then_some(head.len()), "{head:?}");
+            assert_eq!(HeadScan::default().feed(input.as_bytes()), complete, "{head:?} at once");
+        }
+    }
+
+    // Pingora parses a request head again from its first byte after every read that
+    // leaves it incomplete, so a head sent a byte at a time (1-byte TLS records, or one
+    // TCP segment per byte) cost it time quadratic in the head's size. An H1Stream
+    // hands such a head over in reads that double what Pingora has, then the rest of
+    // the head at once, and then passes the body through as it comes. arm() starts
+    // over for the next request on the connection.
+    #[tokio::test]
+    async fn h1_head_reads_double() {
+        use futures::FutureExt;
+
+        let head = format!("GET / HTTP/1.1\r\nHost: a\r\nX-Pad: {}\r\n\r\n", "a".repeat(10_000));
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        let mut stream = H1Stream::new(Box::new(server_io));
+        let mut buf = vec![0; 64 * 1024];
+        for _ in 0..2 {
+            // The size of each read that returned data.
+            let mut reads = vec![];
+            let mut got = vec![];
+            for b in head.bytes().chain(*b"body") {
+                client.write_all(&[b]).await.unwrap();
+                // A fresh cooperative-scheduling budget for the read.
+                tokio::task::yield_now().await;
+                if let Some(n) = stream.read(&mut buf).now_or_never() {
+                    let n = n.unwrap();
+                    reads.push(n);
+                    got.extend_from_slice(&buf[..n]);
+                }
+            }
+            assert_eq!(got, [head.as_bytes(), b"body"].concat());
+            let mut want = vec![1];
+            want.extend((0..13).map(|i| 1 << i));
+            want.push(head.len() - (1 << 13));
+            want.extend([1; 4]);
+            assert_eq!(reads, want);
+            stream.arm();
+        }
+    }
+
+    // Both h1 accept loops run every request of a connection through an H1Stream armed
+    // for its head: heads sent a byte at a time are served, on a keep-alive
+    // connection's later requests too.
+    #[tokio::test]
+    async fn h1_trickled_heads_are_served() {
+        use tokio::io::AsyncBufReadExt;
+
+        // A redirect keeps the connection open (an error response would close it).
+        let redirect = crate::route_table::Redirect {
+            status_code: 302,
+            ..Default::default()
+        };
+        let filters = Filters {
+            redirect: Some(redirect),
+            ..Default::default()
+        };
+        let proxy = route_proxy(NO_TIMEOUTS, vec![], filters, None);
+        let (client, server_io) = tokio::io::duplex(64 * 1024);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let serving = tokio::spawn(async move { serve_h1(&proxy, Box::new(server_io), &shutdown).await });
+        let mut client = tokio::io::BufReader::new(client);
+        for head in [
+            "GET /1 HTTP/1.1\r\nHost: a\r\n\r\n",
+            "\r\nGET /2 HTTP/1.1\r\nHost: a\r\nX-Pad: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n",
+            "GET /3 HTTP/1.1\nHost: a\n\n",
+        ] {
+            for b in head.bytes() {
+                client.get_mut().write_all(&[b]).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), client.read_line(&mut line))
+                .await
+                .expect("the request must be answered")
+                .unwrap();
+            assert_eq!(line, "HTTP/1.1 302 Found\r\n", "{head:?}");
+            while line != "\r\n" {
+                line.clear();
+                assert!(client.read_line(&mut line).await.unwrap() > 0, "{head:?}");
+            }
+        }
+        serving.abort();
     }
 
     /// One raw HTTP/2 frame: 9-byte header (length, type, flags, stream id) + payload.
@@ -2294,20 +2627,15 @@ mod tests {
         (ep, closed)
     }
 
-    /// Send `GET /` over HTTP/1.1 through a proxy whose one route forwards to
-    /// `backend`, with the rule timeout `rule_timeout`. Returns the response's status
-    /// line, or None if there is none after `wait`.
-    async fn proxy_get(
+    /// A proxy whose one route sends every request to `backends` through `filters`,
+    /// with the rule timeout `rule_timeout`.
+    fn route_proxy(
         timeouts: UpstreamTimeouts,
-        backend: Endpoint,
+        backends: Vec<crate::route_table::Backend>,
+        filters: Filters,
         rule_timeout: Option<Duration>,
-        wait: Duration,
-    ) -> Option<String> {
-        use pingora_core::apps::HttpServerApp;
-        use pingora_core::protocols::http::ServerSession;
-        use tokio::io::AsyncBufReadExt;
-
-        use crate::route_table::{Backend, RouteEntry, RouteMatch, RouteTable};
+    ) -> Arc<pingora_proxy::HttpProxy<GatewayProxy>> {
+        use crate::route_table::{RouteEntry, RouteMatch, RouteTable};
 
         // A connection over a duplex has no local address, so its listener port is 0.
         let mut routes = RouteTable::default();
@@ -2316,12 +2644,8 @@ mod tests {
             listener_hostname: None,
             hostnames: vec![],
             r#match: RouteMatch::default(),
-            backends: vec![Backend {
-                weight: 1,
-                endpoints: vec![backend],
-                filters: Filters::default(),
-            }],
-            filters: Filters::default(),
+            backends,
+            filters,
             request_timeout: rule_timeout,
             route_creation: 0,
             route_key: "ns/route".into(),
@@ -2335,7 +2659,30 @@ mod tests {
             ..Default::default()
         });
         let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
-        let proxy = Arc::new(http_proxy(&conf, GatewayProxy::new(data_plane, vec![], timeouts)));
+        Arc::new(http_proxy(&conf, GatewayProxy::new(data_plane, vec![], timeouts)))
+    }
+
+    /// Send `GET /` over HTTP/1.1 through a proxy whose one route forwards to
+    /// `backend`, with the rule timeout `rule_timeout`. Returns the response's status
+    /// line, or None if there is none after `wait`.
+    async fn proxy_get(
+        timeouts: UpstreamTimeouts,
+        backend: Endpoint,
+        rule_timeout: Option<Duration>,
+        wait: Duration,
+    ) -> Option<String> {
+        use pingora_core::apps::HttpServerApp;
+        use pingora_core::protocols::http::ServerSession;
+        use tokio::io::AsyncBufReadExt;
+
+        use crate::route_table::Backend;
+
+        let backend = Backend {
+            weight: 1,
+            endpoints: vec![backend],
+            filters: Filters::default(),
+        };
+        let proxy = route_proxy(timeouts, vec![backend], Filters::default(), rule_timeout);
 
         let (client, server_io) = tokio::io::duplex(64 * 1024);
         let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
