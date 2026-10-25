@@ -13,12 +13,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::Bytes;
 use pingora_core::prelude::*;
-use pingora_core::upstreams::peer::HttpPeer;
+use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session, http_proxy};
 
 use crate::conn_limit::{ConnLimiter, ConnLimits, ConnPermit};
-use crate::route_table::{BackendTls, Endpoint, Filters, HeaderMods, normalize_path, without_path_params};
+use crate::route_table::{BackendTls, Endpoint, Filters, HeaderMods, UpstreamTls, normalize_path, without_path_params};
 use crate::snapshot::DataPlane;
 use crate::tls_table::TlsDecision;
 
@@ -354,17 +354,7 @@ impl ProxyHttp for GatewayProxy {
         // BackendTLSPolicy: re-encrypt to the backend over TLS, verifying its cert
         // against the policy CA with SNI = the policy hostname. Plain HTTP otherwise.
         let mut peer = match &ep.tls {
-            BackendTls::ReEncrypt(tls) => {
-                let mut p = HttpPeer::new((ep.ip, ep.port), true, tls.hostname.clone());
-                p.options.verify_cert = true;
-                p.options.verify_hostname = true;
-                if !tls.ca_pem.is_empty()
-                    && let Ok(certs) = pingora_core::tls::x509::X509::stack_from_pem(&tls.ca_pem)
-                {
-                    p.options.ca = Some(std::sync::Arc::new(certs.into_boxed_slice()));
-                }
-                p
-            }
+            BackendTls::ReEncrypt(tls) => reencrypt_peer(ep, tls),
             BackendTls::Plaintext => HttpPeer::new((ep.ip, ep.port), false, String::new()),
             // Invalid endpoints are rejected with a 5xx in request_filter, so the
             // request never reaches here.
@@ -411,6 +401,55 @@ impl ProxyHttp for GatewayProxy {
             error_code: code,
             can_reuse_downstream: false,
         }
+    }
+}
+
+/// The peer for a backend that a BackendTLSPolicy re-encrypts to: TLS with SNI = the
+/// policy hostname, the backend's cert verified against the policy CA (the system
+/// roots when it has none) and that hostname. HTTPRoutes and TLSRoutes share it.
+fn reencrypt_peer(ep: &Endpoint, tls: &UpstreamTls) -> HttpPeer {
+    let mut p = HttpPeer::new((ep.ip, ep.port), true, tls.hostname.clone());
+    p.options.verify_cert = true;
+    p.options.verify_hostname = true;
+    if !tls.ca_pem.is_empty()
+        && let Ok(certs) = pingora_core::tls::x509::X509::stack_from_pem(&tls.ca_pem)
+    {
+        p.options.ca = Some(std::sync::Arc::new(certs.into_boxed_slice()));
+    }
+    p
+}
+
+/// A TLSRoute Terminate backend that a BackendTLSPolicy re-encrypts to: its
+/// [`reencrypt_peer`], verified the same way, but offering no ALPN. An [`HttpPeer`]
+/// always offers `http/1.1`, while this stream is whatever the client speaks, and a
+/// backend that enforces ALPN would refuse the handshake.
+#[derive(Clone)]
+struct OpaqueTlsPeer(HttpPeer);
+
+impl std::fmt::Display for OpaqueTlsPeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+impl Peer for OpaqueTlsPeer {
+    fn address(&self) -> &pingora_core::protocols::l4::socket::SocketAddr {
+        self.0.address()
+    }
+    fn tls(&self) -> bool {
+        self.0.tls()
+    }
+    fn sni(&self) -> &str {
+        self.0.sni()
+    }
+    fn reuse_hash(&self) -> u64 {
+        self.0.reuse_hash()
+    }
+    fn get_peer_options(&self) -> Option<&pingora_core::upstreams::peer::PeerOptions> {
+        self.0.get_peer_options()
+    }
+    fn get_alpn(&self) -> Option<&pingora_core::protocols::ALPN> {
+        None
     }
 }
 
@@ -1248,6 +1287,9 @@ pub struct GatewayTlsApp {
     tls_callbacks: Arc<pingora_core::listeners::TlsAcceptCallbacks>,
     /// Deadline for connecting to a TLSRoute backend ([`UpstreamTimeouts::connect`]).
     connect_timeout: Option<std::time::Duration>,
+    /// Opens the TLS connections to TLSRoute Terminate backends that a
+    /// BackendTLSPolicy re-encrypts to (built once: it holds the TLS client context).
+    backend_tls: pingora_core::connectors::TransportConnector,
     /// The connection caps, counted together with the plain-HTTP ports' (see [`admit`]).
     limiter: Arc<ConnLimiter>,
 }
@@ -1287,13 +1329,25 @@ impl pingora_core::apps::ServerApp for GatewayTlsApp {
             }
             TlsDecision::Terminate(ep) => {
                 tracing::debug!(port, ?sni, ip = %ep.ip, ep_port = ep.port, "TLS terminate -> TCP");
-                // Terminate TLS here (cert chosen by SNI via the callback), then
-                // pipe the cleartext to the backend (which expects plaintext TCP).
+                // An invalid BackendTLSPolicy targets the backend: refuse the
+                // connection (the HTTP path answers 500), never fall back to plaintext.
+                if matches!(ep.tls, BackendTls::Invalid) {
+                    tracing::debug!(port, ?sni, "TLSRoute backend has an invalid BackendTLSPolicy -> close");
+                    return None;
+                }
+                // Terminate TLS here (cert chosen by SNI via the callback), then pipe
+                // the cleartext to the backend: re-encrypted if a BackendTLSPolicy
+                // targets it, as plain TCP otherwise.
                 let mut tls_stream = self
                     .tls_accept(BoxedStream::new(stream, PIPE_IDLE_TIMEOUT), TLS_HANDSHAKE_TIMEOUT)
                     .await?;
-                let mut upstream = connect_backend(&ep, self.connect_timeout).await?;
-                let _ = copy_bidirectional_idle(&mut tls_stream, &mut upstream, PIPE_IDLE_TIMEOUT).await;
+                if let BackendTls::ReEncrypt(tls) = &ep.tls {
+                    let mut upstream = self.connect_backend_tls(&ep, tls).await?;
+                    let _ = copy_bidirectional_idle(&mut tls_stream, &mut upstream, PIPE_IDLE_TIMEOUT).await;
+                } else {
+                    let mut upstream = connect_backend(&ep, self.connect_timeout).await?;
+                    let _ = copy_bidirectional_idle(&mut tls_stream, &mut upstream, PIPE_IDLE_TIMEOUT).await;
+                }
                 None
             }
             TlsDecision::NoBackend => {
@@ -1335,6 +1389,22 @@ impl GatewayTlsApp {
             }
             Err(_) => {
                 tracing::debug!("downstream TLS handshake timed out; closing");
+                None
+            }
+        }
+    }
+
+    /// Connect to a TLSRoute Terminate backend that a BackendTLSPolicy re-encrypts to:
+    /// over TLS, verified as on the HTTP path, and else like [`connect_backend`], within
+    /// the connect timeout (TLS handshake included) and with TCP keepalive.
+    async fn connect_backend_tls(&self, ep: &Endpoint, tls: &UpstreamTls) -> Option<pingora_core::protocols::Stream> {
+        let mut peer = reencrypt_peer(ep, tls);
+        peer.options.total_connection_timeout = self.connect_timeout;
+        peer.options.tcp_keepalive = Some(UPSTREAM_TCP_KEEPALIVE);
+        match self.backend_tls.new_stream(&OpaqueTlsPeer(peer)).await {
+            Ok(stream) => Some(stream),
+            Err(e) => {
+                tracing::debug!(ip = %ep.ip, port = ep.port, error = %e, "TLSRoute backend TLS connect failed");
                 None
             }
         }
@@ -1913,6 +1983,7 @@ pub fn run(
             acceptor,
             tls_callbacks,
             connect_timeout: timeouts.connect,
+            backend_tls: pingora_core::connectors::TransportConnector::new(None),
             limiter,
         };
         let mut tls_service = pingora_core::services::listening::Service::new("tls-sni-dispatch".to_string(), app);
@@ -2612,6 +2683,7 @@ mod tests {
             acceptor,
             tls_callbacks,
             connect_timeout: None,
+            backend_tls: pingora_core::connectors::TransportConnector::new(None),
             limiter: ConnLimiter::new(NO_LIMITS),
         }
     }
@@ -2958,6 +3030,144 @@ mod tests {
             .expect("the connect must give up");
         assert!(second.is_none());
         assert!(start.elapsed() >= deadline, "gave up early: {:?}", start.elapsed());
+    }
+
+    /// A TLS backend that echoes what it reads, with a cert for `backend.example` from
+    /// a CA of its own, and that refuses a client offering any ALPN protocol, as a
+    /// server that enforces ALPN does. Returns its endpoint and its CA (PEM); the
+    /// receiver yields, for each connection, whether its TLS handshake succeeded.
+    async fn tls_echo_backend() -> (Endpoint, Vec<u8>, tokio::sync::mpsc::UnboundedReceiver<bool>) {
+        use pingora_core::tls::pkey::PKey;
+        use pingora_core::tls::ssl::{AlpnError, SslAcceptor, SslMethod};
+        use pingora_core::tls::x509::X509;
+
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca.distinguished_name.push(rcgen::DnType::CommonName, "backend CA");
+        let ca_pem = ca.self_signed(&ca_key).unwrap().pem().into_bytes();
+        let key = rcgen::KeyPair::generate().unwrap();
+        // rcgen gives every cert the same default subject, which would make this one
+        // look self-signed.
+        let mut leaf = rcgen::CertificateParams::new(vec!["backend.example".to_string()]).unwrap();
+        leaf.distinguished_name
+            .push(rcgen::DnType::CommonName, "backend.example");
+        let cert = leaf.signed_by(&key, &rcgen::Issuer::new(ca, ca_key)).unwrap();
+
+        let mut acceptor = SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).unwrap();
+        acceptor.set_certificate(&X509::from_der(cert.der()).unwrap()).unwrap();
+        acceptor
+            .set_private_key(&PKey::private_key_from_pkcs8(&key.serialize_der()).unwrap())
+            .unwrap();
+        acceptor.set_alpn_select_callback(|_, _| Err(AlpnError::ALERT_FATAL));
+        let acceptor = Arc::new(acceptor.build());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (handshake_tx, handshakes) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((conn, _)) = listener.accept().await {
+                let (acceptor, handshake_tx) = (acceptor.clone(), handshake_tx.clone());
+                tokio::spawn(async move {
+                    let conn = pingora_core::protocols::l4::stream::Stream::from(conn);
+                    let tls = pingora_core::protocols::tls::server::handshake(&acceptor, conn).await;
+                    let _ = handshake_tx.send(tls.is_ok());
+                    let Ok(mut tls) = tls else { return };
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n @ 1..) = tls.read(&mut buf).await {
+                        if tls.write_all(&buf[..n]).await.is_err() || tls.flush().await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let ep = Endpoint {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: BackendTls::Plaintext,
+        };
+        (ep, ca_pem, handshakes)
+    }
+
+    // A TLSRoute Terminate listener re-encrypts the client's stream to a backend that a
+    // BackendTLSPolicy targets, verifying it against the policy's CA and hostname, and
+    // offers it no ALPN (the stream is not HTTP). A backend the CA or the hostname does
+    // not vouch for gets nothing, and one whose policy is invalid is not connected to.
+    // All of them used to get the decrypted stream in plaintext.
+    #[tokio::test]
+    async fn tlsroute_terminate_applies_backend_tls_policy() {
+        use pingora_core::apps::ServerApp;
+        use pingora_core::tls::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+        use crate::route_table::UpstreamTls;
+        use crate::tls_table::{TlsAction, TlsBackend, TlsBackends, TlsTable};
+
+        let (backend, ca_pem, mut handshakes) = tls_echo_backend().await;
+        let (_, other_ca_pem, _) = tls_echo_backend().await;
+        let app = Arc::new(tls_app());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+
+        // Route `db.example.com` on the listener to the backend with `tls`, send `hello`
+        // through it, and return the echo, if one comes back.
+        let hello = async |tls: BackendTls| {
+            let mut table = TlsTable::default();
+            let endpoints = vec![Endpoint { tls, ..backend.clone() }];
+            let backends = vec![TlsBackend { weight: 1, endpoints }];
+            let port = listener.local_addr().unwrap().port();
+            table.insert(port, "db.example.com", TlsAction::Terminate(TlsBackends { backends }));
+            app.data_plane.store(crate::snapshot::Snapshot {
+                tls: table,
+                ..Default::default()
+            });
+
+            let (client, stream) = accept_tcp(&listener).await;
+            let (app, shutdown) = (app.clone(), shutdown.clone());
+            let serving = tokio::spawn(async move { app.process_new(stream, &shutdown).await });
+            let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+            connector.set_verify(SslVerifyMode::NONE);
+            let config = connector.build().configure().unwrap();
+            let client = pingora_core::protocols::l4::stream::Stream::from(client);
+            let echo = async {
+                let mut client =
+                    pingora_core::protocols::tls::client::handshake(config, "db.example.com", client, None)
+                        .await
+                        .ok()?;
+                client.write_all(b"hello").await.ok()?;
+                client.flush().await.ok()?;
+                let mut echo = [0u8; 5];
+                client.read_exact(&mut echo).await.ok()?;
+                Some(echo)
+            };
+            let echo = tokio::time::timeout(Duration::from_secs(5), echo)
+                .await
+                .expect("the connection must be served or closed");
+            serving.abort();
+            echo
+        };
+        let reencrypt = |hostname: &str, ca_pem: &[u8]| {
+            BackendTls::ReEncrypt(UpstreamTls {
+                hostname: hostname.into(),
+                ca_pem: ca_pem.to_vec(),
+            })
+        };
+
+        // Without a policy, the backend gets the stream in plaintext, so no handshake.
+        assert_eq!(hello(BackendTls::Plaintext).await, None);
+        assert_eq!(handshakes.recv().await, Some(false));
+
+        assert_eq!(hello(reencrypt("backend.example", &ca_pem)).await, Some(*b"hello"));
+        assert_eq!(handshakes.recv().await, Some(true));
+
+        assert_eq!(hello(reencrypt("backend.example", &other_ca_pem)).await, None);
+        assert_eq!(handshakes.recv().await, Some(false));
+        assert_eq!(hello(reencrypt("other.example", &ca_pem)).await, None);
+        assert_eq!(handshakes.recv().await, Some(false));
+
+        assert_eq!(hello(BackendTls::Invalid).await, None);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(handshakes.try_recv().is_err(), "nothing may connect to the backend");
     }
 
     /// A backend that answers each request with its request head.

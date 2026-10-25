@@ -526,7 +526,9 @@ impl ReconcileCtx {
         // (passthrough / terminate-then-TCP) data path, not HTTP entries.
         let tls_routes: Vec<Arc<TLSRoute>> = self.stores.tls_routes.state();
         for route in &tls_routes {
-            if let Some(patch) = self.process_tls_route(route, &models, &mut tls_table, &mut attach_counts) {
+            if let Some(patch) =
+                self.process_tls_route(route, &models, &upstream_tls, &mut tls_table, &mut attach_counts)
+            {
                 patches.push(patch);
             }
         }
@@ -537,7 +539,7 @@ impl ReconcileCtx {
         }
         // Policy ancestors are only usable Gateways (a rejected Gateway isn't an
         // ancestor), matching the route-attachment gating above.
-        patches.extend(self.policy_patches(&usable_gateways, &routes, &policy_outcomes));
+        patches.extend(self.policy_patches(&usable_gateways, &routes, &tls_routes, &policy_outcomes));
 
         // ── Publish the data plane FIRST (convergence shouldn't wait on the API
         //    server), then flush all status writes concurrently. Route table and
@@ -1307,6 +1309,7 @@ impl ReconcileCtx {
         &self,
         route: &TLSRoute,
         models: &[GatewayModel],
+        upstream_tls: &UpstreamTlsMap,
         tls_table: &mut TlsTable,
         attach_counts: &mut BTreeMap<(String, String), BTreeMap<String, i32>>,
     ) -> Option<StatusPatch> {
@@ -1370,10 +1373,20 @@ impl ReconcileCtx {
                         continue;
                     }
                     match self.resolve_endpoints(&bns, &backend_ref.name, svc_port) {
-                        Some(endpoints) => backends.backends.push(TlsBackend {
-                            weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
-                            endpoints,
-                        }),
+                        Some(mut endpoints) => {
+                            // Apply any BackendTLSPolicy decision for this Service
+                            // PORT, as for an HTTPRoute. Only a Terminate listener
+                            // uses it: Passthrough forwards the client's own TLS.
+                            if let Some(bt) = upstream_tls.get(&(bns.clone(), backend_ref.name.clone(), svc_port)) {
+                                for ep in &mut endpoints {
+                                    ep.tls = bt.clone();
+                                }
+                            }
+                            backends.backends.push(TlsBackend {
+                                weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
+                                endpoints,
+                            });
+                        }
                         None => {
                             refs_failure.get_or_insert("BackendNotFound");
                         }
@@ -1772,6 +1785,7 @@ impl ReconcileCtx {
         &self,
         gateways: &[Arc<Gateway>],
         routes: &[Arc<HTTPRoute>],
+        tls_routes: &[Arc<TLSRoute>],
         outcomes: &BTreeMap<(String, String), PolicyOutcome>,
     ) -> Vec<StatusPatch> {
         let mut patches = Vec::new();
@@ -1803,7 +1817,8 @@ impl ReconcileCtx {
                 ),
             };
 
-            // Ancestors: Gateways that a route targeting this Service attaches to.
+            // Ancestors: Gateways that a route (HTTPRoute or TLSRoute) targeting this
+            // Service attaches to.
             let target_svcs: Vec<String> = policy
                 .spec
                 .target_refs
@@ -1816,6 +1831,9 @@ impl ReconcileCtx {
                 let gw_ns = gw.namespace().unwrap_or_default();
                 let routes_to_gw_target = routes.iter().any(|r| {
                     route_has_parent(r, &gw.name_any(), &gw_ns) && route_targets_service_in(r, &target_svcs, &pol_ns)
+                }) || tls_routes.iter().any(|r| {
+                    tls_route_has_parent(r, &gw.name_any(), &gw_ns)
+                        && tls_route_targets_service_in(r, &target_svcs, &pol_ns)
                 });
                 if routes_to_gw_target {
                     ancestors.push(BackendTlsPolicyStatusAncestors {
@@ -1927,7 +1945,8 @@ impl ReconcileCtx {
                             ip,
                             port: port as u16,
                             // Plaintext by default; a BackendTLSPolicy targeting this
-                            // Service overrides it (ReEncrypt or Invalid) in process_route.
+                            // Service overrides it (ReEncrypt or Invalid) in process_route
+                            // and process_tls_route.
                             tls: crate::route_table::BackendTls::Plaintext,
                         });
                     }
@@ -2498,6 +2517,28 @@ fn route_targets_service_in(route: &HTTPRoute, svc_names: &[String], svc_ns: &st
         .iter()
         .flatten()
         .flat_map(|rule| rule.backend_refs.iter().flatten())
+        .any(|b| svc_names.contains(&b.name) && b.namespace.as_deref().unwrap_or(&r_ns) == svc_ns)
+}
+
+/// [`route_has_parent`] for a TLSRoute.
+fn tls_route_has_parent(route: &TLSRoute, gw_name: &str, gw_ns: &str) -> bool {
+    let r_ns = route.namespace().unwrap_or_default();
+    route
+        .spec
+        .parent_refs
+        .iter()
+        .flatten()
+        .any(|p| p.name == gw_name && p.namespace.as_deref().unwrap_or(&r_ns) == gw_ns)
+}
+
+/// [`route_targets_service_in`] for a TLSRoute.
+fn tls_route_targets_service_in(route: &TLSRoute, svc_names: &[String], svc_ns: &str) -> bool {
+    let r_ns = route.namespace().unwrap_or_default();
+    route
+        .spec
+        .rules
+        .iter()
+        .flat_map(|rule| &rule.backend_refs)
         .any(|b| svc_names.contains(&b.name) && b.namespace.as_deref().unwrap_or(&r_ns) == svc_ns)
 }
 
