@@ -889,7 +889,8 @@ const H2_MAX_CONCURRENT_STREAMS: u32 = 100;
 /// `H2_MAX_CONCURRENT_STREAMS` × 64 KiB.
 const H2_MAX_HEADER_LIST_SIZE: u32 = 64 * 1024;
 
-/// Deadline for completing the downstream TLS handshake. A client that opens TCP and
+/// Deadline for completing the downstream TLS handshake, on TLSRoute Terminate and the
+/// HTTPS fallback alike (see `GatewayTlsApp::tls_accept`). A client that opens TCP and
 /// sends a ClientHello then stalls would otherwise pin a task forever.
 const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -984,24 +985,13 @@ impl pingora_core::apps::ServerApp for GatewayTlsApp {
                 tracing::debug!(port, ?sni, ip = %ep.ip, ep_port = ep.port, "TLS terminate -> TCP");
                 // Terminate TLS here (cert chosen by SNI via the callback), then
                 // pipe the cleartext to the backend (which expects plaintext TCP).
-                let tls_stream = match pingora_core::protocols::tls::server::handshake_with_callback(
-                    &self.acceptor,
-                    BoxedStream::new(stream, PIPE_IDLE_TIMEOUT),
-                    &self.tls_callbacks,
-                )
-                .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "TLSRoute terminate handshake failed");
-                        return None;
-                    }
-                };
+                let mut tls_stream = self
+                    .tls_accept(BoxedStream::new(stream, PIPE_IDLE_TIMEOUT), TLS_HANDSHAKE_TIMEOUT)
+                    .await?;
                 let Ok(mut upstream) = tokio::net::TcpStream::connect((ep.ip, ep.port)).await else {
                     tracing::debug!(ip = %ep.ip, "terminate backend connect failed");
                     return None;
                 };
-                let mut tls_stream = tls_stream;
                 let _ = copy_bidirectional_idle(&mut tls_stream, &mut upstream, PIPE_IDLE_TIMEOUT).await;
                 None
             }
@@ -1019,6 +1009,36 @@ impl pingora_core::apps::ServerApp for GatewayTlsApp {
 }
 
 impl GatewayTlsApp {
+    /// Run the server side of a downstream TLS handshake (cert chosen by SNI via the
+    /// callback), giving up after `timeout`. Returns `None` if it fails or times out.
+    ///
+    /// Both TLS-terminating paths (TLSRoute Terminate and the HTTPS fallback) go
+    /// through here, so neither can lose the deadline. A client can send a ClientHello
+    /// (so dispatch reaches a handshake) then stall mid-handshake: OpenSSL has no timer
+    /// of its own, and Pingora's accept-time handshake deadline does not apply to our
+    /// plain-TCP listeners, so without one each such connection would hold its task,
+    /// fd and handshake state forever. The SNI peek has its own `PEEK_TIMEOUT`; this
+    /// covers the rest of the handshake.
+    async fn tls_accept(
+        &self,
+        stream: BoxedStream,
+        timeout: std::time::Duration,
+    ) -> Option<pingora_core::protocols::tls::SslStream<BoxedStream>> {
+        let handshake =
+            pingora_core::protocols::tls::server::handshake_with_callback(&self.acceptor, stream, &self.tls_callbacks);
+        match tokio::time::timeout(timeout, handshake).await {
+            Ok(Ok(s)) => Some(s),
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, "downstream TLS handshake failed");
+                None
+            }
+            Err(_) => {
+                tracing::debug!("downstream TLS handshake timed out; closing");
+                None
+            }
+        }
+    }
+
     /// Terminate TLS and feed the resulting stream to the HTTP proxy. Dispatches on
     /// the ALPN-negotiated protocol: HTTP/2 (`h2`) or HTTP/1.1. Mirrors pingora's own
     /// `HttpServerApp` accept loop (`apps/mod.rs`), but inlined because pingora's h2
@@ -1030,30 +1050,9 @@ impl GatewayTlsApp {
     ) -> Option<pingora_core::protocols::Stream> {
         use pingora_core::protocols::tls::ALPN;
 
-        // Bound the TLS handshake: a client can open TCP and send a ClientHello (so
-        // dispatch reaches here) then stall mid-handshake, leaving this awaiting
-        // forever. Without a deadline such connections accumulate unbounded. The peek
-        // stage has its own PEEK_TIMEOUT; this covers the rest of the handshake.
-        let tls_stream = match tokio::time::timeout(
-            TLS_HANDSHAKE_TIMEOUT,
-            pingora_core::protocols::tls::server::handshake_with_callback(
-                &self.acceptor,
-                BoxedStream::new(stream, CLIENT_STALL_TIMEOUT),
-                &self.tls_callbacks,
-            ),
-        )
-        .await
-        {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                tracing::debug!(error = %e, "HTTPS terminate handshake failed");
-                return None;
-            }
-            Err(_) => {
-                tracing::debug!("HTTPS terminate handshake timed out; closing");
-                return None;
-            }
-        };
+        let tls_stream = self
+            .tls_accept(BoxedStream::new(stream, CLIENT_STALL_TIMEOUT), TLS_HANDSHAKE_TIMEOUT)
+            .await?;
 
         // Box the concrete TLS stream as the `Box<dyn IO>` the HTTP servers take,
         // preserving the trait-object's ALPN accessor for the dispatch below.
@@ -2113,6 +2112,84 @@ mod tests {
             "expected only RST_STREAM(CANCEL) for the stalled body"
         );
         assert!(resets[0].2 >= stall, "reset early: {:?}", resets[0].2);
+    }
+
+    /// A TLS app on an empty data plane (handshakes get the self-signed fallback cert).
+    fn tls_app() -> GatewayTlsApp {
+        let data_plane = DataPlane::new();
+        let (acceptor, tls_callbacks) = build_tls_acceptor(data_plane.clone());
+        let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
+        GatewayTlsApp {
+            proxy: Arc::new(http_proxy(&conf, GatewayProxy::new(data_plane.clone(), vec![]))),
+            data_plane,
+            acceptor,
+            tls_callbacks,
+        }
+    }
+
+    /// The ClientHello a TLS client sends to open a connection to `sni`.
+    fn client_hello(sni: &str) -> Vec<u8> {
+        use pingora_core::tls::ssl::{HandshakeError, SslConnector, SslMethod};
+
+        // Records what the client writes, and has nothing for it to read yet.
+        struct Wire(Vec<u8>);
+        impl std::io::Read for Wire {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::ErrorKind::WouldBlock.into())
+            }
+        }
+        impl std::io::Write for Wire {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let connector = SslConnector::builder(SslMethod::tls()).unwrap().build();
+        match connector.connect(sni, Wire(Vec::new())) {
+            Err(HandshakeError::WouldBlock(mid)) => mid.get_ref().0.clone(),
+            _ => panic!("the client must wait for the server's flight"),
+        }
+    }
+
+    // A client that sends its ClientHello and then never finishes the handshake is
+    // cut off at the deadline, which TLSRoute Terminate and the HTTPS fallback share.
+    // A client that finishes it gets the stream.
+    #[tokio::test]
+    async fn stalled_tls_handshake_times_out() {
+        use pingora_core::tls::ssl::{SslConnector, SslMethod, SslVerifyMode};
+
+        let app = tls_app();
+        let deadline = Duration::from_millis(200);
+
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        client.write_all(&client_hello("example.com")).await.unwrap();
+        let start = tokio::time::Instant::now();
+        let accept = app.tls_accept(BoxedStream::new(Box::new(server_io), PIPE_IDLE_TIMEOUT), deadline);
+        let accepted = tokio::time::timeout(Duration::from_secs(5), accept)
+            .await
+            .expect("the handshake must give up");
+        assert!(accepted.is_none());
+        assert!(start.elapsed() >= deadline, "gave up early: {:?}", start.elapsed());
+        // It got as far as sending its own flight (a handshake record).
+        assert_eq!(client.read_u8().await.unwrap(), 0x16);
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+        connector.set_verify(SslVerifyMode::NONE);
+        let config = connector.build().configure().unwrap();
+        let client = tokio::spawn(async move {
+            pingora_core::protocols::tls::client::handshake(config, "example.com", client_io, None).await
+        });
+        let accept = app.tls_accept(
+            BoxedStream::new(Box::new(server_io), PIPE_IDLE_TIMEOUT),
+            TLS_HANDSHAKE_TIMEOUT,
+        );
+        assert!(accept.await.is_some());
+        client.await.unwrap().expect("client handshake");
     }
 
     // split_host_port matches Go's net.SplitHostPort: it unbrackets IPv6 literals
