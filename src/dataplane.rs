@@ -1356,6 +1356,59 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
     }
 
+    // RUSTSEC-2026-0258: h2 < 0.4.16 queued every zero-length DATA frame until the
+    // body was read, so a client that stalls the proxy's body read could stream 9-byte
+    // empty frames (no flow-control cost) until OOM. The h2 server serve_h2 runs must
+    // instead cut the connection off with GOAWAY(ENHANCE_YOUR_CALM).
+    #[tokio::test]
+    async fn h2_empty_data_frame_flood_gets_goaway() {
+        use pingora_core::protocols::Digest;
+        use pingora_core::protocols::http::v2::server;
+
+        fn frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+            let mut f = (payload.len() as u32).to_be_bytes()[1..].to_vec();
+            f.extend([ty, flags]);
+            f.extend(stream.to_be_bytes());
+            f.extend(payload);
+            f
+        }
+
+        let (mut client, server_io) = tokio::io::duplex(64 * 1024);
+        tokio::spawn(async move {
+            let mut conn = server::handshake(Box::new(server_io), None).await.unwrap();
+            // Accept streams but never read their bodies, like a proxy stuck on a
+            // response write.
+            let mut held = Vec::new();
+            while let Ok(Some(s)) = server::HttpSession::from_h2_conn(&mut conn, Arc::new(Digest::default())).await {
+                held.push(s);
+            }
+        });
+
+        // Preface, SETTINGS, HEADERS(END_HEADERS) for POST https://a/ (HPACK static
+        // indices 3, 7, 4 and :authority literal), then 1000 empty DATA frames.
+        let mut req = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        req.extend(frame(0x4, 0, 0, &[]));
+        req.extend(frame(0x1, 0x4, 1, &[0x83, 0x87, 0x84, 0x41, 0x01, b'a']));
+        for _ in 0..1000 {
+            req.extend(frame(0x0, 0, 1, &[]));
+        }
+        client.write_all(&req).await.unwrap();
+
+        let goaway = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut head = [0u8; 9];
+            loop {
+                client.read_exact(&mut head).await.ok()?;
+                let mut payload = vec![0; u32::from_be_bytes([0, head[0], head[1], head[2]]) as usize];
+                client.read_exact(&mut payload).await.ok()?;
+                if head[3] == 0x7 {
+                    return Some(u32::from_be_bytes(payload[4..8].try_into().unwrap()));
+                }
+            }
+        })
+        .await;
+        assert_eq!(goaway, Ok(Some(0xb)), "expected GOAWAY(ENHANCE_YOUR_CALM)");
+    }
+
     // split_host_port matches Go's net.SplitHostPort: it unbrackets IPv6 literals
     // and REQUIRES a port. These cases mirror the stdlib's own test table.
     #[test]
