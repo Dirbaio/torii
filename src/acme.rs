@@ -1009,15 +1009,7 @@ fn build_challenge_store(store: &Store<Secret>) -> ChallengeStore {
         }
     }
     out.into_iter()
-        .filter_map(|(host, (c, k))| {
-            Some((
-                host,
-                CertKey {
-                    cert_pem: c?,
-                    key_pem: k?,
-                },
-            ))
-        })
+        .filter_map(|(host, (c, k))| Some((host, CertKey::new(&c?, &k?))))
         .collect()
 }
 

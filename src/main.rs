@@ -93,6 +93,11 @@ struct Cli {
     #[arg(long, env = "TORII_ALLOW_ENCODED_SLASHES")]
     allow_encoded_slashes: bool,
 
+    /// Worker threads of each data-plane service (plain HTTP, and TLS). Defaults
+    /// to the CPUs available to the process, CPU quota included.
+    #[arg(long, env = "TORII_DATAPLANE_THREADS")]
+    dataplane_threads: Option<usize>,
+
     /// Most connections one client may have open at once, on all ports together. A
     /// client is an IPv4 address or an IPv6 /64; its connections over this are
     /// closed as they come. Raise it, or set `0` to disable it, if many clients
@@ -191,6 +196,10 @@ async fn run(args: Cli) -> Result<()> {
         response: enabled(args.upstream_timeout),
     };
     let allow_encoded_slashes = args.allow_encoded_slashes;
+    let threads = args
+        .dataplane_threads
+        .filter(|&n| n > 0)
+        .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()));
     let memory_limit = conn_limit::memory_limit();
     let cap = |n: usize| Some(n).filter(|&n| n > 0);
     let limits = conn_limit::ConnLimits {
@@ -233,6 +242,7 @@ async fn run(args: Cli) -> Result<()> {
                 timeouts,
                 allow_encoded_slashes,
                 limits,
+                threads,
             )
         })
         .context("failed to spawn data-plane thread")?;

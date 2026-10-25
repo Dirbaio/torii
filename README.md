@@ -58,6 +58,14 @@ request to a backend ~1 MB while its client does not read the response.
   cap, so a few clients cannot lock everyone else out.
 - Refusals are logged as a warning at most once a minute, with how many there were since the last one.
 
+### TLS handshakes
+
+Each TLS handshake costs torii a key exchange and a signature, so a client that opens connections and
+drops them makes it spend CPU. The plain-HTTP and the TLS ports each run on `--dataplane-threads`
+(`TORII_DATAPLANE_THREADS`) worker threads, by default as many as the CPUs available to the pod (its CPU
+limit included). Give it more than one CPU so that one client's handshakes cannot hold up everyone
+else's. ECDSA certificates, as ACME issues, cost 5-6x less per handshake than RSA-4096 ones.
+
 ## Automatic TLS certificates (ACME)
 
 torii can obtain and renew TLS certificates automatically via **ACME TLS-ALPN-01**

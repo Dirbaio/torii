@@ -728,10 +728,7 @@ impl ReconcileCtx {
         let data = secret.data.as_ref()?;
         let cert = data.get("tls.crt")?;
         let key = data.get("tls.key")?;
-        Some(CertKey {
-            cert_pem: cert.0.clone(),
-            key_pem: key.0.clone(),
-        })
+        Some(CertKey::new(&cert.0, &key.0))
     }
 
     fn gatewayclass_patch(&self, gc: &GatewayClass) -> StatusPatch {
@@ -2329,10 +2326,9 @@ fn ca_pem_is_valid(pem: &[u8]) -> bool {
 }
 
 /// Validate that a cert/key pair parses as PEM (used to reject malformed cert
-/// Secrets → InvalidCertificateRef). Uses the same OpenSSL backend as the proxy.
+/// Secrets → InvalidCertificateRef). Uses the same OpenSSL parse the proxy serves.
 fn cert_key_is_valid(ck: &CertKey) -> bool {
-    pingora_core::tls::x509::X509::from_pem(&ck.cert_pem).is_ok()
-        && pingora_core::tls::pkey::PKey::private_key_from_pem(&ck.key_pem).is_ok()
+    ck.parsed().is_some()
 }
 
 /// Parse a Gateway API duration into a [`Duration`].
@@ -2885,13 +2881,13 @@ mod tests {
             "spec": { "parentRefs": [{ "name": "gw" }], "rules": [{}] },
         }))
         .unwrap();
-        let ck = CertKey::generate_self_signed().unwrap();
+        let (cert_pem, key_pem) = CertKey::generate_self_signed_pem().unwrap();
         let mut secret = Secret::default();
         secret.metadata.name = Some("cert".into());
         secret.metadata.namespace = Some("ns".into());
         secret.data = Some(BTreeMap::from([
-            ("tls.crt".to_string(), k8s_openapi::ByteString(ck.cert_pem)),
-            ("tls.key".to_string(), k8s_openapi::ByteString(ck.key_pem)),
+            ("tls.crt".to_string(), k8s_openapi::ByteString(cert_pem)),
+            ("tls.key".to_string(), k8s_openapi::ByteString(key_pem)),
         ]));
 
         // The API server is a closed port: the status writes fail, and are only logged.

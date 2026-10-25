@@ -823,17 +823,14 @@ impl pingora_core::listeners::TlsAccept for SniCertCallback {
 /// to a root they trust — without them, an ACME/CA-issued leaf fails to verify.
 fn install_cert(ssl: &mut pingora_core::tls::ssl::SslRef, ck: &crate::cert_store::CertKey) {
     use pingora_core::tls::ext;
-    let (Ok(chain), Ok(key)) = (
-        pingora_core::tls::x509::X509::stack_from_pem(&ck.cert_pem),
-        pingora_core::tls::pkey::PKey::private_key_from_pem(&ck.key_pem),
-    ) else {
+    let Some(parsed) = ck.parsed() else {
         return;
     };
-    let Some((leaf, intermediates)) = chain.split_first() else {
+    let Some((leaf, intermediates)) = parsed.chain.split_first() else {
         return;
     };
     let _ = ext::ssl_use_certificate(ssl, leaf);
-    let _ = ext::ssl_use_private_key(ssl, &key);
+    let _ = ext::ssl_use_private_key(ssl, &parsed.key);
     for inter in intermediates {
         let _ = ext::ssl_add_chain_cert(ssl, inter);
     }
@@ -2147,6 +2144,15 @@ fn build_tls_acceptor(
     // OpenSSL 3.0, where retained record buffers are the classic idle-conn cost,
     // so keep it: it is free and can only shrink idle memory.
     builder.set_mode(pingora_core::tls::ssl::SslMode::RELEASE_BUFFERS);
+    // TLS 1.2: ECDHE key exchange only. Mozilla intermediate also has the DHE-RSA
+    // suites, which let a client make each handshake against an RSA certificate
+    // ~20-70% more expensive, and every client it targets has ECDHE.
+    builder
+        .set_cipher_list(
+            "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:\
+             ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305",
+        )
+        .expect("failed to set TLS 1.2 cipher list");
     // ALPN: offer, in preference order, the ACME `acme-tls/1` challenge protocol,
     // then HTTP/2 (`h2`), then HTTP/1.1. We pick the first of OUR preferences that
     // the client also offered. NOACK only if the client offered none of them (it
@@ -2194,6 +2200,7 @@ fn tcp_listener(addr: &str) -> pingora_core::listeners::ListenerConfig {
 ///
 /// This blocks forever (Pingora calls `std::process::exit` on shutdown), so call
 /// it from a dedicated thread.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     data_plane: DataPlane,
     bind_ip: &str,
@@ -2202,6 +2209,7 @@ pub fn run(
     timeouts: UpstreamTimeouts,
     allow_encoded_slashes: bool,
     limits: ConnLimits,
+    threads: usize,
 ) -> ! {
     // Pass None so Pingora doesn't parse our process argv as its own options.
     let mut server = Server::new(None).expect("failed to create pingora server");
@@ -2226,6 +2234,7 @@ pub fn run(
         limiter: limiter.clone(),
     };
     let mut http_service = pingora_core::services::listening::Service::new("http-proxy".to_string(), http_app);
+    http_service.threads = Some(threads);
     for port in http_ports {
         http_service.add_listener(tcp_listener(&format!("{bind_ip}:{port}")));
     }
@@ -2257,13 +2266,24 @@ pub fn run(
             limiter,
         };
         let mut tls_service = pingora_core::services::listening::Service::new("tls-sni-dispatch".to_string(), app);
+        // OpenSSL runs each handshake inside the task's poll: on Pingora's default
+        // single thread, one client's handshake flood held up every other TLS
+        // connection of every Gateway while the other cores were idle.
+        tls_service.threads = Some(threads);
         for port in tls_ports {
             tls_service.add_listener(tcp_listener(&format!("{bind_ip}:{port}")));
         }
         server.add_service(tls_service);
     }
 
-    tracing::info!(bind_ip, ?http_ports, ?tls_ports, ?limits, "data plane listening");
+    tracing::info!(
+        bind_ip,
+        ?http_ports,
+        ?tls_ports,
+        ?limits,
+        threads,
+        "data plane listening"
+    );
     server.run_forever();
 }
 

@@ -6,15 +6,42 @@
 //! plane's TLS `certificate_callback` reads it per handshake to select a cert by SNI.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-/// A resolved server certificate (PEM-encoded chain + private key).
+use pingora_core::tls::pkey::{PKey, Private};
+use pingora_core::tls::x509::X509;
+
+/// A resolved server certificate (chain + private key), parsed once from PEM when
+/// it is built: a handshake only attaches the parsed objects, and reuses OpenSSL's
+/// per-key state (re-parsing an RSA-4096 key took ~1/3 of a handshake).
 #[derive(Clone)]
 pub struct CertKey {
-    pub cert_pem: Vec<u8>,
-    pub key_pem: Vec<u8>,
+    parsed: Option<Arc<ParsedCertKey>>,
+}
+
+/// The parsed chain (leaf first) and key of a [`CertKey`].
+pub struct ParsedCertKey {
+    pub chain: Vec<X509>,
+    pub key: PKey<Private>,
 }
 
 impl CertKey {
+    /// A cert+key from PEM, parsed now; see [`CertKey::parsed`].
+    pub fn new(cert_pem: &[u8], key_pem: &[u8]) -> CertKey {
+        let chain = X509::stack_from_pem(cert_pem).ok().filter(|c| !c.is_empty());
+        let key = PKey::private_key_from_pem(key_pem).ok();
+        let parsed = chain
+            .zip(key)
+            .map(|(chain, key)| Arc::new(ParsedCertKey { chain, key }));
+        CertKey { parsed }
+    }
+
+    /// The parsed chain and key, or `None` when either does not parse (the
+    /// controller then reports the certificateRef invalid).
+    pub fn parsed(&self) -> Option<&ParsedCertKey> {
+        self.parsed.as_deref()
+    }
+
     /// Generate a self-signed "fallback" certificate, served as a last resort when
     /// no real cert matches a TLS connection (no SNI match, Secret missing, ACME
     /// not issued yet — or no real certs configured at all). It will NOT validate,
@@ -23,6 +50,12 @@ impl CertKey {
     /// `SSL_ERROR_NO_CYPHER_OVERLAP`. Generated once at startup; always available,
     /// independent of whether ACME is configured.
     pub fn generate_self_signed() -> Result<CertKey, rcgen::Error> {
+        let (cert_pem, key_pem) = Self::generate_self_signed_pem()?;
+        Ok(CertKey::new(&cert_pem, &key_pem))
+    }
+
+    /// The PEM cert and key of [`CertKey::generate_self_signed`].
+    pub fn generate_self_signed_pem() -> Result<(Vec<u8>, Vec<u8>), rcgen::Error> {
         let key = rcgen::KeyPair::generate()?;
         let mut params = rcgen::CertificateParams::new(vec!["torii-fallback.invalid".to_string()])?;
         let mut dn = rcgen::DistinguishedName::new();
@@ -30,10 +63,7 @@ impl CertKey {
         dn.push(rcgen::DnType::OrganizationName, "torii");
         params.distinguished_name = dn;
         let cert = params.self_signed(&key)?;
-        Ok(CertKey {
-            cert_pem: cert.pem().into_bytes(),
-            key_pem: key.serialize_pem().into_bytes(),
-        })
+        Ok((cert.pem().into_bytes(), key.serialize_pem().into_bytes()))
     }
 }
 
@@ -83,11 +113,12 @@ mod tests {
 
     #[test]
     fn self_signed_fallback_parses_as_cert_and_key() {
-        let ck = CertKey::generate_self_signed().unwrap();
-        assert!(ck.cert_pem.starts_with(b"-----BEGIN CERTIFICATE-----"));
-        assert!(ck.key_pem.starts_with(b"-----BEGIN PRIVATE KEY-----"));
+        assert!(CertKey::generate_self_signed().unwrap().parsed().is_some());
+        let (cert_pem, key_pem) = CertKey::generate_self_signed_pem().unwrap();
+        assert!(cert_pem.starts_with(b"-----BEGIN CERTIFICATE-----"));
+        assert!(key_pem.starts_with(b"-----BEGIN PRIVATE KEY-----"));
         // The data plane installs it the same way; ensure both halves parse.
-        let (_, pem) = x509_parser::pem::parse_x509_pem(&ck.cert_pem).unwrap();
+        let (_, pem) = x509_parser::pem::parse_x509_pem(&cert_pem).unwrap();
         assert!(pem.parse_x509().is_ok(), "fallback cert must parse as X.509");
     }
 
@@ -98,10 +129,7 @@ mod tests {
     }
 
     fn dummy_cert() -> CertKey {
-        CertKey {
-            cert_pem: b"c".to_vec(),
-            key_pem: b"k".to_vec(),
-        }
+        CertKey::new(b"c", b"k")
     }
 
     #[test]
