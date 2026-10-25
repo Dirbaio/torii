@@ -17,6 +17,7 @@ use pingora_core::upstreams::peer::HttpPeer;
 use pingora_http::ResponseHeader;
 use pingora_proxy::{ProxyHttp, Session, http_proxy};
 
+use crate::conn_limit::{ConnLimiter, ConnLimits, ConnPermit};
 use crate::route_table::{BackendTls, Endpoint, Filters, HeaderMods};
 use crate::snapshot::DataPlane;
 use crate::tls_table::TlsDecision;
@@ -1200,6 +1201,8 @@ pub struct GatewayTlsApp {
     tls_callbacks: Arc<pingora_core::listeners::TlsAcceptCallbacks>,
     /// Deadline for connecting to a TLSRoute backend ([`UpstreamTimeouts::connect`]).
     connect_timeout: Option<std::time::Duration>,
+    /// The connection caps, counted together with the plain-HTTP ports' (see [`admit`]).
+    limiter: Arc<ConnLimiter>,
 }
 
 #[async_trait]
@@ -1209,6 +1212,8 @@ impl pingora_core::apps::ServerApp for GatewayTlsApp {
         mut stream: pingora_core::protocols::Stream,
         shutdown: &pingora_core::server::ShutdownWatch,
     ) -> Option<pingora_core::protocols::Stream> {
+        let _permit = admit(&self.limiter, &stream)?;
+
         let port = stream
             .get_socket_digest()
             .and_then(|d| d.local_addr().and_then(|a| a.as_inet().map(|i| i.port())))
@@ -1541,6 +1546,7 @@ async fn serve_h1(
 /// that writes to the client are bounded.
 struct GatewayHttpApp {
     proxy: Arc<pingora_proxy::HttpProxy<GatewayProxy>>,
+    limiter: Arc<ConnLimiter>,
 }
 
 #[async_trait]
@@ -1550,6 +1556,7 @@ impl pingora_core::apps::ServerApp for GatewayHttpApp {
         stream: pingora_core::protocols::Stream,
         shutdown: &pingora_core::server::ShutdownWatch,
     ) -> Option<pingora_core::protocols::Stream> {
+        let _permit = admit(&self.limiter, &stream)?;
         let stream = Box::new(BoxedStream::new(stream, CLIENT_STALL_TIMEOUT));
         serve_h1(&self.proxy, stream, shutdown).await;
         None
@@ -1558,6 +1565,18 @@ impl pingora_core::apps::ServerApp for GatewayHttpApp {
     async fn cleanup(&self) {
         pingora_core::apps::ServerApp::cleanup(&*self.proxy).await
     }
+}
+
+/// Take a slot under the connection caps for a new downstream connection, by its
+/// peer address. Both apps take it before any work for the connection (the SNI
+/// peek, the TLS handshake, the HTTP session) and hold it until the connection
+/// ends: they never hand the stream back to Pingora for reuse. Pingora accepts and
+/// spawns a task for every connection, so `None` (over a cap) means closing it.
+fn admit(limiter: &Arc<ConnLimiter>, stream: &pingora_core::protocols::Stream) -> Option<ConnPermit> {
+    let peer = stream
+        .get_socket_digest()
+        .and_then(|d| d.peer_addr().and_then(|a| a.as_inet()).map(|a| a.ip()));
+    limiter.admit(peer)
 }
 
 /// Connect to a TLSRoute backend the way Pingora connects to an HTTP one: within
@@ -1807,10 +1826,14 @@ pub fn run(
     http_ports: &[u16],
     tls_ports: &[u16],
     timeouts: UpstreamTimeouts,
+    limits: ConnLimits,
 ) -> ! {
     // Pass None so Pingora doesn't parse our process argv as its own options.
     let mut server = Server::new(None).expect("failed to create pingora server");
     server.bootstrap();
+
+    // One count for all ports, so that a source's share is for all of them.
+    let limiter = ConnLimiter::new(limits);
 
     // Plain-HTTP proxy service. The proxy routes per-port via server_addr().
     let http_app = GatewayHttpApp {
@@ -1818,6 +1841,7 @@ pub fn run(
             &server.configuration,
             GatewayProxy::new(data_plane.clone(), tls_ports.to_vec(), timeouts),
         )),
+        limiter: limiter.clone(),
     };
     let mut http_service = pingora_core::services::listening::Service::new("http-proxy".to_string(), http_app);
     for port in http_ports {
@@ -1841,6 +1865,7 @@ pub fn run(
             acceptor,
             tls_callbacks,
             connect_timeout: timeouts.connect,
+            limiter,
         };
         let mut tls_service = pingora_core::services::listening::Service::new("tls-sni-dispatch".to_string(), app);
         for port in tls_ports {
@@ -1849,7 +1874,7 @@ pub fn run(
         server.add_service(tls_service);
     }
 
-    tracing::info!(bind_ip, ?http_ports, ?tls_ports, "data plane listening");
+    tracing::info!(bind_ip, ?http_ports, ?tls_ports, ?limits, "data plane listening");
     server.run_forever();
 }
 
@@ -1865,6 +1890,11 @@ mod tests {
     const NO_TIMEOUTS: UpstreamTimeouts = UpstreamTimeouts {
         connect: None,
         response: None,
+    };
+
+    const NO_LIMITS: ConnLimits = ConnLimits {
+        per_source: None,
+        total: None,
     };
 
     // copy_bidirectional_idle relays bytes both ways and ends cleanly on EOF.
@@ -2534,6 +2564,7 @@ mod tests {
             acceptor,
             tls_callbacks,
             connect_timeout: None,
+            limiter: ConnLimiter::new(NO_LIMITS),
         }
     }
 
@@ -2600,6 +2631,93 @@ mod tests {
         );
         assert!(accept.await.is_some());
         client.await.unwrap().expect("client handshake");
+    }
+
+    /// Accept a TCP connection from 127.0.0.1 the way Pingora's listener does, with
+    /// the socket digest that has its peer address. Returns the client side too.
+    async fn accept_tcp(
+        listener: &tokio::net::TcpListener,
+    ) -> (tokio::net::TcpStream, pingora_core::protocols::Stream) {
+        use std::os::fd::AsRawFd;
+
+        use pingora_core::protocols::{GetSocketDigest, SocketDigest};
+
+        let client = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let mut server = pingora_core::protocols::l4::stream::Stream::from(server);
+        server.set_socket_digest(SocketDigest::from_raw_fd(server.as_raw_fd()));
+        (client, Box::new(server))
+    }
+
+    // A connection holds its slot under the connection caps from accept to close, on
+    // the plain and the TLS ports alike, which count together. One from a source that
+    // already has its share open is closed before any work for it (it would have
+    // waited for a request head or a ClientHello), and one that ends frees its slot.
+    #[tokio::test]
+    async fn connections_over_the_source_cap_are_closed() {
+        use pingora_core::apps::ServerApp;
+
+        fn serve<A: ServerApp + Send + Sync + 'static>(
+            app: &Arc<A>,
+            stream: pingora_core::protocols::Stream,
+            shutdown: &pingora_core::server::ShutdownWatch,
+        ) -> tokio::task::JoinHandle<()> {
+            let (app, shutdown) = (app.clone(), shutdown.clone());
+            tokio::spawn(async move {
+                app.process_new(stream, &shutdown).await;
+            })
+        }
+
+        let limiter = ConnLimiter::new(ConnLimits {
+            per_source: Some(2),
+            total: None,
+        });
+        let http = Arc::new(GatewayHttpApp {
+            proxy: route_proxy(NO_TIMEOUTS, vec![], Filters::default(), None),
+            limiter: limiter.clone(),
+        });
+        let tls = Arc::new(GatewayTlsApp { limiter, ..tls_app() });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+
+        let (plain_client, stream) = accept_tcp(&listener).await;
+        let plain = serve(&http, stream, &shutdown);
+        let (_tls_client, stream) = accept_tcp(&listener).await;
+        let tls_conn = serve(&tls, stream, &shutdown);
+
+        let (mut client, stream) = accept_tcp(&listener).await;
+        tokio::time::timeout(Duration::from_secs(1), serve(&http, stream, &shutdown))
+            .await
+            .expect("the plain port must close it at once")
+            .unwrap();
+        assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+        let (mut client, stream) = accept_tcp(&listener).await;
+        tokio::time::timeout(Duration::from_secs(1), serve(&tls, stream, &shutdown))
+            .await
+            .expect("the TLS port must close it at once")
+            .unwrap();
+        assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !plain.is_finished() && !tls_conn.is_finished(),
+            "the first two are served"
+        );
+
+        drop(plain_client);
+        tokio::time::timeout(Duration::from_secs(5), plain)
+            .await
+            .unwrap()
+            .unwrap();
+        let (_client, stream) = accept_tcp(&listener).await;
+        let admitted = serve(&tls, stream, &shutdown);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!admitted.is_finished(), "a closed connection frees its slot");
+
+        tls_conn.abort();
+        admitted.abort();
     }
 
     /// A backend that accepts connections and never sends a byte (so as a TLS backend

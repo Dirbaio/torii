@@ -22,6 +22,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 mod acme;
 mod acme_cert;
 mod cert_store;
+mod conn_limit;
 mod controller;
 mod dataplane;
 mod route_table;
@@ -82,6 +83,22 @@ struct Cli {
     /// disables it. A duration like `60s` or `5m`; `0s` disables it.
     #[arg(long, env = "TORII_UPSTREAM_TIMEOUT", default_value = "60s", value_parser = parse_duration)]
     upstream_timeout: Duration,
+
+    /// Most connections one client may have open at once, on all ports together. A
+    /// client is an IPv4 address or an IPv6 /64; its connections over this are
+    /// closed as they come. Raise it, or set `0` to disable it, if many clients
+    /// share an address: behind a NAT, or a load balancer that does not keep client
+    /// addresses.
+    #[arg(long, env = "TORII_MAX_CONNECTIONS_PER_SOURCE", default_value_t = 256)]
+    max_connections_per_source: usize,
+
+    /// Most connections open at once, on all ports together; new ones over this are
+    /// closed as they come. Defaults to one per 128 KiB of the memory limit
+    /// (`limits.memory`, from cgroup v2), about twice what an idle TLS connection
+    /// costs, so that connections cannot exhaust it. No limit without a memory
+    /// limit, or with `0`.
+    #[arg(long, env = "TORII_MAX_CONNECTIONS")]
+    max_connections: Option<usize>,
 
     /// Enable automatic TLS certificate issuance via ACME (TLS-ALPN-01).
     /// OFF by default; even when on, a Gateway must opt in by carrying the
@@ -148,9 +165,16 @@ async fn run(args: Cli) -> Result<()> {
         connect: enabled(args.upstream_connect_timeout),
         response: enabled(args.upstream_timeout),
     };
+    let limits = conn_limit::ConnLimits {
+        per_source: Some(args.max_connections_per_source).filter(|&n| n > 0),
+        total: match args.max_connections {
+            Some(n) => Some(n).filter(|&n| n > 0),
+            None => conn_limit::default_max_connections(),
+        },
+    };
     std::thread::Builder::new()
         .name("dataplane".into())
-        .spawn(move || dataplane::run(dp, &bind_ip, &http_ports, &tls_ports, timeouts))
+        .spawn(move || dataplane::run(dp, &bind_ip, &http_ports, &tls_ports, timeouts, limits))
         .context("failed to spawn data-plane thread")?;
 
     // ACME (optional): only spawned with --acme. When off, `acme_feed` is None and the
