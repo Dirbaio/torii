@@ -449,6 +449,17 @@ async fn scan_and_issue(
     config: &AcmeConfig,
     backoff: &mut Backoff,
 ) -> Result<()> {
+    // A Secret holds one certificate, for one hostname. When listeners with different
+    // hostnames share a certificateRef, issue for the first of them by name only:
+    // the others would see its certificate as theirs and report it Issued.
+    let mut secret_owners: HashMap<(&str, &str), &AcmeTarget> = HashMap::new();
+    for t in targets.iter().filter(|t| is_concrete_hostname(&t.hostname)) {
+        let owner = secret_owners.entry((&t.secret_ns, &t.secret_name)).or_insert(t);
+        if (&t.gw_ns, &t.gw_name, &t.listener_name) < (&owner.gw_ns, &owner.gw_name, &owner.listener_name) {
+            *owner = t;
+        }
+    }
+
     for target in targets {
         // Config error: the Gateway opted in but no issuer/email is configured
         // (neither a CLI default nor a Gateway annotation). Report it instead of
@@ -483,7 +494,7 @@ async fn scan_and_issue(
         }
 
         // Wildcard / empty hostname → can never validate via TLS-ALPN-01. Report it.
-        if target.hostname.starts_with("*.") || target.hostname.is_empty() {
+        if !is_concrete_hostname(&target.hostname) {
             patch_acme_status(
                 client,
                 target,
@@ -499,12 +510,27 @@ async fn scan_and_issue(
             continue;
         }
 
-        // Already have a good cert? Report Issued and move on (no CA traffic).
-        if let CertCheck::Good { not_after } = cert_check(client, &target.secret_ns, &target.secret_name).await {
-            backoff.record_success(target);
-            patch_acme_status(client, target, &AcmeState::Issued { not_after }).await;
+        if let Some(owner) = secret_owners.get(&(target.secret_ns.as_str(), target.secret_name.as_str()))
+            && !owner.hostname.eq_ignore_ascii_case(&target.hostname)
+        {
+            let detail = format!(
+                "certificateRef Secret {}/{} is also used by listener {:?} of Gateway {}/{} for {}, and ACME \
+                 issues one hostname per Secret; give this listener its own Secret",
+                target.secret_ns, target.secret_name, owner.listener_name, owner.gw_ns, owner.gw_name, owner.hostname
+            );
+            patch_acme_status(client, target, &AcmeState::Failed { detail, retry_in_s: 0 }).await;
             continue;
         }
+
+        // Already have a good cert? Report Issued and move on (no CA traffic).
+        let reason = match cert_check(client, target).await {
+            CertCheck::Good { not_after } => {
+                backoff.record_success(target);
+                patch_acme_status(client, target, &AcmeState::Issued { not_after }).await;
+                continue;
+            }
+            CertCheck::NeedsWork { reason } => reason,
+        };
 
         // Needs work. If backed off from a recent failure, keep reporting that
         // failure (with the remaining wait) rather than re-hitting the CA.
@@ -521,7 +547,7 @@ async fn scan_and_issue(
             client,
             target,
             &AcmeState::Pending {
-                stage: "ordering certificate".into(),
+                stage: format!("ordering certificate ({reason})"),
             },
         )
         .await;
@@ -583,22 +609,36 @@ fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
         .unwrap_or("non-string panic payload")
 }
 
-/// The current state of a cert Secret for ACME purposes.
-enum CertCheck {
-    /// A valid cert is present and not within the renewal window. `not_after` unix s.
-    Good { not_after: i64 },
-    /// Missing, unparseable, or expiring → needs (re)issuance.
-    NeedsWork,
+/// Whether TLS-ALPN-01 can validate `host`: a concrete (non-wildcard, non-empty) name.
+fn is_concrete_hostname(host: &str) -> bool {
+    !host.is_empty() && !host.starts_with("*.")
 }
 
-/// Inspect a cert Secret: is there a valid, not-yet-expiring cert?
-async fn cert_check(client: &Client, ns: &str, name: &str) -> CertCheck {
+/// The current state of a cert Secret for ACME purposes.
+#[derive(Debug)]
+enum CertCheck {
+    /// A valid cert for the target's hostname, with its key, is present and not
+    /// within the renewal window. `not_after` unix s.
+    Good { not_after: i64 },
+    /// Missing, unparseable, for another name, not matching its key, or expiring →
+    /// needs (re)issuance; `reason` says which.
+    NeedsWork { reason: String },
+}
+
+/// Inspect a target's cert Secret: is there a valid, not-yet-expiring cert for its
+/// hostname, with the matching key?
+async fn cert_check(client: &Client, target: &AcmeTarget) -> CertCheck {
+    let (ns, name) = (target.secret_ns.as_str(), target.secret_name.as_str());
     let api: Api<Secret> = Api::namespaced(client.clone(), ns);
     // Only a genuine NotFound (404) means "missing" → issue. Any other API error
     // (timeout, 429, 503) must NOT force a reissuance of an already-valid cert.
     let secret = match api.get(name).await {
         Ok(s) => s,
-        Err(kube::Error::Api(ae)) if ae.code == 404 => return CertCheck::NeedsWork,
+        Err(kube::Error::Api(ae)) if ae.code == 404 => {
+            return CertCheck::NeedsWork {
+                reason: format!("Secret {ns}/{name} does not exist"),
+            };
+        }
         Err(e) => {
             tracing::warn!(ns, name, error = %e, "ACME: cert Secret read failed; not reissuing");
             // Treat a transient read error as "leave as-is" — needs work false-ish.
@@ -610,19 +650,55 @@ async fn cert_check(client: &Client, ns: &str, name: &str) -> CertCheck {
             };
         }
     };
-    let Some(crt) = secret.data.as_ref().and_then(|d| d.get("tls.crt")) else {
-        return CertCheck::NeedsWork;
-    };
-    match cert_not_after(&crt.0) {
-        Some(not_after) => {
-            let renew_at = not_after - RENEW_WINDOW.as_secs() as i64;
-            if now_unix() >= renew_at {
-                CertCheck::NeedsWork
-            } else {
-                CertCheck::Good { not_after }
-            }
-        }
-        None => CertCheck::NeedsWork, // unparseable → reissue
+    let data = secret.data.as_ref();
+    let crt = data.and_then(|d| d.get("tls.crt")).map(|b| b.0.as_slice());
+    let key = data.and_then(|d| d.get("tls.key")).map(|b| b.0.as_slice());
+    check_cert_key(crt, key, &target.hostname, now_unix()).unwrap_or_else(|reason| CertCheck::NeedsWork {
+        reason: format!("certificate in Secret {ns}/{name} {reason}"),
+    })
+}
+
+/// Check a Secret's `tls.crt`/`tls.key` for `host` at time `now` (unix s). The
+/// error completes "certificate in Secret ns/name ...".
+fn check_cert_key(crt: Option<&[u8]>, key: Option<&[u8]>, host: &str, now: i64) -> Result<CertCheck, String> {
+    use pingora_core::tls::pkey::PKey;
+    use pingora_core::tls::x509::X509;
+
+    let crt = crt.ok_or("is missing (no tls.crt)")?;
+    let leaf = X509::from_pem(crt).map_err(|_| "does not parse")?;
+    let not_after = cert_not_after(crt).ok_or("does not parse")?;
+    let covers = leaf
+        .subject_alt_names()
+        .into_iter()
+        .flatten()
+        .filter_map(|n| n.dnsname().map(str::to_owned))
+        .any(|n| dns_name_covers(&n, host));
+    if !covers {
+        return Err(format!("does not cover {host}"));
+    }
+    let key = key.ok_or("has no key (no tls.key)")?;
+    let key = PKey::private_key_from_pem(key).map_err(|_| "has a key that does not parse")?;
+    let leaf_key = leaf.public_key().map_err(|_| "has a public key that does not parse")?;
+    if !leaf_key.public_eq(&key) {
+        return Err("does not match the key in tls.key".into());
+    }
+    if now >= not_after - RENEW_WINDOW.as_secs() as i64 {
+        return Ok(CertCheck::NeedsWork {
+            reason: format!("renewing the certificate, valid until unix:{not_after}"),
+        });
+    }
+    Ok(CertCheck::Good { not_after })
+}
+
+/// Whether a certificate's DNS SAN `name` covers `host`: an exact match, or a
+/// `*.` wildcard for exactly one label (RFC 6125 §6.4.3). Case-insensitive.
+fn dns_name_covers(name: &str, host: &str) -> bool {
+    if name.eq_ignore_ascii_case(host) {
+        return true;
+    }
+    match (name.strip_prefix("*."), host.split_once('.')) {
+        (Some(suffix), Some((label, rest))) => !label.is_empty() && suffix.eq_ignore_ascii_case(rest),
+        _ => false,
     }
 }
 
@@ -1019,6 +1095,60 @@ mod tests {
     #[test]
     fn cert_not_after_rejects_garbage() {
         assert!(cert_not_after(b"not a pem").is_none());
+    }
+
+    #[test]
+    fn dns_name_covers_exact_and_one_label_wildcards() {
+        assert!(dns_name_covers("a.example.com", "a.example.com"));
+        assert!(dns_name_covers("A.Example.com", "a.example.COM"));
+        assert!(dns_name_covers("*.example.com", "a.example.com"));
+        assert!(!dns_name_covers("*.example.com", "example.com"));
+        assert!(!dns_name_covers("*.example.com", "a.b.example.com"));
+        assert!(!dns_name_covers("*.example.com", ".example.com"));
+        assert!(!dns_name_covers("b.example.com", "a.example.com"));
+    }
+
+    #[test]
+    fn cert_check_needs_the_hostname_and_the_key() {
+        let cert = |names: &[&str], key: &rcgen::KeyPair, not_after: Option<(i32, u8, u8)>| {
+            let mut params =
+                rcgen::CertificateParams::new(names.iter().map(|n| n.to_string()).collect::<Vec<_>>()).unwrap();
+            if let Some((y, m, d)) = not_after {
+                params.not_before = rcgen::date_time_ymd(y - 1, m, d);
+                params.not_after = rcgen::date_time_ymd(y, m, d);
+            }
+            params.self_signed(key).unwrap().pem().into_bytes()
+        };
+        let key = rcgen::KeyPair::generate().unwrap();
+        let key_pem = key.serialize_pem().into_bytes();
+        let other_key = rcgen::KeyPair::generate().unwrap().serialize_pem().into_bytes();
+        let host = "h2.example";
+        let check = |crt: &[u8], key: Option<&[u8]>| check_cert_key(Some(crt), key, host, now_unix());
+
+        let good = cert(&["h2.example"], &key, None);
+        assert!(matches!(check(&good, Some(&key_pem)), Ok(CertCheck::Good { .. })));
+        let wildcard = cert(&["*.example"], &key, None);
+        assert!(matches!(check(&wildcard, Some(&key_pem)), Ok(CertCheck::Good { .. })));
+
+        let renamed = cert(&["h1.example"], &key, None);
+        assert_eq!(
+            check(&renamed, Some(&key_pem)).unwrap_err(),
+            "does not cover h2.example"
+        );
+        assert_eq!(
+            check(&good, Some(&other_key)).unwrap_err(),
+            "does not match the key in tls.key"
+        );
+        assert!(check(&good, None).is_err());
+        assert!(check(&good, Some(b"garbage")).is_err());
+        assert!(check(b"garbage", Some(&key_pem)).is_err());
+        assert!(check_cert_key(None, Some(&key_pem), host, now_unix()).is_err());
+
+        let expiring = cert(&["h2.example"], &key, Some((2020, 1, 1)));
+        assert!(matches!(
+            check(&expiring, Some(&key_pem)),
+            Ok(CertCheck::NeedsWork { .. })
+        ));
     }
 
     #[test]
