@@ -32,6 +32,9 @@ gateway-api = "=0.21.0"
 pingora-core = { git = "https://github.com/cloudflare/pingora", features = ["openssl"] }
 pingora-proxy = { git = "https://github.com/cloudflare/pingora", features = ["openssl"] }
 pingora-http = { git = "https://github.com/cloudflare/pingora" }
+# Pingora's HTTP/2 implementation; the h2 accept loop resets streams and the
+# connection with its error codes.
+h2 = "0.4.20"
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 clap = { version = "4", features = ["derive", "env"] }

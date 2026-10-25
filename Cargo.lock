@@ -3001,6 +3001,7 @@ dependencies = [
  "clap",
  "futures",
  "gateway-api",
+ "h2",
  "http",
  "instant-acme",
  "k8s-openapi",
