@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use futures::StreamExt;
+use futures::{Stream, StreamExt, TryStreamExt};
 use gateway_api::apis::standard::backendtlspolicies::{
     BackendTLSPolicy, BackendTlsPolicyStatus, BackendTlsPolicyStatusAncestors,
     BackendTlsPolicyStatusAncestorsAncestorRef,
@@ -31,11 +31,13 @@ use gateway_api::apis::standard::tlsroutes::{
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
-use kube::api::{Patch, PatchParams};
+use kube::api::{ApiResource, DynamicObject, Patch, PatchParams};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::reflector::{self, Store};
-use kube::runtime::watcher::{Config, watcher};
+use kube::runtime::watcher::{self, Config, watcher};
 use kube::{Api, Client, Resource, ResourceExt};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 
 use crate::cert_store::{CertKey, CertStore};
 use crate::route_table::{
@@ -52,6 +54,11 @@ pub const CONTROLLER_NAME: &str = "torii.dirba.io/controller";
 /// from the ACME subsystem's manager ([`crate::acme::FIELD_MANAGER`]) so the two
 /// can own different conditions on the same object without clobbering each other.
 const FIELD_MANAGER: &str = "torii-controller";
+
+/// Annotation on the in-memory stand-in for a route that does not decode (see
+/// [`route_stand_in`]), holding why the route is rejected. Never written to the
+/// API server.
+const UNDECODABLE_ANNOTATION: &str = "torii.dirba.io/undecodable";
 
 /// Features we report in GatewayClass.status.supportedFeatures. The conformance
 /// suite uses this to decide which tests apply when running a whole profile
@@ -132,18 +139,16 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
 
     // For each watched resource: create a reflector store, spawn a watcher that
     // feeds it and pokes `tx` on every event, and yield the store. One macro
-    // expansion per resource keeps the wiring in one place. The `ready` future
-    // waits for every store's first list before the initial reconcile.
+    // expansion per resource keeps the wiring in one place. Gateway API kinds
+    // (`per_object`) are decoded one object at a time, see [`decoded_watcher`].
+    // The `ready` future waits for every store's first list before the initial
+    // reconcile.
     let mut ready: Vec<futures::future::BoxFuture<'static, ()>> = Vec::new();
     macro_rules! watch {
-        ($ty:ty, $kind:literal) => {{
+        (@reflect $ty:ty, $kind:literal, $events:expr) => {{
             let (store, writer) = reflector::store::<$ty>();
-            let api: Api<$ty> = Api::all(client.clone());
             let tx = tx.clone();
-            let stream = watcher(api, Config::default())
-                .reflect(writer)
-                .default_backoff()
-                .touched_objects();
+            let stream = $events.reflect(writer).default_backoff().touched_objects();
             tokio::spawn(async move {
                 futures::pin_mut!(stream);
                 while let Some(ev) = stream.next().await {
@@ -158,20 +163,26 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
             ready.push(Box::pin(async move { let _ = r.wait_until_ready().await; }));
             store
         }};
+        ($ty:ty, $kind:literal, per_object) => {
+            watch!(@reflect $ty, $kind, decoded_watcher::<$ty>(client.clone()))
+        };
+        ($ty:ty, $kind:literal) => {
+            watch!(@reflect $ty, $kind, watcher(Api::<$ty>::all(client.clone()), Config::default()))
+        };
     }
 
     let stores = Arc::new(Stores {
-        gateway_classes: watch!(GatewayClass, "GatewayClass"),
-        gateways: watch!(Gateway, "Gateway"),
-        routes: watch!(HTTPRoute, "HTTPRoute"),
-        tls_routes: watch!(TLSRoute, "TLSRoute"),
+        gateway_classes: watch!(GatewayClass, "GatewayClass", per_object),
+        gateways: watch!(Gateway, "Gateway", per_object),
+        routes: watch!(HTTPRoute, "HTTPRoute", per_object),
+        tls_routes: watch!(TLSRoute, "TLSRoute", per_object),
         services: watch!(Service, "Service"),
         endpoint_slices: watch!(EndpointSlice, "EndpointSlice"),
-        reference_grants: watch!(ReferenceGrant, "ReferenceGrant"),
+        reference_grants: watch!(ReferenceGrant, "ReferenceGrant", per_object),
         namespaces: watch!(Namespace, "Namespace"),
         secrets: watch!(Secret, "Secret"),
         config_maps: watch!(ConfigMap, "ConfigMap"),
-        backend_tls_policies: watch!(BackendTLSPolicy, "BackendTLSPolicy"),
+        backend_tls_policies: watch!(BackendTLSPolicy, "BackendTLSPolicy", per_object),
     });
 
     // Wait for all caches to populate before the first reconcile.
@@ -179,12 +190,10 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
         futures::future::join_all(ready).await;
     });
 
-    let gc_api: Api<GatewayClass> = Api::all(client.clone());
     tracing::info!(controller = CONTROLLER_NAME, "control plane started");
 
     let ctx = ReconcileCtx {
         client,
-        gc_api,
         data_plane,
         config,
         stores,
@@ -214,11 +223,111 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
     }
 }
 
+/// Watch every object of a Gateway API kind, decoding each one on its own.
+///
+/// A typed watcher decodes a whole LIST page as one `ObjectList<K>`, so a single
+/// object that the gateway-api types cannot represent (a value only a newer or
+/// experimental-channel CRD allows, like an `ExternalAuth` filter or a v1alpha2
+/// TLSRoute without `hostnames`) fails every LIST: the store stays empty after a
+/// start, or frozen after a re-list, and torii serves none of that kind for
+/// anyone. Here the LIST and the watch carry `DynamicObject`s, and
+/// [`decode_event`] confines a failure to its own object. Core kinds keep the
+/// typed watcher: k8s-openapi models their enums as strings, ignores unknown
+/// fields, and the API server enforces their required ones.
+fn decoded_watcher<K>(client: Client) -> impl Stream<Item = watcher::Result<watcher::Event<K>>> + Send
+where
+    K: Resource<DynamicType = ()> + Default + Serialize + DeserializeOwned + Send + 'static,
+{
+    let api = Api::<DynamicObject>::all_with(client, &ApiResource::erase::<K>(&()));
+    watcher(api, Config::default()).try_filter_map(|event| futures::future::ready(Ok(decode_event(event))))
+}
+
+/// Decode one event of a [`decoded_watcher`]. An object that does not decode is
+/// logged, and then:
+/// - a route (an object with `spec.parentRefs`) is replaced by its
+///   [`route_stand_in`], so that the Gateways it targets report it;
+/// - an object of any other kind is left out, and its `Apply` deletes the older
+///   version from the store.
+fn decode_event<K>(event: watcher::Event<DynamicObject>) -> Option<watcher::Event<K>>
+where
+    K: Resource<DynamicType = ()> + Default + Serialize + DeserializeOwned,
+{
+    use watcher::Event;
+    Some(match event {
+        Event::Init => Event::Init,
+        Event::InitApply(obj) => Event::InitApply(decode_object(obj)?),
+        Event::InitDone => Event::InitDone,
+        Event::Apply(obj) => {
+            let gone = Event::Delete(bare_object(&obj));
+            decode_object(obj).map_or(gone, Event::Apply)
+        }
+        // The store removes by name and namespace only.
+        Event::Delete(obj) => Event::Delete(bare_object(&obj)),
+    })
+}
+
+/// Decode one watched object into `K`, or into its [`route_stand_in`].
+fn decode_object<K>(obj: DynamicObject) -> Option<K>
+where
+    K: Resource<DynamicType = ()> + Default + Serialize + DeserializeOwned,
+{
+    match serde_json::to_value(&obj).and_then(serde_json::from_value::<K>) {
+        Ok(mut k) => {
+            // The marker is torii's alone: a copy set by a user rejects nothing.
+            if let Some(annotations) = k.meta_mut().annotations.as_mut() {
+                annotations.remove(UNDECODABLE_ANNOTATION);
+            }
+            Some(k)
+        }
+        Err(e) => {
+            tracing::warn!(
+                kind = %K::kind(&()),
+                namespace = obj.namespace().unwrap_or_default(),
+                name = obj.name_any(),
+                error = %e,
+                "object does not decode"
+            );
+            route_stand_in(obj, &e)
+        }
+    }
+}
+
+/// The stand-in kept for a route (an object with `spec.parentRefs`) that does not
+/// decode: `K`'s default with the route's metadata and parentRefs, and the decode
+/// error in [`UNDECODABLE_ANNOTATION`]. It has no rules, so none of it is
+/// programmed, and each torii Gateway it targets reports it
+/// `Accepted=False`/`UnsupportedValue`, as the spec prescribes for unknown values.
+/// None for any other kind, or when the parentRefs do not decode either.
+fn route_stand_in<K>(obj: DynamicObject, error: &serde_json::Error) -> Option<K>
+where
+    K: Resource + Default + Serialize + DeserializeOwned,
+{
+    let parent_refs = obj.data.get("spec")?.get("parentRefs")?.clone();
+    let mut stand_in = serde_json::to_value(K::default()).ok()?;
+    stand_in
+        .get_mut("spec")?
+        .as_object_mut()?
+        .insert("parentRefs".into(), parent_refs);
+    let mut k: K = serde_json::from_value(stand_in).ok()?;
+    *k.meta_mut() = obj.metadata;
+    let reason = format!("torii cannot decode this route, so none of it is programmed: {error}");
+    k.meta_mut()
+        .annotations
+        .get_or_insert_default()
+        .insert(UNDECODABLE_ANNOTATION.into(), reason);
+    Some(k)
+}
+
+/// An empty `K` with `obj`'s name and namespace: enough to remove it from a store.
+fn bare_object<K: Resource + Default>(obj: &DynamicObject) -> K {
+    let mut k = K::default();
+    k.meta_mut().name = obj.metadata.name.clone();
+    k.meta_mut().namespace = obj.metadata.namespace.clone();
+    k
+}
+
 struct ReconcileCtx {
     client: Client,
-    // GatewayClass is cluster-scoped; Gateway/HTTPRoute status use namespaced
-    // APIs built inline per object.
-    gc_api: Api<GatewayClass>,
     data_plane: DataPlane,
     config: ControllerConfig,
     stores: Arc<Stores>,
@@ -558,29 +667,17 @@ impl ReconcileCtx {
         Ok(())
     }
 
-    /// Apply one deferred status patch, building the right typed `Api` for its kind.
-    /// Each kind supplies its apiVersion+kind so the patch is a self-contained
-    /// Server-Side Apply document (see [`Self::patch_status`]).
+    /// Apply one deferred status patch to an object of its kind. Each kind supplies
+    /// its apiVersion+kind so the patch is a self-contained Server-Side Apply
+    /// document (see [`Self::patch_status`]).
     async fn apply_patch(&self, p: StatusPatch) -> Result<()> {
-        let ns = p.ns.unwrap_or_default();
+        let ns = p.ns.as_deref();
         match p.target {
-            PatchTarget::GatewayClass => self.patch_status(&self.gc_api, &p.name, "GatewayClass", p.json).await,
-            PatchTarget::Gateway => {
-                let api: Api<Gateway> = Api::namespaced(self.client.clone(), &ns);
-                self.patch_status(&api, &p.name, "Gateway", p.json).await
-            }
-            PatchTarget::HttpRoute => {
-                let api: Api<HTTPRoute> = Api::namespaced(self.client.clone(), &ns);
-                self.patch_status(&api, &p.name, "HTTPRoute", p.json).await
-            }
-            PatchTarget::TlsRoute => {
-                let api: Api<TLSRoute> = Api::namespaced(self.client.clone(), &ns);
-                self.patch_status(&api, &p.name, "TLSRoute", p.json).await
-            }
-            PatchTarget::BackendTlsPolicy => {
-                let api: Api<BackendTLSPolicy> = Api::namespaced(self.client.clone(), &ns);
-                self.patch_status(&api, &p.name, "BackendTLSPolicy", p.json).await
-            }
+            PatchTarget::GatewayClass => self.patch_status::<GatewayClass>(ns, &p.name, p.json).await,
+            PatchTarget::Gateway => self.patch_status::<Gateway>(ns, &p.name, p.json).await,
+            PatchTarget::HttpRoute => self.patch_status::<HTTPRoute>(ns, &p.name, p.json).await,
+            PatchTarget::TlsRoute => self.patch_status::<TLSRoute>(ns, &p.name, p.json).await,
+            PatchTarget::BackendTlsPolicy => self.patch_status::<BackendTLSPolicy>(ns, &p.name, p.json).await,
         }
     }
 
@@ -986,8 +1083,9 @@ impl ReconcileCtx {
             // ResolvedRefs failure reason (RefNotPermitted takes priority).
             let mut refs_failure: Option<&'static str> = None;
             // First unsupported-value problem found in any rule. The offending rule
-            // is skipped (not programmed) and the route is Accepted=False.
-            let mut unsupported: Option<String> = None;
+            // is skipped (not programmed) and the route is Accepted=False. A route
+            // torii cannot decode is a stand-in with no rules (see `route_stand_in`).
+            let mut unsupported: Option<String> = route.annotations().get(UNDECODABLE_ANNOTATION).cloned();
             for (rule_order, rule) in route.spec.rules.iter().flatten().enumerate() {
                 // A rule with a CRD-valid but unsupported value is not programmed;
                 // record the reason for the route's Accepted condition and skip it.
@@ -1215,6 +1313,9 @@ impl ReconcileCtx {
         let generation = route.meta().generation.unwrap_or(0);
         let route_ns = route.namespace().unwrap_or_default();
         let route_hostnames = &route.spec.hostnames;
+        // A route torii cannot decode is a stand-in (see `route_stand_in`): it
+        // attaches like any other, but programs nothing and reports why.
+        let undecodable = route.annotations().get(UNDECODABLE_ANNOTATION);
 
         let mut parents: Vec<TlsRouteStatusParents> = Vec::new();
 
@@ -1241,9 +1342,10 @@ impl ReconcileCtx {
                 *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
             }
 
-            let accepted = match accept_reason {
-                None => condition("Accepted", "True", "Accepted", generation),
-                Some(reason) => condition("Accepted", "False", reason, generation),
+            let accepted = match (accept_reason, undecodable) {
+                (Some(reason), _) => condition("Accepted", "False", reason, generation),
+                (None, Some(msg)) => condition_msg("Accepted", "False", "UnsupportedValue", msg, generation),
+                (None, None) => condition("Accepted", "True", "Accepted", generation),
             };
 
             // Resolve backends across all rules (shared by every matched SNI), and
@@ -1280,14 +1382,17 @@ impl ReconcileCtx {
             }
 
             // For each attached listener, add its effective SNIs to the dispatch
-            // table with the listener's mode (Passthrough vs Terminate).
-            for (l, mode) in &attached {
-                let action = match mode {
-                    TlsListenerMode::Passthrough => TlsAction::Passthrough(backends.clone()),
-                    TlsListenerMode::Terminate => TlsAction::Terminate(backends.clone()),
-                };
-                for sni in effective_hostnames(route_hostnames, l.hostname.as_deref()) {
-                    tls_table.insert(l.port as u16, &sni, action.clone());
+            // table with the listener's mode (Passthrough vs Terminate). A stand-in
+            // has no backends and must not take its listeners' SNIs.
+            if undecodable.is_none() {
+                for (l, mode) in &attached {
+                    let action = match mode {
+                        TlsListenerMode::Passthrough => TlsAction::Passthrough(backends.clone()),
+                        TlsListenerMode::Terminate => TlsAction::Terminate(backends.clone()),
+                    };
+                    for sni in effective_hostnames(route_hostnames, l.hostname.as_deref()) {
+                        tls_table.insert(l.port as u16, &sni, action.clone());
+                    }
                 }
             }
 
@@ -1842,15 +1947,21 @@ impl ReconcileCtx {
     /// for the standard conditions.
     ///
     /// `json` is the `{"status": {...}}` we computed; we wrap it into a full apply
-    /// document (apiVersion/kind/metadata.name) as SSA requires.
-    async fn patch_status<K>(&self, api: &Api<K>, name: &str, kind: &str, json: serde_json::Value) -> Result<()>
+    /// document (apiVersion/kind/metadata.name) as SSA requires. The API server
+    /// answers with the whole object, read as a `DynamicObject`: a route that
+    /// torii keeps as a stand-in does not decode into `K` (see [`route_stand_in`]).
+    async fn patch_status<K>(&self, ns: Option<&str>, name: &str, json: serde_json::Value) -> Result<()>
     where
-        K: Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
-        K::DynamicType: Default,
+        K: Resource<DynamicType = ()>,
     {
+        let resource = ApiResource::erase::<K>(&());
+        let api: Api<DynamicObject> = match ns {
+            Some(ns) => Api::namespaced_with(self.client.clone(), ns, &resource),
+            None => Api::all_with(self.client.clone(), &resource),
+        };
         let mut doc = serde_json::json!({
-            "apiVersion": "gateway.networking.k8s.io/v1",
-            "kind": kind,
+            "apiVersion": resource.api_version,
+            "kind": resource.kind,
             "metadata": { "name": name },
         });
         // Merge the computed `{"status": ...}` into the apply document.
@@ -2473,6 +2584,110 @@ mod tests {
         assert_eq!(timeout(Some("1m"), Some("0s")), Some(Duration::from_secs(60)));
         assert_eq!(timeout(Some("0s"), None), Some(Duration::ZERO));
         assert_eq!(timeout(None, Some("0s")), Some(Duration::ZERO));
+    }
+
+    fn http_route(name: &str, filter: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": {
+                "name": name,
+                "namespace": "ns",
+                "generation": 3,
+                "annotations": { UNDECODABLE_ANNOTATION: "set by a user" },
+            },
+            "spec": {
+                "parentRefs": [{ "name": "gw" }],
+                "rules": [{ "filters": [filter], "backendRefs": [{ "name": "app", "port": 80 }] }],
+            },
+        })
+    }
+
+    // One route that the gateway-api types cannot represent (here an
+    // experimental-channel ExternalAuth filter) used to fail the whole LIST page,
+    // so torii served no HTTPRoute at all. Now only that route is left out of the
+    // data plane, as a stand-in that keeps its parentRefs for status.
+    #[test]
+    fn undecodable_route_does_not_fail_the_list() {
+        let ext_auth = serde_json::json!({
+            "type": "ExternalAuth",
+            "externalAuth": { "protocol": "HTTP", "http": {}, "backendRef": { "name": "auth", "port": 8080 } },
+        });
+        let page = serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRouteList",
+            "metadata": { "resourceVersion": "1" },
+            "items": [
+                http_route("good", serde_json::json!({ "type": "RequestHeaderModifier" })),
+                http_route("extauth", ext_auth),
+            ],
+        });
+        // A typed LIST decodes the page as a whole, and fails.
+        assert!(serde_json::from_value::<kube::core::ObjectList<HTTPRoute>>(page.clone()).is_err());
+
+        let page: kube::core::ObjectList<DynamicObject> = serde_json::from_value(page).unwrap();
+        let (store, mut writer) = reflector::store::<HTTPRoute>();
+        writer.apply_watcher_event(&watcher::Event::Init);
+        for obj in page.items {
+            writer.apply_watcher_event(&decode_event(watcher::Event::InitApply(obj)).unwrap());
+        }
+        writer.apply_watcher_event(&watcher::Event::InitDone);
+
+        let good = find_in(&store, "ns", "good").unwrap();
+        assert_eq!(good.spec.rules.as_ref().map(Vec::len), Some(1));
+        assert!(!good.annotations().contains_key(UNDECODABLE_ANNOTATION));
+
+        let stand_in = find_in(&store, "ns", "extauth").unwrap();
+        assert_eq!(stand_in.spec.rules, None);
+        assert_eq!(stand_in.spec.parent_refs.as_ref().unwrap()[0].name, "gw");
+        assert_eq!(stand_in.meta().generation, Some(3));
+        assert!(stand_in.annotations()[UNDECODABLE_ANNOTATION].contains("unknown variant `ExternalAuth`"));
+    }
+
+    // A v1alpha2 TLSRoute may omit hostnames, which v1 (and so the Rust type)
+    // requires.
+    #[test]
+    fn tls_route_without_hostnames_is_a_stand_in() {
+        let obj: DynamicObject = serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "TLSRoute",
+            "metadata": { "name": "nohostnames", "namespace": "ns" },
+            "spec": {
+                "parentRefs": [{ "name": "gw" }],
+                "rules": [{ "backendRefs": [{ "name": "app", "port": 443 }] }],
+            },
+        }))
+        .unwrap();
+        let Some(watcher::Event::Apply(stand_in)) = decode_event::<TLSRoute>(watcher::Event::Apply(obj)) else {
+            panic!("expected an Apply of the stand-in");
+        };
+        assert!(stand_in.spec.rules.is_empty());
+        assert_eq!(stand_in.spec.parent_refs.as_ref().unwrap()[0].name, "gw");
+        assert!(stand_in.annotations()[UNDECODABLE_ANNOTATION].contains("missing field `hostnames`"));
+    }
+
+    // Any other kind that does not decode is left out: an update removes the
+    // older version from the store, and a re-list skips it.
+    #[test]
+    fn undecodable_object_leaves_the_store() {
+        let gateway = |mode: &str| -> DynamicObject {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "Gateway",
+                "metadata": { "name": "gw", "namespace": "ns" },
+                "spec": {
+                    "gatewayClassName": "torii",
+                    "listeners": [{ "name": "tls", "port": 443, "protocol": "TLS", "tls": { "mode": mode } }],
+                },
+            }))
+            .unwrap()
+        };
+        let (store, mut writer) = reflector::store::<Gateway>();
+        writer.apply_watcher_event(&decode_event(watcher::Event::Apply(gateway("Passthrough"))).unwrap());
+        assert!(find_in(&store, "ns", "gw").is_some());
+        writer.apply_watcher_event(&decode_event(watcher::Event::Apply(gateway("Bogus"))).unwrap());
+        assert!(find_in(&store, "ns", "gw").is_none());
+        assert!(decode_event::<Gateway>(watcher::Event::InitApply(gateway("Bogus"))).is_none());
     }
 
     fn lbls(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
