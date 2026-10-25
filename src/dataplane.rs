@@ -27,6 +27,23 @@ pub struct GatewayProxy {
     /// Ports that terminate TLS (HTTPS listeners). Used so redirects from an
     /// HTTPS listener default their scheme to `https`.
     tls_ports: Vec<u16>,
+    timeouts: UpstreamTimeouts,
+}
+
+/// Deadlines for torii's connections and requests to backends (the `--upstream-*`
+/// flags; `None` disables one). Pingora sets none by default, so a backend that
+/// never answered (an endpoint that drops SYNs, a BackendTLSPolicy endpoint that
+/// never finishes the handshake, a server that never sends its response) held the
+/// request, its task and its sockets for minutes or forever. A client that gives up
+/// does not end a connect either: Pingora only watches the client once it has the
+/// backend connection.
+#[derive(Clone, Copy, Debug)]
+pub struct UpstreamTimeouts {
+    /// For connecting to a backend, TLS handshake included.
+    pub connect: Option<std::time::Duration>,
+    /// How long a backend may go without sending or accepting data during a request,
+    /// the wait for its response included, for HTTPRoute rules without `timeouts`.
+    pub response: Option<std::time::Duration>,
 }
 
 /// Per-request state carried between the proxy phases.
@@ -37,7 +54,7 @@ pub struct RequestCtx {
     filters: Filters,
     /// Rewritten request path (from a URL-rewrite filter), if any.
     rewrite_path: Option<String>,
-    /// Request timeout for the matched route (applied to the upstream peer).
+    /// The matched rule's `timeouts` (see `RouteEntry::request_timeout`).
     request_timeout: Option<std::time::Duration>,
     /// If set, the request's allowed Origin — add CORS headers to the response.
     cors_origin: Option<String>,
@@ -66,8 +83,12 @@ struct Forwarded {
 }
 
 impl GatewayProxy {
-    pub fn new(data_plane: DataPlane, tls_ports: Vec<u16>) -> Self {
-        GatewayProxy { data_plane, tls_ports }
+    pub fn new(data_plane: DataPlane, tls_ports: Vec<u16>, timeouts: UpstreamTimeouts) -> Self {
+        GatewayProxy {
+            data_plane,
+            tls_ports,
+            timeouts,
+        }
     }
 }
 
@@ -320,11 +341,16 @@ impl ProxyHttp for GatewayProxy {
             // request never reaches here.
             BackendTls::Invalid => unreachable!("invalid-TLS endpoint reached upstream_peer"),
         };
-        // Apply the route's request timeout to the upstream read (response) wait.
-        if let Some(t) = ctx.request_timeout {
-            peer.options.read_timeout = Some(t);
-            peer.options.total_connection_timeout = Some(t);
-        }
+        // The rule's `timeouts` replace the default response timeout ("0s" disables
+        // it), and can only shorten the connect deadline.
+        let response = match ctx.request_timeout {
+            None => self.timeouts.response,
+            Some(t) => Some(t).filter(|t| !t.is_zero()),
+        };
+        peer.options.total_connection_timeout = self.timeouts.connect.into_iter().chain(response).min();
+        peer.options.read_timeout = response;
+        peer.options.write_timeout = response;
+        peer.options.tcp_keepalive = Some(UPSTREAM_TCP_KEEPALIVE);
         Ok(Box::new(peer))
     }
 
@@ -914,6 +940,20 @@ const H1_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// be reading.
 const H2_GOAWAY_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// TCP keepalive on torii's connections to backends: probe after 60s of silence,
+/// give up after 3 unanswered probes 10s apart. Without it, a backend that vanished
+/// without a FIN or RST (node power loss, a dropped conntrack entry) goes unnoticed
+/// by a connection waiting with no timeout: a pooled one, one whose route disables
+/// its timeouts, or a TLSRoute pipe until its idle timeout.
+const UPSTREAM_TCP_KEEPALIVE: pingora_core::protocols::TcpKeepalive = pingora_core::protocols::TcpKeepalive {
+    idle: std::time::Duration::from_secs(60),
+    interval: std::time::Duration::from_secs(10),
+    count: 3,
+    // 0: the system default.
+    #[cfg(target_os = "linux")]
+    user_timeout: std::time::Duration::ZERO,
+};
+
 /// h2 server settings for the terminate-then-HTTP path. Starts from Pingora's bounded
 /// defaults (`server::handshake` only applies them when given `None`) and sets the
 /// security-relevant limits explicitly, so they can't be dropped by accident.
@@ -945,6 +985,8 @@ pub struct GatewayTlsApp {
     /// used to terminate TLS on a stream we hand it.
     acceptor: Arc<pingora_core::tls::ssl::SslAcceptor>,
     tls_callbacks: Arc<pingora_core::listeners::TlsAcceptCallbacks>,
+    /// Deadline for connecting to a TLSRoute backend ([`UpstreamTimeouts::connect`]).
+    connect_timeout: Option<std::time::Duration>,
 }
 
 #[async_trait]
@@ -971,10 +1013,7 @@ impl pingora_core::apps::ServerApp for GatewayTlsApp {
         match decision {
             TlsDecision::Passthrough(ep) => {
                 tracing::debug!(port, ?sni, ip = %ep.ip, ep_port = ep.port, "TLS passthrough");
-                let Ok(mut upstream) = tokio::net::TcpStream::connect((ep.ip, ep.port)).await else {
-                    tracing::debug!(ip = %ep.ip, "passthrough backend connect failed");
-                    return None;
-                };
+                let mut upstream = connect_backend(&ep, self.connect_timeout).await?;
                 // True bidirectional pipe: the backend may speak first. Bounded by an
                 // idle timeout so a stalled connection can't pin the task forever.
                 let mut stream = BoxedStream::new(stream, PIPE_IDLE_TIMEOUT);
@@ -988,10 +1027,7 @@ impl pingora_core::apps::ServerApp for GatewayTlsApp {
                 let mut tls_stream = self
                     .tls_accept(BoxedStream::new(stream, PIPE_IDLE_TIMEOUT), TLS_HANDSHAKE_TIMEOUT)
                     .await?;
-                let Ok(mut upstream) = tokio::net::TcpStream::connect((ep.ip, ep.port)).await else {
-                    tracing::debug!(ip = %ep.ip, "terminate backend connect failed");
-                    return None;
-                };
+                let mut upstream = connect_backend(&ep, self.connect_timeout).await?;
                 let _ = copy_bidirectional_idle(&mut tls_stream, &mut upstream, PIPE_IDLE_TIMEOUT).await;
                 None
             }
@@ -1298,6 +1334,30 @@ impl pingora_core::apps::ServerApp for GatewayHttpApp {
     }
 }
 
+/// Connect to a TLSRoute backend the way Pingora connects to an HTTP one: within
+/// `timeout`, with TCP keepalive and `TCP_NODELAY`. A bare `connect()` to an endpoint
+/// that drops SYNs waits out the kernel's retries (~130s), holding the client's
+/// connection and task all along, even after the client has left.
+async fn connect_backend(ep: &Endpoint, timeout: Option<std::time::Duration>) -> Option<tokio::net::TcpStream> {
+    let connect = tokio::net::TcpStream::connect((ep.ip, ep.port));
+    let connected = match timeout {
+        Some(t) => tokio::time::timeout(t, connect)
+            .await
+            .unwrap_or_else(|_| Err(std::io::ErrorKind::TimedOut.into())),
+        None => connect.await,
+    };
+    let stream = match connected {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::debug!(ip = %ep.ip, port = ep.port, error = %e, "TLSRoute backend connect failed");
+            return None;
+        }
+    };
+    let _ = pingora_core::protocols::l4::ext::set_tcp_keepalive(&stream, &UPSTREAM_TCP_KEEPALIVE);
+    let _ = stream.set_nodelay(true);
+    Some(stream)
+}
+
 /// Bidirectional byte pipe with an **idle timeout**: if no bytes flow in EITHER
 /// direction for `idle`, the connection is torn down. Without it, a client that
 /// completes the handshake then stalls would pin a task + its upstream socket
@@ -1515,7 +1575,13 @@ fn tcp_listener(addr: &str) -> pingora_core::listeners::ListenerConfig {
 ///
 /// This blocks forever (Pingora calls `std::process::exit` on shutdown), so call
 /// it from a dedicated thread.
-pub fn run(data_plane: DataPlane, bind_ip: &str, http_ports: &[u16], tls_ports: &[u16]) -> ! {
+pub fn run(
+    data_plane: DataPlane,
+    bind_ip: &str,
+    http_ports: &[u16],
+    tls_ports: &[u16],
+    timeouts: UpstreamTimeouts,
+) -> ! {
     // Pass None so Pingora doesn't parse our process argv as its own options.
     let mut server = Server::new(None).expect("failed to create pingora server");
     server.bootstrap();
@@ -1524,7 +1590,7 @@ pub fn run(data_plane: DataPlane, bind_ip: &str, http_ports: &[u16], tls_ports: 
     let http_app = GatewayHttpApp {
         proxy: Arc::new(http_proxy(
             &server.configuration,
-            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec()),
+            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec(), timeouts),
         )),
     };
     let mut http_service = pingora_core::services::listening::Service::new("http-proxy".to_string(), http_app);
@@ -1541,13 +1607,14 @@ pub fn run(data_plane: DataPlane, bind_ip: &str, http_ports: &[u16], tls_ports: 
         // Arc<HttpProxy>, not a Service, so we use the http_proxy() factory.
         let proxy = Arc::new(http_proxy(
             &server.configuration,
-            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec()),
+            GatewayProxy::new(data_plane.clone(), tls_ports.to_vec(), timeouts),
         ));
         let app = GatewayTlsApp {
             data_plane: data_plane.clone(),
             proxy,
             acceptor,
             tls_callbacks,
+            connect_timeout: timeouts.connect,
         };
         let mut tls_service = pingora_core::services::listening::Service::new("tls-sni-dispatch".to_string(), app);
         for port in tls_ports {
@@ -1567,6 +1634,12 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
+
+    /// Upstream timeouts for the tests whose requests never reach a backend.
+    const NO_TIMEOUTS: UpstreamTimeouts = UpstreamTimeouts {
+        connect: None,
+        response: None,
+    };
 
     // copy_bidirectional_idle relays bytes both ways and ends cleanly on EOF.
     #[tokio::test]
@@ -1648,7 +1721,7 @@ mod tests {
         use pingora_core::apps::HttpPersistentSettings;
         use pingora_core::protocols::http::ServerSession;
 
-        let proxy = GatewayProxy::new(DataPlane::new(), vec![]);
+        let proxy = GatewayProxy::new(DataPlane::new(), vec![], NO_TIMEOUTS);
         let idle = Some(H1_IDLE_TIMEOUT.as_secs());
         for (head, want) in [
             ("GET / HTTP/1.1\r\nHost: a\r\n\r\n", idle),
@@ -2120,10 +2193,14 @@ mod tests {
         let (acceptor, tls_callbacks) = build_tls_acceptor(data_plane.clone());
         let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
         GatewayTlsApp {
-            proxy: Arc::new(http_proxy(&conf, GatewayProxy::new(data_plane.clone(), vec![]))),
+            proxy: Arc::new(http_proxy(
+                &conf,
+                GatewayProxy::new(data_plane.clone(), vec![], NO_TIMEOUTS),
+            )),
             data_plane,
             acceptor,
             tls_callbacks,
+            connect_timeout: None,
         }
     }
 
@@ -2190,6 +2267,181 @@ mod tests {
         );
         assert!(accept.await.is_some());
         client.await.unwrap().expect("client handshake");
+    }
+
+    /// A backend that accepts connections and never sends a byte (so as a TLS backend
+    /// it never answers the ClientHello). The receiver yields once for each
+    /// connection torii closes.
+    async fn silent_backend() -> (Endpoint, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (closed_tx, closed) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((mut conn, _)) = listener.accept().await {
+                let closed_tx = closed_tx.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    while conn.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+                    let _ = closed_tx.send(());
+                });
+            }
+        });
+        let ep = Endpoint {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: BackendTls::Plaintext,
+        };
+        (ep, closed)
+    }
+
+    /// Send `GET /` over HTTP/1.1 through a proxy whose one route forwards to
+    /// `backend`, with the rule timeout `rule_timeout`. Returns the response's status
+    /// line, or None if there is none after `wait`.
+    async fn proxy_get(
+        timeouts: UpstreamTimeouts,
+        backend: Endpoint,
+        rule_timeout: Option<Duration>,
+        wait: Duration,
+    ) -> Option<String> {
+        use pingora_core::apps::HttpServerApp;
+        use pingora_core::protocols::http::ServerSession;
+        use tokio::io::AsyncBufReadExt;
+
+        use crate::route_table::{Backend, RouteEntry, RouteMatch, RouteTable};
+
+        // A connection over a duplex has no local address, so its listener port is 0.
+        let mut routes = RouteTable::default();
+        routes.entries.push(RouteEntry {
+            listener_port: 0,
+            listener_hostname: None,
+            hostnames: vec![],
+            r#match: RouteMatch::default(),
+            backends: vec![Backend {
+                weight: 1,
+                endpoints: vec![backend],
+                filters: Filters::default(),
+            }],
+            filters: Filters::default(),
+            request_timeout: rule_timeout,
+            route_creation: 0,
+            route_key: "ns/route".into(),
+            rule_order: 0,
+            match_order: 0,
+        });
+        routes.sort();
+        let data_plane = DataPlane::new();
+        data_plane.store(crate::snapshot::Snapshot {
+            routes,
+            ..Default::default()
+        });
+        let conf = Arc::new(pingora_core::server::configuration::ServerConf::default());
+        let proxy = Arc::new(http_proxy(&conf, GatewayProxy::new(data_plane, vec![], timeouts)));
+
+        let (client, server_io) = tokio::io::duplex(64 * 1024);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
+        let serving = tokio::spawn(async move {
+            proxy
+                .process_new_http(ServerSession::new_http1(Box::new(server_io)), &shutdown)
+                .await;
+        });
+        let mut client = tokio::io::BufReader::new(client);
+        client.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
+        let mut status = String::new();
+        let read = tokio::time::timeout(wait, client.read_line(&mut status)).await;
+        serving.abort();
+        read.ok()?.ok().filter(|&n| n > 0)?;
+        Some(status.trim_end().to_string())
+    }
+
+    // A backend that accepts the connection and never answers gets the request 504'd
+    // at the response timeout, and its connection closed. Without a default, a
+    // request to it waited as long as its client did, which can be forever. A rule's
+    // `timeouts` replace the default, and "0s" there disables it.
+    #[tokio::test]
+    async fn silent_backend_times_out() {
+        let (backend, mut closed) = silent_backend().await;
+        let default = Duration::from_millis(200);
+        let timeouts = UpstreamTimeouts {
+            connect: Some(Duration::from_secs(5)),
+            response: Some(default),
+        };
+        for (rule_timeout, deadline) in [
+            (None, default),
+            (Some(Duration::from_millis(500)), Duration::from_millis(500)),
+        ] {
+            let start = tokio::time::Instant::now();
+            let status = proxy_get(timeouts, backend.clone(), rule_timeout, Duration::from_secs(5)).await;
+            assert_eq!(
+                status.as_deref(),
+                Some("HTTP/1.1 504 Gateway Timeout"),
+                "rule timeout {rule_timeout:?}"
+            );
+            assert!(start.elapsed() >= deadline, "timed out early: {:?}", start.elapsed());
+            let closed = tokio::time::timeout(Duration::from_secs(5), closed.recv()).await;
+            assert!(closed.is_ok(), "the backend connection must be closed");
+        }
+
+        let status = proxy_get(timeouts, backend, Some(Duration::ZERO), default * 3).await;
+        assert_eq!(status, None, "\"0s\" must disable the response timeout");
+    }
+
+    // The connect deadline covers a BackendTLSPolicy backend's TLS handshake, which
+    // had no limit at all: each request to an endpoint that never answers the
+    // ClientHello held its task, socket and TLS state forever, even after its client
+    // left. A rule's longer timeout, or "0s", must not lengthen it.
+    #[tokio::test]
+    async fn stalled_backend_tls_handshake_times_out() {
+        let (mut backend, mut closed) = silent_backend().await;
+        backend.tls = BackendTls::ReEncrypt(crate::route_table::UpstreamTls {
+            hostname: "backend.example".into(),
+            ca_pem: vec![],
+        });
+        let deadline = Duration::from_millis(200);
+        let timeouts = UpstreamTimeouts {
+            connect: Some(deadline),
+            response: Some(Duration::from_secs(60)),
+        };
+        for rule_timeout in [None, Some(Duration::from_secs(3600)), Some(Duration::ZERO)] {
+            let start = tokio::time::Instant::now();
+            let status = proxy_get(timeouts, backend.clone(), rule_timeout, Duration::from_secs(5)).await;
+            assert_eq!(
+                status.as_deref(),
+                Some("HTTP/1.1 504 Gateway Timeout"),
+                "rule timeout {rule_timeout:?}"
+            );
+            assert!(start.elapsed() >= deadline, "timed out early: {:?}", start.elapsed());
+            let closed = tokio::time::timeout(Duration::from_secs(5), closed.recv()).await;
+            assert!(closed.is_ok(), "the backend connection must be closed");
+        }
+    }
+
+    // A TLSRoute backend that drops SYNs must not hold the client's connection for the
+    // kernel's ~130s of SYN retries. A listener whose accept queue is full drops them.
+    #[tokio::test]
+    async fn tlsroute_backend_connect_times_out() {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let listener = socket.listen(0).unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend = Endpoint {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: BackendTls::Plaintext,
+        };
+
+        // With a backlog of 0, the first connection fills the queue.
+        let first = connect_backend(&backend, Some(Duration::from_secs(5)))
+            .await
+            .expect("the first connection must be queued");
+        assert!(first.nodelay().unwrap());
+
+        let deadline = Duration::from_millis(200);
+        let start = tokio::time::Instant::now();
+        let second = tokio::time::timeout(Duration::from_secs(5), connect_backend(&backend, Some(deadline)))
+            .await
+            .expect("the connect must give up");
+        assert!(second.is_none());
+        assert!(start.elapsed() >= deadline, "gave up early: {:?}", start.elapsed());
     }
 
     // split_host_port matches Go's net.SplitHostPort: it unbrackets IPv6 literals

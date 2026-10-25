@@ -149,8 +149,9 @@ pub struct RouteEntry {
     pub backends: Vec<Backend>,
     /// Filters applied to matching requests/responses.
     pub filters: Filters,
-    /// Request timeout from the rule's `timeouts.request` (None = no timeout,
-    /// also used for an explicit "0s" which disables it).
+    /// Request timeout from the rule's `timeouts` (the smaller non-zero one of
+    /// `request` and `backendRequest`). None = the rule sets none, so the data
+    /// plane's default applies; zero = "0s", which disables it.
     pub request_timeout: Option<std::time::Duration>,
 
     // --- precedence tiebreakers (Gateway API spec order) ---

@@ -1045,23 +1045,10 @@ impl ReconcileCtx {
                     }
                 }
 
-                // Parse this rule's filters and timeouts once. Honor both
-                // `request` (overall) and `backendRequest` (per-attempt); with no
-                // retries they coincide, so use the smaller non-zero value. "0s"
-                // disables that timeout.
+                // Parse this rule's filters and timeouts once.
                 let rule_filters = rule.filters.as_deref().unwrap_or_default();
                 let filters = filters_from(rule_filters);
-                let request_timeout = rule.timeouts.as_ref().and_then(|t| {
-                    let parse = |s: &Option<String>| {
-                        s.as_ref()
-                            .and_then(|v| parse_gep2257_duration(v))
-                            .filter(|d| !d.is_zero())
-                    };
-                    [parse(&t.request), parse(&t.backend_request)]
-                        .into_iter()
-                        .flatten()
-                        .min()
-                });
+                let request_timeout = rule.timeouts.as_ref().and_then(request_timeout_from);
 
                 // Each `match` in the rule is an independent OR alternative. A rule
                 // with no matches defaults to a single match-all (PathPrefix "/").
@@ -2164,7 +2151,7 @@ fn cert_key_is_valid(ck: &CertKey) -> bool {
 /// `2m30s`, `500ms`, `0s`). Returns `None` on any parse failure. A previous version
 /// matched the whole tail as a single unit, so a compound value like `1h30m` failed
 /// and silently disabled the configured timeout.
-fn parse_gep2257_duration(s: &str) -> Option<Duration> {
+pub fn parse_gep2257_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     // Tolerate a bare "0" even though GEP-2257 requires a unit (e.g. "0s").
     if s == "0" {
@@ -2218,6 +2205,22 @@ fn path_rewrite(is_full_path: bool, replace_full: &Option<String>, replace_prefi
     } else {
         PathRewrite::ReplacePrefixMatch(replace_prefix.clone().unwrap_or_default())
     }
+}
+
+/// A rule's request timeout for the data plane (`RouteEntry::request_timeout`).
+/// Honor both `request` (overall) and `backendRequest` (per-attempt); with no
+/// retries they coincide, so use the smaller non-zero value. "0s" disables that
+/// timeout, and when no other is set the result is zero, so that the data plane's
+/// default does not apply either.
+fn request_timeout_from(
+    timeouts: &gateway_api::apis::standard::httproutes::HttpRouteRulesTimeouts,
+) -> Option<Duration> {
+    [&timeouts.request, &timeouts.backend_request]
+        .into_iter()
+        .flatten()
+        .filter_map(|v| parse_gep2257_duration(v))
+        // Zero sorts after every non-zero value.
+        .min_by_key(|d| (d.is_zero(), *d))
 }
 
 /// Parse a rule's filters into our pre-digested [`Filters`] form.
@@ -2450,6 +2453,26 @@ mod tests {
         assert_eq!(parse_gep2257_duration("1x"), None); // unknown unit
         assert_eq!(parse_gep2257_duration("1us"), None); // not a GEP-2257 unit
         assert_eq!(parse_gep2257_duration("1.5s"), None); // GEP-2257 is integer-only
+    }
+
+    // The smaller non-zero timeout wins. "0s" alone must stay distinct from no
+    // timeouts at all: it disables the data plane's default response timeout.
+    #[test]
+    fn rule_request_timeout() {
+        use gateway_api::apis::standard::httproutes::HttpRouteRulesTimeouts;
+        let timeout = |request: Option<&str>, backend_request: Option<&str>| {
+            request_timeout_from(&HttpRouteRulesTimeouts {
+                request: request.map(Into::into),
+                backend_request: backend_request.map(Into::into),
+            })
+        };
+        assert_eq!(timeout(None, None), None);
+        assert_eq!(timeout(Some("10s"), None), Some(Duration::from_secs(10)));
+        assert_eq!(timeout(Some("10s"), Some("2s")), Some(Duration::from_secs(2)));
+        assert_eq!(timeout(Some("0s"), Some("2s")), Some(Duration::from_secs(2)));
+        assert_eq!(timeout(Some("1m"), Some("0s")), Some(Duration::from_secs(60)));
+        assert_eq!(timeout(Some("0s"), None), Some(Duration::ZERO));
+        assert_eq!(timeout(None, Some("0s")), Some(Duration::ZERO));
     }
 
     fn lbls(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {

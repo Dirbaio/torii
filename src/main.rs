@@ -3,6 +3,8 @@
 //! The single entrypoint runs both planes: the kube controller (control plane) on
 //! the tokio runtime, and the Pingora proxy (data plane) on a dedicated thread.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use kube::Client;
@@ -66,6 +68,21 @@ struct Cli {
     #[arg(long, env = "TORII_ADVERTISE", default_value = "127.0.0.1")]
     advertise: String,
 
+    /// How long to wait for a connection to a backend, TLS handshake included,
+    /// before answering 504 (a TLSRoute connection is closed instead). An HTTPRoute
+    /// rule's shorter `timeouts` shorten it. A duration like `10s` or `500ms`; `0s`
+    /// disables it.
+    #[arg(long, env = "TORII_UPSTREAM_CONNECT_TIMEOUT", default_value = "10s", value_parser = parse_duration)]
+    upstream_connect_timeout: Duration,
+
+    /// How long a backend may go without sending or accepting data during a request,
+    /// the wait for its response included, before torii answers 504 (or cuts the
+    /// response short). So a WebSocket or long poll whose backend stays silent this
+    /// long is closed. An HTTPRoute rule's `timeouts` replace it, and `0s` there
+    /// disables it. A duration like `60s` or `5m`; `0s` disables it.
+    #[arg(long, env = "TORII_UPSTREAM_TIMEOUT", default_value = "60s", value_parser = parse_duration)]
+    upstream_timeout: Duration,
+
     /// Enable automatic TLS certificate issuance via ACME (TLS-ALPN-01).
     /// OFF by default; even when on, a Gateway must opt in by carrying the
     /// `torii.dirba.io/acme` annotation. Requires a TLS listener port.
@@ -126,9 +143,14 @@ async fn run(args: Cli) -> Result<()> {
     let bind_ip = args.bind_ip.clone();
     let http_ports = args.http_ports.clone();
     let tls_ports = args.tls_ports.clone();
+    let enabled = |d: Duration| Some(d).filter(|d| !d.is_zero());
+    let timeouts = dataplane::UpstreamTimeouts {
+        connect: enabled(args.upstream_connect_timeout),
+        response: enabled(args.upstream_timeout),
+    };
     std::thread::Builder::new()
         .name("dataplane".into())
-        .spawn(move || dataplane::run(dp, &bind_ip, &http_ports, &tls_ports))
+        .spawn(move || dataplane::run(dp, &bind_ip, &http_ports, &tls_ports, timeouts))
         .context("failed to spawn data-plane thread")?;
 
     // ACME (optional): only spawned with --acme. When off, `acme_feed` is None and the
@@ -164,6 +186,12 @@ async fn run(args: Cli) -> Result<()> {
         acme_default_email: args.acme_email,
     };
     controller::run(client, data_plane, config).await
+}
+
+/// Parse a duration flag, in the GEP-2257 format of HTTPRoute timeouts.
+fn parse_duration(s: &str) -> Result<Duration, String> {
+    controller::parse_gep2257_duration(s)
+        .ok_or_else(|| format!("invalid duration {s:?} (expected e.g. 10s, 1m30s, 500ms)"))
 }
 
 /// A stable-per-process identity for ACME Lease leader election. Prefer the pod
