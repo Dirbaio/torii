@@ -201,6 +201,14 @@ spec:
             limits: { memory: "512Mi" }
           # Liveness/readiness: torii has no HTTP health endpoint, so probe the
           # data-plane TCP port — if the proxy thread is up, the port accepts.
+          # The data plane binds its ports only after the first complete
+          # snapshot (every watched list loaded), which takes longer on large
+          # clusters: the startup probe gives it up to 5 minutes before the
+          # liveness probe starts counting.
+          startupProbe:
+            tcpSocket: { port: http }
+            periodSeconds: 2
+            failureThreshold: 150
           livenessProbe:
             tcpSocket: { port: http }
             initialDelaySeconds: 5

@@ -34,10 +34,22 @@ pub type ChallengeStore = HashMap<String, CertKey>;
 
 /// Lock-free, atomically-swappable handles the data plane reads. Cheap to clone
 /// (Arc-backed); shared between the control plane, the ACME task, and the proxy.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct DataPlane {
     snapshot: Arc<ArcSwap<Snapshot>>,
     challenges: Arc<ArcSwap<ChallengeStore>>,
+    /// Whether the control plane has published a snapshot yet.
+    published: Arc<tokio::sync::watch::Sender<bool>>,
+}
+
+impl Default for DataPlane {
+    fn default() -> Self {
+        Self {
+            snapshot: Default::default(),
+            challenges: Default::default(),
+            published: Arc::new(tokio::sync::watch::Sender::new(false)),
+        }
+    }
 }
 
 impl DataPlane {
@@ -48,6 +60,12 @@ impl DataPlane {
     /// Publish a new routing/cert snapshot. Readers see it on their next `load`.
     pub fn store(&self, snapshot: Snapshot) {
         self.snapshot.store(Arc::new(snapshot));
+        self.published.send_if_modified(|p| !std::mem::replace(p, true));
+    }
+
+    /// Wait until the first snapshot is published. Runs on any executor.
+    pub async fn wait_published(&self) {
+        let _ = self.published.subscribe().wait_for(|&p| p).await;
     }
 
     /// Load the current snapshot (cheap, lock-free).

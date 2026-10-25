@@ -219,6 +219,12 @@ async fn run(args: Cli) -> Result<()> {
     std::thread::Builder::new()
         .name("dataplane".into())
         .spawn(move || {
+            // Bind the ports only once the controller has published its first
+            // snapshot, built from complete caches. Before that the proxy would answer
+            // 404 to every host and serve the fallback certificate, while a TCP
+            // readiness probe already passed.
+            futures::executor::block_on(dp.wait_published());
+            tracing::info!("first snapshot published; starting the data plane");
             dataplane::run(
                 dp,
                 &bind_ip,

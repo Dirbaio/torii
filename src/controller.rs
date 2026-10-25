@@ -142,12 +142,18 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
     // expansion per resource keeps the wiring in one place. Gateway API kinds
     // (`per_object`) are decoded one object at a time, see [`decoded_watcher`].
     // The `ready` future waits for every store's first list before the initial
-    // reconcile.
+    // reconcile. A kind whose list the API server refuses with 404 or 403 (a CRD
+    // that is not installed, like TLSRoute or BackendTLSPolicy on an older Gateway
+    // API install, or a missing RBAC rule) counts as ready and empty, so it can't
+    // hold startup forever; its watcher keeps retrying and fills the store if the
+    // kind shows up later.
     let mut ready: Vec<futures::future::BoxFuture<'static, ()>> = Vec::new();
     macro_rules! watch {
         (@reflect $ty:ty, $kind:literal, $events:expr) => {{
             let (store, writer) = reflector::store::<$ty>();
             let tx = tx.clone();
+            let absent = Arc::new(tokio::sync::Notify::new());
+            let absent_tx = absent.clone();
             let stream = $events.reflect(writer).default_backoff().touched_objects();
             tokio::spawn(async move {
                 futures::pin_mut!(stream);
@@ -155,12 +161,22 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
                     match ev {
                         // Non-blocking poke; a pending reconcile already covers us.
                         Ok(_) => { let _ = tx.try_send(()); }
-                        Err(e) => tracing::warn!(kind = $kind, error = %e, "watch error"),
+                        Err(e) => {
+                            if list_refused(&e) {
+                                absent_tx.notify_one();
+                            }
+                            tracing::warn!(kind = $kind, error = %e, "watch error")
+                        }
                     }
                 }
             });
             let r = store.clone();
-            ready.push(Box::pin(async move { let _ = r.wait_until_ready().await; }));
+            ready.push(Box::pin(async move {
+                tokio::select! {
+                    _ = r.wait_until_ready() => {}
+                    _ = absent.notified() => tracing::warn!(kind = $kind, "cannot list; starting without it"),
+                }
+            }));
             store
         }};
         ($ty:ty, $kind:literal, per_object) => {
@@ -185,10 +201,13 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
         backend_tls_policies: watch!(BackendTLSPolicy, "BackendTLSPolicy", per_object),
     });
 
-    // Wait for all caches to populate before the first reconcile.
-    tokio::spawn(async move {
-        futures::future::join_all(ready).await;
-    });
+    // Wait for all caches to populate before the first reconcile. A store fills only
+    // when its whole list is in, so a pass before then sees that kind as empty: it
+    // would publish a snapshot without its objects (no certificates, no endpoints)
+    // and write status as if they did not exist, which the next pass flips back.
+    // The data plane binds its ports only after this first snapshot is published.
+    futures::future::join_all(ready).await;
+    let _ = tx.try_send(());
 
     tracing::info!(controller = CONTROLLER_NAME, "control plane started");
 
@@ -221,6 +240,12 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
             tracing::error!(error = %e, "reconcile failed");
         }
     }
+}
+
+/// Whether a watcher error is the API server refusing the initial list for good:
+/// the kind does not exist (404) or torii may not list it (403).
+fn list_refused(e: &watcher::Error) -> bool {
+    matches!(e, watcher::Error::InitialListFailed(kube::Error::Api(ae)) if ae.code == 404 || ae.code == 403)
 }
 
 /// Watch every object of a Gateway API kind, decoding each one on its own.
