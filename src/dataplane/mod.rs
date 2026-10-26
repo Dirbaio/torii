@@ -351,13 +351,15 @@ async fn accept_loop(ctx: Arc<Ctx>, listener: TcpListener, tls: bool, mut stop: 
         };
         let ctx = ctx.clone();
         tokio::spawn(async move {
-            let _permit = permit;
             let _live = ctx.live.track();
             if tls {
                 serve_tls(&ctx, tcp, &info).await;
             } else {
                 serve_h1::serve(&ctx, Stream::Plain(tcp), &info).await;
             }
+            // Held to the end. (Moved into a local instead, it would take room in
+            // the task twice, and the task's size is most of an idle connection.)
+            drop(permit);
         });
     }
 }
