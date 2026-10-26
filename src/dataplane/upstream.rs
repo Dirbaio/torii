@@ -25,9 +25,14 @@ use crate::route_table::{BackendTls, Endpoint, UpstreamTls};
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Most requests one backend connection serves (nginx's `keepalive_requests`).
 const MAX_REQUESTS: u32 = 1000;
-/// Most idle connections kept per backend endpoint, and in all.
-const MAX_IDLE_PER_KEY: usize = 32;
-const MAX_IDLE: usize = 512;
+/// Most idle connections kept per backend endpoint, and in all. Each costs a socket
+/// and ~1-2 KB. Room for a backend's usual concurrency matters more than the bytes:
+/// a connection the pool has no room for is closed, and its port then sits in
+/// TIME_WAIT for a minute, so a pool smaller than the requests in flight churns
+/// through the ephemeral ports (32 per endpoint ran them out within seconds at 64
+/// concurrent requests, and requests got 502s).
+const MAX_IDLE_PER_KEY: usize = 256;
+const MAX_IDLE: usize = 1024;
 
 /// Which pooled connections are interchangeable.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
