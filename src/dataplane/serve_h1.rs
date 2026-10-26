@@ -6,11 +6,14 @@
 //! head, the plan, the exchange's buffers and clocks) lives in a boxed future that
 //! exists only while a request is in flight.
 
+use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll;
 
 use bytes::{Bytes, BytesMut};
 use tokio::io::AsyncWriteExt;
+use tokio::sync::watch;
+use tokio::time::{Instant, Sleep};
 
 use super::h1::{
     self, Decoder, Encoder, HeadError, HeadEvent, HeadReader, MAX_REQUEST_HEAD, MAX_RESPONSE_HEAD, RequestFraming,
@@ -34,10 +37,16 @@ const MAX_REQUESTS: u32 = 1000;
 /// a request ends it.
 pub async fn serve(ctx: &Arc<Ctx>, mut stream: Stream, info: &ConnInfo) {
     let mut buf = BytesMut::new();
+    // Both kept for the life of the connection rather than made for each request:
+    // a running timer whose deadline only moves later is restarted without taking
+    // tokio's timer lock (a new one took it twice).
+    let idle = tokio::time::sleep(H1_IDLE_TIMEOUT);
+    tokio::pin!(idle);
+    let mut draining = ctx.shutdown.subscribe();
     let mut first = true;
     let mut served = 0;
     loop {
-        let head = match read_request(ctx, &mut stream, &mut buf, first).await {
+        let head = match read_request(&mut stream, &mut buf, idle.as_mut(), &mut draining, first).await {
             Ok(Some(head)) => head,
             Ok(None) => break,
             Err(status) => {
@@ -66,18 +75,20 @@ pub async fn serve(ctx: &Arc<Ctx>, mut stream: Stream, info: &ConnInfo) {
 /// While torii drains for shutdown, a keep-alive connection waiting for its next
 /// request is closed; a new connection still gets its first request served.
 async fn read_request(
-    ctx: &Ctx,
     stream: &mut Stream,
     buf: &mut BytesMut,
+    mut idle: Pin<&mut Sleep>,
+    draining: &mut watch::Receiver<bool>,
     first: bool,
 ) -> Result<Option<RequestHead>, u16> {
     if buf.is_empty() {
-        let mut draining = ctx.shutdown.subscribe();
+        idle.as_mut().reset(Instant::now() + H1_IDLE_TIMEOUT);
         tokio::select! {
-            r = tokio::time::timeout(H1_IDLE_TIMEOUT, read_lazy(stream, buf, FIRST_READ)) => match r {
-                Ok(Ok(n)) if n > 0 => {}
+            r = read_lazy(stream, buf, FIRST_READ) => match r {
+                Ok(n) if n > 0 => {}
                 _ => return Ok(None),
             },
+            () = idle => return Ok(None),
             _ = draining.wait_for(|&d| d), if !first => return Ok(None),
         }
     }

@@ -669,6 +669,49 @@ async fn an_idle_connection_is_closed() {
     assert!(start.elapsed() >= H1_IDLE_TIMEOUT);
 }
 
+#[tokio::test(start_paused = true)]
+async fn the_idle_clock_restarts_with_each_request() {
+    let ctx = ctx_with(RouteTable::default(), TIMEOUTS, NO_LIMITS);
+    let mut client = serve_duplex(&ctx);
+    let start = tokio::time::Instant::now();
+    // Each request comes within the idle timeout of the one before, not of the
+    // first: all are served (a 404, keeping the connection).
+    let gap = H1_IDLE_TIMEOUT - Duration::from_secs(10);
+    for _ in 0..3 {
+        client.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
+        let resp = read_response(&mut client, &mut BytesMut::new(), "GET").await.unwrap();
+        assert_eq!(resp.status, 404);
+        tokio::time::sleep(gap).await;
+    }
+    let mut b = [0u8; 1];
+    assert_eq!(client.read(&mut b).await.unwrap(), 0);
+    assert!(start.elapsed() >= 2 * gap + H1_IDLE_TIMEOUT);
+}
+
+#[tokio::test(start_paused = true)]
+async fn an_idle_h2_connection_is_closed_after_its_last_stream() {
+    let ctx = ctx_with(RouteTable::default(), TIMEOUTS, NO_LIMITS);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let info = ConnInfo {
+            port: 0,
+            peer: None,
+            tls: true,
+        };
+        serve_h2::serve(&ctx, io::Stream::Duplex(server), &info).await;
+    });
+    let (mut client, conn) = h2::client::handshake(client).await.unwrap();
+    let conn = tokio::spawn(conn);
+    let start = tokio::time::Instant::now();
+    let gap = H2_IDLE_TIMEOUT - Duration::from_secs(10);
+    tokio::time::sleep(gap).await;
+    let req = http::Request::builder().uri("https://a/").body(()).unwrap();
+    let resp = client.send_request(req, true).unwrap().0.await.unwrap();
+    assert_eq!(resp.status(), 404);
+    let _ = conn.await;
+    assert!(start.elapsed() >= gap + H2_IDLE_TIMEOUT);
+}
+
 #[tokio::test]
 async fn a_client_that_stops_reading_is_cut_off() {
     tokio::time::pause();

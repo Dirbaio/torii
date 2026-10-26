@@ -11,6 +11,7 @@ use bytes::{Bytes, BytesMut};
 use h2::server::SendResponse;
 use h2::{Reason, RecvStream};
 use http::{HeaderName, HeaderValue, Request, Response};
+use tokio::time::Instant;
 
 use super::h1::{self, Decoder, Encoder, HeadEvent, HeadReader, MAX_RESPONSE_HEAD, RequestHead, ResponseFraming};
 use super::io::{Outgoing, Stream};
@@ -56,37 +57,45 @@ pub async fn serve(ctx: &Arc<Ctx>, stream: Stream, info: &ConnInfo) {
     let mut tasks = tokio::task::JoinSet::new();
     // Streams refused since a task last ended.
     let mut refused = 0;
+    // Both made once rather than on each turn of the loop: a running timer whose
+    // deadline only moves later is restarted without taking tokio's timer lock.
     let mut shutdown = ctx.shutdown.subscribe();
+    let shutdown = shutdown.wait_for(|&d| d);
+    tokio::pin!(shutdown);
+    let idle = tokio::time::sleep(H2_IDLE_TIMEOUT);
+    tokio::pin!(idle);
     let mut draining = false;
     loop {
+        idle.as_mut().reset(Instant::now() + H2_IDLE_TIMEOUT);
         let next = tokio::select! {
             Some(_) = tasks.join_next() => {
                 refused = 0;
                 continue;
             }
-            _ = shutdown.wait_for(|&d| d), if !draining => {
+            _ = &mut shutdown, if !draining => {
                 draining = true;
                 conn.graceful_shutdown();
                 continue;
             }
-            next = tokio::time::timeout(H2_IDLE_TIMEOUT, conn.accept()) => next,
+            () = idle.as_mut() => None,
+            next = conn.accept() => Some(next),
         };
         let (req, mut respond) = match next {
             // Idle window elapsed. Close only if nothing is in flight.
-            Err(_) if tasks.is_empty() => {
+            None if tasks.is_empty() => {
                 tracing::debug!("h2 connection idle; closing");
                 conn.graceful_shutdown();
                 let closed = std::future::poll_fn(|cx| conn.poll_closed(cx));
                 let _ = tokio::time::timeout(H2_GOAWAY_FLUSH_TIMEOUT, closed).await;
                 break;
             }
-            Err(_) => continue,
-            Ok(None) => break,
-            Ok(Some(Err(e))) => {
+            None => continue,
+            Some(None) => break,
+            Some(Some(Err(e))) => {
                 tracing::debug!(error = %e, "h2 connection failed");
                 break;
             }
-            Ok(Some(Ok(stream))) => stream,
+            Some(Some(Ok(stream))) => stream,
         };
         // Too many fields to forward: answer as h2 answers an over-size head.
         if req.headers().len() > H2_MAX_HEADER_FIELDS {
