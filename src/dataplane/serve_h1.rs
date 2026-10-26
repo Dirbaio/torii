@@ -191,9 +191,20 @@ async fn exchange(
         RequestFraming::Length(n) => (UpstreamBody::Length(n), Encoder::Raw),
         RequestFraming::Chunked => (UpstreamBody::Chunked, Encoder::Chunked),
     };
-    let up_head = Bytes::from(proxy::upstream_head(head, &plan, up_body, upgrade.as_deref()));
+    let up_head = proxy::upstream_head(head, &plan, up_body, upgrade.as_deref());
     let mut timers = Timers::new(plan.timeout, ctx.client_stall);
     let mut pump = ReqPump::new(ReqSource::H1(Decoder::for_request(framing)), encoder);
+    // A request with a body goes out with the start of its body in one write (it
+    // is never retried). One without is written on its own, so that a retry on a
+    // new connection can write it again.
+    let up_head = if framing == RequestFraming::None {
+        Bytes::from(up_head)
+    } else {
+        if let Err(e) = pump.start_with_head(up_head, buf) {
+            return fail(ctx, stream, e, &pump, close).await;
+        }
+        Bytes::new()
+    };
     // torii answers `Expect: 100-continue` itself, as it starts reading the body
     // (the Expect field is not forwarded).
     if expect_continue
@@ -333,9 +344,12 @@ async fn exchange(
     drop(resp);
 
     // Phase B: the response body, while any rest of the request body goes on.
+    let mut decoder = Decoder::for_response(resp_framing);
     let mut sink = H1Sink::new(down_encoder);
-    sink.start_raw(Bytes::from(out));
-    let mut resp_pump = RespPump::new(Decoder::for_response(resp_framing), RespSink::H1(sink));
+    if let Err(e) = sink.start_with_head(out, &mut decoder, &mut up.buf) {
+        return fail(ctx, stream, RelayError::BadResponse(e.0), &pump, close).await;
+    }
+    let mut resp_pump = RespPump::new(decoder, RespSink::H1(sink));
     let done = std::future::poll_fn(|cx| {
         let mut down = Down::H1 {
             io: &mut *stream,
@@ -378,7 +392,7 @@ async fn response_head(
     timers: &mut Timers,
     client: &mut ClientSide,
 ) -> Result<h1::ResponseHead, RelayError> {
-    let mut head_out = Some(super::io::Outgoing::new(&[], up_head.clone(), b""));
+    let mut head_out = (!up_head.is_empty()).then(|| super::io::Outgoing::new(&[], up_head.clone(), b""));
     let mut interim = 0;
     loop {
         let mut reader = HeadReader::new(4096, MAX_RESPONSE_HEAD);

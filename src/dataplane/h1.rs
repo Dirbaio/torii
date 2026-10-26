@@ -681,7 +681,29 @@ impl Encoder {
     pub fn finish(self) -> Option<Outgoing> {
         match self {
             Encoder::Raw => None,
-            Encoder::Chunked => Some(Outgoing::new(b"0\r\n\r\n", Bytes::new(), b"")),
+            Encoder::Chunked => Some(Outgoing::new(self.end(), Bytes::new(), b"")),
+        }
+    }
+
+    /// Append one chunk of body data, framed, to `out` (a copy, for a write that
+    /// carries a head too).
+    pub fn append(self, out: &mut Vec<u8>, data: &[u8]) {
+        if self == Encoder::Chunked {
+            let mut line = [0u8; 20];
+            let len = hex_line(data.len(), &mut line);
+            out.extend_from_slice(&line[..len]);
+            out.extend_from_slice(data);
+            out.extend_from_slice(b"\r\n");
+        } else {
+            out.extend_from_slice(data);
+        }
+    }
+
+    /// The bytes that end the body: none, or the last chunk.
+    pub fn end(self) -> &'static [u8] {
+        match self {
+            Encoder::Raw => b"",
+            Encoder::Chunked => b"0\r\n\r\n",
         }
     }
 }

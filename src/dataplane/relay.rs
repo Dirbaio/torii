@@ -22,7 +22,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::time::Instant;
 
 use super::MIN_BODY_PROGRESS;
-use super::h1::{Decoder, Encoder};
+use super::h1::{BodyError, Decoder, Encoder};
 use super::io::{Outgoing, Stream, Timer, poll_read_lazy};
 
 /// Most body bytes read or sent at a time.
@@ -256,9 +256,25 @@ impl H1Sink {
         self.out = Some(self.encoder.frame(data));
     }
 
-    /// Queue bytes to write as they are, outside the body's framing (a head).
-    pub fn start_raw(&mut self, data: Bytes) {
-        self.out = Some(Outgoing::new(&[], data, b""));
+    /// Queue `head` to be written together with the start of the body: what of
+    /// it `buf` already holds (up to a chunk), and the end of the body if that is
+    /// all of it. A small message is then one write and one TLS record, as nginx
+    /// sends it (it holds back output under `postpone_output` to merge it).
+    pub fn start_with_head(
+        &mut self,
+        mut head: Vec<u8>,
+        decoder: &mut Decoder,
+        buf: &mut BytesMut,
+    ) -> Result<(), BodyError> {
+        if let Some(data) = decoder.decode_gathered(buf, CHUNK)? {
+            self.encoder.append(&mut head, &data);
+        }
+        if decoder.is_done() {
+            head.extend_from_slice(self.encoder.end());
+            self.finished = true;
+        }
+        self.out = Some(Outgoing::new(&[], Bytes::from(head), b""));
+        Ok(())
     }
 
     /// Queue the end of the body (once).
@@ -361,6 +377,18 @@ impl ReqPump {
     /// The whole body was sent.
     pub fn is_done(&self) -> bool {
         self.done
+    }
+
+    /// Send `head` first, with the start of the body that `buf` already holds (see
+    /// [`H1Sink::start_with_head`]). For an HTTP/1 client's body only.
+    pub fn start_with_head(&mut self, head: Vec<u8>, buf: &mut BytesMut) -> Result<(), RelayError> {
+        let ReqSource::H1(decoder) = &mut self.source else {
+            unreachable!("start_with_head on an HTTP/2 body");
+        };
+        self.sink.start_with_head(head, decoder, buf).map_err(|e| {
+            tracing::debug!(error = e.0, "malformed request body");
+            RelayError::BadRequestBody
+        })
     }
 
     /// Stop sending (a write to the backend failed after its response began).
@@ -713,5 +741,39 @@ impl Half {
             }
         }
         Ok(progressed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dataplane::h1::{RequestFraming, ResponseFraming};
+
+    fn written(sink: &mut H1Sink) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        assert!(sink.poll_out(&mut cx, &mut out).is_ready());
+        out
+    }
+
+    #[test]
+    fn a_small_message_is_one_write() {
+        // The whole body is buffered: head, body and end in one write.
+        let mut decoder = Decoder::for_response(ResponseFraming::Chunked);
+        let mut buf = BytesMut::from(&b"5\r\nhello\r\n0\r\n\r\n"[..]);
+        let mut sink = H1Sink::new(Encoder::Chunked);
+        sink.start_with_head(b"HEAD\r\n\r\n".to_vec(), &mut decoder, &mut buf)
+            .unwrap();
+        assert_eq!(written(&mut sink), b"HEAD\r\n\r\n5\r\nhello\r\n0\r\n\r\n");
+        assert!(sink.finished && decoder.is_done());
+
+        // Part of the body is buffered: the head and that part.
+        let mut decoder = Decoder::for_request(RequestFraming::Length(10));
+        let mut buf = BytesMut::from(&b"hello"[..]);
+        let mut sink = H1Sink::new(Encoder::Raw);
+        sink.start_with_head(b"HEAD\r\n\r\n".to_vec(), &mut decoder, &mut buf)
+            .unwrap();
+        assert_eq!(written(&mut sink), b"HEAD\r\n\r\nhello");
+        assert!(!sink.finished && !decoder.is_done());
     }
 }
