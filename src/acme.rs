@@ -674,8 +674,8 @@ async fn cert_check(client: &Client, target: &AcmeTarget) -> CertCheck {
 /// Check a Secret's `tls.crt`/`tls.key` for `host` at time `now` (unix s). The
 /// error completes "certificate in Secret ns/name ...".
 fn check_cert_key(crt: Option<&[u8]>, key: Option<&[u8]>, host: &str, now: i64) -> Result<CertCheck, String> {
-    use pingora_core::tls::pkey::PKey;
-    use pingora_core::tls::x509::X509;
+    use openssl::pkey::PKey;
+    use openssl::x509::X509;
 
     let crt = crt.ok_or("is missing (no tls.crt)")?;
     let leaf = X509::from_pem(crt).map_err(|_| "does not parse")?;

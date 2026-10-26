@@ -2320,7 +2320,7 @@ fn hostname_intersection(a: &str, b: &str) -> Option<String> {
 
 /// Validate that a CA bundle PEM contains at least one parseable certificate.
 fn ca_pem_is_valid(pem: &[u8]) -> bool {
-    pingora_core::tls::x509::X509::stack_from_pem(pem)
+    openssl::x509::X509::stack_from_pem(pem)
         .map(|s| !s.is_empty())
         .unwrap_or(false)
 }

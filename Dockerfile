@@ -1,13 +1,13 @@
 # Build torii. Multi-stage: a Debian-based Rust builder (so the binary's
 # glibc/OpenSSL ABI matches the Debian runtime + the kind node), then a slim
-# runtime image with just the shared libs Pingora's OpenSSL backend needs.
+# runtime image with just the shared libs the OpenSSL-based data plane needs.
 #
 # Context is the repo root; .dockerignore trims it to Cargo.{toml,lock} + src/.
-# All dependencies, including Pingora, are fetched from crates.io.
+# Dependencies come from crates.io, except our h2 fork (a git dependency).
 
 FROM rust:1-bookworm AS builder
 
-# Pingora's `openssl` feature links against system OpenSSL; the build needs the
+# The `openssl` crate links against system OpenSSL; the build needs the
 # dev headers, pkg-config, and a C toolchain (cc/perl for some -sys crates).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config libssl-dev cmake perl clang \

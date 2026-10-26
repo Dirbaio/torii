@@ -1,7 +1,7 @@
 # ⛩️ torii
 
-A [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) controller written in Rust
-using [Pingora](https://github.com/cloudflare/pingora).
+A [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) controller written in Rust,
+with its own lean proxy (tokio, OpenSSL, HTTP/1 on httparse, HTTP/2 on a fork of h2).
 
 Torii optimizes for simplicity. A single binary reads the gateway objects from the Kubernetes API
 and proxies traffic accordingly. You can deploy it as a single pod, or scale up with multiple pods

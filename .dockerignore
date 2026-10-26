@@ -1,5 +1,5 @@
 # Keep the build context small. The Rust build needs only Cargo.{toml,lock} and
-# src/ (our crate); all dependencies, including Pingora, come from crates.io.
+# src/ (our crate); dependencies come from crates.io and git.
 target/
 .git/
 gateway-api/

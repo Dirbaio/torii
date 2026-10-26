@@ -1,9 +1,10 @@
-//! Minimal TLS ClientHello SNI parser.
+//! Minimal TLS ClientHello parser: the SNI and whether ALPN offers `acme-tls/1`.
 //!
 //! For TLSRoute we route a raw TCP connection by the SNI hostname in the TLS
 //! ClientHello, *without* terminating TLS (passthrough) or before terminating it
-//! (terminate). Pingora exposes no ClientHello parser, so we parse just enough of
-//! the handshake to pull out the `server_name` extension. We never decrypt; we
+//! (terminate), and the certificate for a terminated connection is chosen from the
+//! same peek, before the handshake starts. So we parse just enough of the
+//! handshake to pull out the `server_name` and ALPN extensions. We never decrypt; we
 //! only read the cleartext ClientHello, which is always sent in the clear (even in
 //! TLS 1.3 — Encrypted Client Hello is not in scope here and would simply present
 //! no usable SNI).
@@ -19,7 +20,24 @@
 /// `buf` should be the bytes starting at the TLS record header (byte 0 = content
 /// type). The record may be larger than one ClientHello-worth of bytes; we only
 /// read within the declared lengths and ignore trailing data.
+#[cfg(test)]
 pub fn parse_client_hello_sni(buf: &[u8]) -> Option<String> {
+    parse_client_hello(buf)?.sni
+}
+
+/// What the data plane needs from a ClientHello.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ClientHello {
+    /// The lowercased SNI host_name, if any.
+    pub sni: Option<String>,
+    /// The ALPN extension offers `acme-tls/1` (an ACME TLS-ALPN-01 validation).
+    pub offers_acme: bool,
+}
+
+/// Parse a buffer that begins with a TLS record containing a ClientHello. `None`
+/// if it is not a handshake record with a ClientHello, or is malformed/truncated.
+/// A malformed `server_name` extension leaves `sni` empty.
+pub fn parse_client_hello(buf: &[u8]) -> Option<ClientHello> {
     let mut r = Reader::new(buf);
 
     // --- TLS record header (5 bytes) ---
@@ -57,23 +75,41 @@ pub fn parse_client_hello_sni(buf: &[u8]) -> Option<String> {
 
     // Extensions are optional (TLS 1.2 allows a ClientHello with none). If the
     // body ends here, there's no SNI.
-    let extensions_len = match r.u16() {
-        Some(n) => n as usize,
-        None => return None,
+    let mut hello = ClientHello::default();
+    let Some(extensions_len) = r.u16() else {
+        return Some(hello);
     };
-    let extensions = r.take(extensions_len)?;
+    let extensions = r.take(extensions_len as usize)?;
     let mut r = Reader::new(extensions);
 
-    // --- Walk extensions, looking for server_name (type 0) ---
+    // --- Walk extensions: server_name (type 0) and ALPN (type 16) ---
     while r.remaining() >= 4 {
         let ext_type = r.u16()?;
         let ext_len = r.u16()? as usize;
         let ext_data = r.take(ext_len)?;
-        if ext_type == 0x0000 {
-            return parse_server_name_extension(ext_data);
+        match ext_type {
+            0x0000 if hello.sni.is_none() => hello.sni = parse_server_name_extension(ext_data),
+            0x0010 => hello.offers_acme = alpn_offers(ext_data, b"acme-tls/1"),
+            _ => {}
         }
     }
-    None
+    Some(hello)
+}
+
+/// Whether an ALPN extension body (RFC 7301: a u16-length list of u8-length
+/// protocol names) offers `proto`.
+fn alpn_offers(data: &[u8], proto: &[u8]) -> bool {
+    let mut r = Reader::new(data);
+    let Some(list) = r.u16().and_then(|n| r.take(n as usize)) else {
+        return false;
+    };
+    let mut r = Reader::new(list);
+    while let Some(name) = r.u8().and_then(|n| r.take(n as usize)) {
+        if name == proto {
+            return true;
+        }
+    }
+    false
 }
 
 /// Parse a `server_name` extension body (RFC 6066): a ServerNameList of

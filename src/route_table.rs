@@ -37,6 +37,19 @@ struct PortIndex {
     any: Vec<usize>,
 }
 
+/// A request's header fields, as route matching sees them.
+pub trait HeaderLookup {
+    /// Whether `f` holds for any value of the field `name` (compared without
+    /// case) that is a string of visible ASCII; other values never match.
+    fn any_value(&self, name: &str, f: &mut dyn FnMut(&str) -> bool) -> bool;
+}
+
+impl HeaderLookup for http::HeaderMap {
+    fn any_value(&self, name: &str, f: &mut dyn FnMut(&str) -> bool) -> bool {
+        self.get_all(name).iter().filter_map(|v| v.to_str().ok()).any(f)
+    }
+}
+
 impl RouteTable {
     /// Find the matching entry for a request on `(port, host)`.
     ///
@@ -55,7 +68,7 @@ impl RouteTable {
         host: &str,
         path: &str,
         method: &str,
-        headers: &http::HeaderMap,
+        headers: &dyn HeaderLookup,
         query: &str,
     ) -> Option<&RouteEntry> {
         let idx = self.by_port.get(&port)?;
@@ -91,13 +104,30 @@ impl RouteTable {
         host: &str,
         path: &str,
         method: &str,
-        headers: &http::HeaderMap,
+        headers: &dyn HeaderLookup,
         query: &str,
     ) -> Option<&RouteEntry> {
         bucket
             .iter()
             .map(|&i| &self.entries[i])
             .find(|e| e.matches(host, path, method, headers, query))
+    }
+
+    /// Whether a listener on `port` with routes attached serves the hostname
+    /// `host` (an exact or wildcard listener hostname covering it, or a listener
+    /// with no hostname); with no `host`, whether one with no hostname exists.
+    pub fn serves_host(&self, port: u16, host: Option<&str>) -> bool {
+        let Some(idx) = self.by_port.get(&port) else {
+            return false;
+        };
+        if !idx.any.is_empty() {
+            return true;
+        }
+        let Some(host) = host else {
+            return false;
+        };
+        let host_lc = host.to_ascii_lowercase();
+        idx.exact.contains_key(&host_lc) || idx.wildcard.iter().any(|(suffix, _)| host_matches_suffix(suffix, host))
     }
 
     /// Sort entries into Gateway API precedence order (highest precedence first),
@@ -221,12 +251,6 @@ pub struct HeaderMods {
     pub remove: Vec<String>,
 }
 
-impl HeaderMods {
-    pub fn is_empty(&self) -> bool {
-        self.set.is_empty() && self.add.is_empty() && self.remove.is_empty()
-    }
-}
-
 /// A request redirect filter (produces an early 3xx response).
 #[derive(Debug, Clone, Default)]
 pub struct Redirect {
@@ -342,7 +366,7 @@ pub struct UpstreamTls {
 }
 
 impl RouteEntry {
-    pub fn matches(&self, host: &str, path: &str, method: &str, headers: &http::HeaderMap, query: &str) -> bool {
+    pub fn matches(&self, host: &str, path: &str, method: &str, headers: &dyn HeaderLookup, query: &str) -> bool {
         self.matches_host(host) && self.r#match.matches(path, method, headers, query)
     }
 
@@ -462,7 +486,7 @@ impl RouteEntry {
 }
 
 impl RouteMatch {
-    fn matches(&self, path: &str, method: &str, headers: &http::HeaderMap, query: &str) -> bool {
+    fn matches(&self, path: &str, method: &str, headers: &dyn HeaderLookup, query: &str) -> bool {
         self.matches_path(path)
             && self.matches_method(method)
             && self.matches_headers(headers)
@@ -484,16 +508,12 @@ impl RouteMatch {
         }
     }
 
-    fn matches_headers(&self, headers: &http::HeaderMap) -> bool {
+    fn matches_headers(&self, headers: &dyn HeaderLookup) -> bool {
         self.headers.iter().all(|hm| {
-            headers
-                .get_all(hm.name.as_str())
-                .iter()
-                .filter_map(|v| v.to_str().ok())
-                .any(|v| match &hm.value {
-                    HeaderValueMatch::Exact(want) => v == want,
-                    HeaderValueMatch::Regex(re) => re.is_match(v),
-                })
+            headers.any_value(hm.name.as_str(), &mut |v| match &hm.value {
+                HeaderValueMatch::Exact(want) => v == want,
+                HeaderValueMatch::Regex(re) => re.is_match(v),
+            })
         })
     }
 
@@ -941,7 +961,7 @@ mod tests {
         host: &str,
         path: &str,
         method: &str,
-        headers: &http::HeaderMap,
+        headers: &dyn HeaderLookup,
         query: &str,
     ) -> Option<&'a RouteEntry> {
         let on_port = || {

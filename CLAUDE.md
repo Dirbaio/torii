@@ -1,28 +1,29 @@
 # torii
 
 A [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) controller implemented in
-Rust, with a data plane built on [Pingora](https://github.com/cloudflare/pingora). The
+Rust, with its own data plane on tokio, OpenSSL, httparse and a fork of h2. The
 goal is to **pass the upstream Gateway API conformance suite**, starting with the
 `GATEWAY-HTTP` profile.
 
 ## Status
 
-Greenfield. No Rust crate exists yet — this repo currently contains only the two
-vendored reference checkouts (`pingora/`, `gateway-api/`). The first task is to scaffold
-the workspace; see **Building from here** below.
+Working: the controller and data plane pass the `GATEWAY-HTTP` profile except
+`TLSRouteHostnameIntersection`'s "not matching" cases (an unmatched SNI on a TLS port
+falls back to HTTPS). **Building from here** below is the original bring-up plan.
 
 ## Repository layout
 
 ```
 torii/
 ├── CLAUDE.md            # this file
-├── pingora/             # Pingora source — READ-ONLY API reference (dep is from crates.io)
 ├── gateway-api/         # vendored Gateway API v1.5 — CRDs, docs, conformance suite (Go)
-└── src/ (TBD)           # our controller + data plane (does not exist yet)
+└── src/                 # our controller + data plane (src/dataplane/)
 ```
 
-`pingora/` and `gateway-api/` are **read-only references**. Treat them as upstream
-dependencies: read them to understand APIs and required behavior, never modify them.
+`gateway-api/` is a **read-only reference**. Treat it as an upstream dependency: read it
+to understand required behavior, never modify it. The data plane's h2 is our fork, the
+`torii` branch of https://github.com/Dirbaio/h2, pinned by rev in Cargo.toml: keep every
+change there marked `torii fork` and listed in its TORII.md.
 
 ## Architecture (target)
 
@@ -35,10 +36,11 @@ A Gateway controller has two halves that run in one process:
    `observedGeneration`, attached-route counts, addresses). Conformance checks status
    just as much as it checks traffic.
 
-2. **Data plane (Pingora).** A `pingora-proxy` server implementing the `ProxyHttp` trait.
-   It receives the controller's computed config (via a shared, atomically-swapped
-   snapshot — e.g. `ArcSwap<RouteTable>`) and, per request, matches the request against
-   HTTPRoute rules and picks an upstream.
+2. **Data plane (`src/dataplane/`).** Our own proxy on tokio sockets, OpenSSL (used
+   directly), HTTP/1 on httparse, and HTTP/2 on our h2 fork. It receives the
+   controller's computed config (via a shared, atomically-swapped snapshot —
+   `ArcSwap<Snapshot>`) and, per request, matches the request against HTTPRoute rules
+   and forwards it to a backend over HTTP/1.1.
 
 The control plane mutates a config snapshot; the data plane reads it lock-free per
 request. Keep these two concerns cleanly separated.
@@ -67,20 +69,19 @@ request. Keep these two concerns cleanly separated.
 
 ### Data-plane building blocks
 
-- The single most important Pingora API is the `ProxyHttp` trait in
-  [pingora/pingora-proxy/src/proxy_trait.rs](pingora/pingora-proxy/src/proxy_trait.rs).
-  Methods you'll lean on:
-  - `request_filter` — return early responses (404 for no route match, 301/302
-    redirects, `RequestRedirect`/`RequestHeaderModifier` filters). Return `Ok(true)`
-    when you've already sent the response.
-  - `upstream_peer` — pick the backend `HttpPeer` (the routing decision lives here or in
-    a filter that stashes the choice on `CTX`).
-  - `upstream_request_filter` / `response_filter` — header rewriting, hostname rewrite,
-    response header modifiers.
-- Per-request state lives on the associated `CTX` type (`new_ctx`). Put the matched
-  route/backend decision there.
-- Look at `pingora/pingora-proxy/examples/` and `pingora-load-balancing/` for upstream
-  selection, health checks, and load-balancing primitives before writing your own.
+- The goal is nginx's memory per connection. The rule that gets there: **no buffer is
+  held while waiting on a peer.** Reads go through `io::poll_read_lazy`, which lets go of
+  an empty buffer when a read would block; a request's state lives in a boxed future
+  that exists only while the request does; the relay holds one chunk per direction.
+  Keep `tests::connection_futures_are_small` passing.
+- `mod.rs`: listeners, admission (`conn_limit`), TLS-port dispatch (SNI peek →
+  TLSRoute pipe or TLS-terminated HTTP), shutdown drain. `serve_h1.rs` / `serve_h2.rs`:
+  the client side. `proxy.rs`: routing and filters, and the head rewrites.
+  `relay.rs`: bodies and their clocks. `upstream.rs`: backend connections and the pool.
+  `h1.rs`: HTTP/1 heads, framing, chunked coding. `tls.rs`: OpenSSL contexts.
+- HTTP/1 parsing is strict on purpose (request smuggling): one Transfer-Encoding
+  `chunked`, at most one Content-Length, CRLF line ends in chunked bodies.
+- Every wait on a client or backend is bounded by a clock; never add an unbounded wait.
 
 ## The conformance suite — the spec that matters
 
@@ -142,14 +143,8 @@ Iterate one test at a time. `HTTPRouteSimpleSameNamespace`
 
 1. Scaffold a Cargo workspace at the repo root. Suggested members: `torii`
    (binary), plus crates for control plane and data plane if it helps separation.
-2. Add the Pingora dependencies from crates.io, e.g.:
-   ```toml
-   pingora-core  = { version = "0.8", features = ["openssl"] }
-   pingora-proxy = { version = "0.8", features = ["openssl"] }
-   pingora-http  = "0.8"
-   ```
-   (`pingora/` is kept only as a read-only API reference — see below — not as a
-   build dependency.)
+2. Data-plane dependencies: `openssl` + `tokio-openssl`, `httparse`, `h2` (path dep on
+   the `torii` branch of github.com/Dirbaio/h2), `socket2`.
 3. Add `kube`, `kube-runtime`, `k8s-openapi` (pin the k8s version feature), `tokio`,
    `arc-swap`, `serde`. For Gateway CRD types, prefer the `gateway-api` Rust crate; if it
    lags v1.5, generate types from the CRDs in `gateway-api/config/crd/` with
@@ -165,11 +160,10 @@ Iterate one test at a time. `HTTPRouteSimpleSameNamespace`
 
 ## Conventions
 
-- **Our crate is edition 2024, `rust-version = "1.96"`.** Pingora (vendored, path dep)
-  is its own crate on its own edition (MSRV 1.84, edition 2021) — editions are per-crate,
-  so ours doesn't force Pingora's. Keep `cargo clippy` clean.
-- Never edit `pingora/` or `gateway-api/`. If you think you need to, you've misunderstood
-  the API — re-read the reference instead.
+- **Our crate is edition 2024, `rust-version = "1.96"`.** The h2 fork keeps its own
+  edition (2021) — editions are per-crate. Keep `cargo clippy` clean.
+- Never edit `gateway-api/`. If you think you need to, you've misunderstood the API —
+  re-read the reference instead.
 - Conformance is the source of truth for *behavior*. When unsure how something should
   behave, find the test that exercises it and read its assertions rather than guessing
   from the spec prose.
@@ -178,7 +172,7 @@ Iterate one test at a time. `HTTPRouteSimpleSameNamespace`
 
 ## Key reference files
 
-- Pingora request lifecycle: [pingora/pingora-proxy/src/proxy_trait.rs](pingora/pingora-proxy/src/proxy_trait.rs)
+- Data plane overview: [src/dataplane/mod.rs](src/dataplane/mod.rs); the h2 fork's changes: [TORII.md on the `torii` branch](https://github.com/Dirbaio/h2/blob/torii/TORII.md)
 - Conformance profiles & features: [gateway-api/conformance/utils/suite/profiles.go](gateway-api/conformance/utils/suite/profiles.go), [gateway-api/pkg/features/](gateway-api/pkg/features/)
 - Conformance test cases: [gateway-api/conformance/tests/](gateway-api/conformance/tests/)
 - Status-check helpers (what conditions tests expect): [gateway-api/conformance/utils/kubernetes/helpers.go](gateway-api/conformance/utils/kubernetes/helpers.go)

@@ -124,6 +124,11 @@ impl TlsTable {
         }
     }
 
+    /// Whether any TLSRoute is attached to a listener on `port`.
+    pub fn has_port(&self, port: u16) -> bool {
+        self.by_port.contains_key(&port)
+    }
+
     /// Resolve a connection's `(port, SNI)` to a [`TlsDecision`], picking a backend
     /// endpoint by weight with `rng`. Exact SNI match beats the most-specific
     /// wildcard; an unmatched SNI (or absent SNI) is `NoRoute`.

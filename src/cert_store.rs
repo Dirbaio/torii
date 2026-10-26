@@ -8,8 +8,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use pingora_core::tls::pkey::{PKey, Private};
-use pingora_core::tls::x509::X509;
+use openssl::pkey::{PKey, Private};
+use openssl::x509::X509;
 
 /// A resolved server certificate (chain + private key), parsed once from PEM when
 /// it is built: a handshake only attaches the parsed objects, and reuses OpenSSL's

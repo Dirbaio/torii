@@ -1,7 +1,8 @@
-//! torii — a Kubernetes Gateway API controller built on Pingora.
+//! torii — a Kubernetes Gateway API controller and proxy.
 //!
 //! The single entrypoint runs both planes: the kube controller (control plane) on
-//! the tokio runtime, and the Pingora proxy (data plane) on a dedicated thread.
+//! the tokio runtime, and the proxy (data plane) on a dedicated thread with its own
+//! runtime.
 
 use std::time::Duration;
 
@@ -30,7 +31,7 @@ mod snapshot;
 mod tls_sni;
 mod tls_table;
 
-/// torii: a Kubernetes Gateway API controller built on Pingora. Running the binary
+/// torii: a Kubernetes Gateway API controller and proxy. Running the binary
 /// starts both the controller and the proxy; there are no subcommands.
 #[derive(Parser, Debug)]
 #[command(name = "torii", version, about)]
@@ -174,8 +175,8 @@ async fn main() -> Result<()> {
     run(args).await
 }
 
-/// Run both planes: the kube controller on this tokio runtime, and the Pingora
-/// proxy on a dedicated OS thread (it blocks and manages its own runtime).
+/// Run both planes: the kube controller on this tokio runtime, and the proxy on a
+/// dedicated OS thread (it blocks and manages its own runtime).
 async fn run(args: Cli) -> Result<()> {
     let client = Client::try_default()
         .await
@@ -185,7 +186,7 @@ async fn run(args: Cli) -> Result<()> {
     // the control plane (writer) and data plane (reader).
     let data_plane = snapshot::DataPlane::new();
 
-    // Data plane on its own thread — run_forever() blocks and calls process::exit.
+    // Data plane on its own thread — dataplane::run() blocks and ends the process.
     let dp = data_plane.clone();
     let bind_ip = args.bind_ip.clone();
     let http_ports = args.http_ports.clone();
