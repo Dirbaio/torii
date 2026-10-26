@@ -202,7 +202,7 @@ async fn handle(ctx: &Arc<Ctx>, req: Request<RecvStream>, mut respond: SendRespo
                 *cont.status_mut() = http::StatusCode::CONTINUE;
                 let _ = respond.send_informational(cont);
             }
-            exchange(ctx, &head, *plan, framing, recv, respond).await
+            exchange(ctx, &head, plan, framing, recv, respond).await
         }
     }
 }
@@ -211,7 +211,7 @@ async fn handle(ctx: &Arc<Ctx>, req: Request<RecvStream>, mut respond: SendRespo
 async fn exchange(
     ctx: &Arc<Ctx>,
     head: &RequestHead,
-    plan: Plan,
+    plan: Box<Plan>,
     framing: UpstreamBody,
     recv: RecvStream,
     mut respond: SendResponse<Bytes>,

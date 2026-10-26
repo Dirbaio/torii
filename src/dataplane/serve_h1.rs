@@ -154,7 +154,7 @@ async fn handle(
             let close = close || framing != RequestFraming::None;
             write_local(stream, &local, close, ctx.client_stall).await.is_ok() && !close
         }
-        Decision::Proxy(plan) => exchange(ctx, stream, buf, &head, *plan, framing, close).await,
+        Decision::Proxy(plan) => exchange(ctx, stream, buf, &head, plan, framing, close).await,
     }
 }
 
@@ -165,7 +165,7 @@ async fn exchange(
     stream: &mut Stream,
     buf: &mut BytesMut,
     head: &RequestHead,
-    plan: Plan,
+    plan: Box<Plan>,
     framing: RequestFraming,
     close: bool,
 ) -> bool {
