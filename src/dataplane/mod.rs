@@ -249,6 +249,7 @@ pub fn run(
             shutdown: watch::Sender::new(false),
             live: Live::default(),
         });
+        tokio::spawn(ctx.pool.clone().sweep());
         let (stop_accepting, stop) = watch::channel(false);
         let ports = http_ports
             .iter()

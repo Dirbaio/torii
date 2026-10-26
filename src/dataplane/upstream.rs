@@ -1,28 +1,34 @@
 //! Connections to backends: connecting (TCP, and TLS for a BackendTLSPolicy), and
 //! the pool of idle HTTP/1.1 connections kept for reuse.
 //!
-//! A pooled connection holds its socket (and TLS state), and a small task that
-//! watches it: the connection is dropped as soon as the backend closes it or sends
-//! something unasked, or after [`IDLE_TIMEOUT`]. It holds no buffer.
+//! A pooled connection holds its socket (and TLS state) and no buffer, and nothing
+//! runs for it: whether the backend closed it, or sent something unasked, is checked
+//! when it is taken, and [`Pool::sweep`] closes the ones that idled out or that the
+//! backend closed meanwhile.
 
 use std::collections::HashMap;
 use std::io;
+use std::mem::MaybeUninit;
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::task::{Context, Waker};
 use std::time::Duration;
 
 use bytes::BytesMut;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
+use tokio::time::Instant;
 use tokio_openssl::SslStream;
 
-use super::io::{Stream, read_lazy, setup_upstream};
+use super::io::{Stream, setup_upstream};
 use super::tls::{ClientIdentity, Clients};
 use crate::route_table::{BackendTls, Endpoint, UpstreamTls};
 
 /// How long a pooled connection may stay idle (nginx's upstream `keepalive_timeout`).
 const IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How often [`Pool::sweep`] looks for connections to close.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 /// Most requests one backend connection serves (nginx's `keepalive_requests`).
 const MAX_REQUESTS: u32 = 1000;
 /// Most idle connections kept per backend endpoint, and in all. Each costs a socket
@@ -73,7 +79,7 @@ pub async fn connect_http(
         addr,
         tls: client.as_ref().map(|c| c.identity.clone()),
     };
-    if !fresh && let Some(up) = pool.take(&key).await {
+    if !fresh && let Some(up) = pool.take(&key) {
         return Ok(up);
     }
     let ssl = match &client {
@@ -150,50 +156,57 @@ pub struct Pool {
 
 #[derive(Default)]
 struct PoolInner {
+    /// Per key, oldest first.
     idle: HashMap<PoolKey, Vec<Idle>>,
     count: usize,
-    next_id: u64,
 }
 
-/// A pooled connection, as the pool sees it: a way to ask its watcher for it.
+/// A pooled connection, and since when it has been idle.
 struct Idle {
-    id: u64,
-    take: oneshot::Sender<oneshot::Sender<Upstream>>,
+    up: Upstream,
+    since: Instant,
+}
+
+impl Idle {
+    /// Whether it may serve another request.
+    fn usable(&mut self) -> bool {
+        self.since.elapsed() < IDLE_TIMEOUT && is_idle(&mut self.up.stream)
+    }
 }
 
 impl Pool {
+    fn lock(&self) -> MutexGuard<'_, PoolInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Keep `up` for reuse, if it may be and there is room.
-    pub fn put(self: &Arc<Self>, mut up: Upstream) {
+    pub fn put(&self, mut up: Upstream) {
         up.requests += 1;
         if up.requests >= MAX_REQUESTS || !up.buf.is_empty() {
             return;
         }
         up.buf = BytesMut::new();
         up.reused = true;
-        let (tx, rx) = oneshot::channel();
-        let id = {
-            let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-            if inner.count >= MAX_IDLE {
-                return;
-            }
-            let id = inner.next_id;
-            inner.next_id += 1;
-            let list = inner.idle.entry(up.key.clone()).or_default();
-            if list.len() >= MAX_IDLE_PER_KEY {
-                return;
-            }
-            list.push(Idle { id, take: tx });
-            inner.count += 1;
-            id
-        };
-        tokio::spawn(watch(self.clone(), id, up, rx));
+        let mut inner = self.lock();
+        if inner.count >= MAX_IDLE {
+            return;
+        }
+        let list = inner.idle.entry(up.key.clone()).or_default();
+        if list.len() >= MAX_IDLE_PER_KEY {
+            return;
+        }
+        list.push(Idle {
+            up,
+            since: Instant::now(),
+        });
+        inner.count += 1;
     }
 
-    /// The most recently pooled connection for `key`, if any is still open.
-    async fn take(&self, key: &PoolKey) -> Option<Upstream> {
+    /// The most recently pooled connection for `key` that is still usable, if any.
+    fn take(&self, key: &PoolKey) -> Option<Upstream> {
         loop {
-            let idle = {
-                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut idle = {
+                let mut inner = self.lock();
                 let list = inner.idle.get_mut(key)?;
                 let idle = list.pop();
                 if list.is_empty() {
@@ -203,52 +216,93 @@ impl Pool {
                 inner.count -= 1;
                 idle
             };
-            let (tx, rx) = oneshot::channel();
-            if idle.take.send(tx).is_err() {
-                continue;
-            }
-            if let Ok(up) = rx.await {
-                return Some(up);
+            if idle.usable() {
+                return Some(idle.up);
             }
         }
     }
 
-    /// Forget a pooled connection whose watcher dropped it.
-    fn remove(&self, key: &PoolKey, id: u64) {
-        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(list) = inner.idle.get_mut(key) else {
-            return;
-        };
-        let Some(i) = list.iter().position(|idle| idle.id == id) else {
-            return;
-        };
-        list.swap_remove(i);
-        if list.is_empty() {
-            inner.idle.remove(key);
+    /// Close, every [`SWEEP_INTERVAL`], the pooled connections that idled out or
+    /// that the backend closed. Runs for as long as the data plane does.
+    pub async fn sweep(self: Arc<Self>) {
+        let mut interval = tokio::time::interval(SWEEP_INTERVAL);
+        loop {
+            interval.tick().await;
+            let mut closed = Vec::new();
+            let mut inner = self.lock();
+            inner.idle.retain(|_, list| {
+                closed.extend(list.extract_if(.., |idle| !idle.usable()));
+                !list.is_empty()
+            });
+            inner.count -= closed.len();
+            // The sockets close (and TLS state is freed) once the lock is let go.
+            drop(inner);
         }
-        inner.count -= 1;
     }
 }
 
-/// Hold a pooled connection until it is taken, the backend closes it, or it has
-/// idled for [`IDLE_TIMEOUT`].
-async fn watch(pool: Arc<Pool>, id: u64, mut up: Upstream, take: oneshot::Receiver<oneshot::Sender<Upstream>>) {
-    let taken = {
-        let closed = async {
-            // Any byte or EOF makes the connection unusable: nothing was asked.
-            let mut buf = BytesMut::new();
-            let _ = read_lazy(&mut up.stream, &mut buf, 1).await;
+/// Whether a pooled connection is as it was left: nothing to read, not even an
+/// EOF. A byte the backend sent unasked, or its close, makes it unusable.
+///
+/// A connection the event loop has seen no event for answers without a syscall.
+fn is_idle(stream: &mut Stream) -> bool {
+    let mut byte = [MaybeUninit::uninit()];
+    let mut cx = Context::from_waker(Waker::noop());
+    Pin::new(stream)
+        .poll_read(&mut cx, &mut ReadBuf::uninit(&mut byte))
+        .is_pending()
+}
+
+#[cfg(test)]
+mod tests {
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    /// A backend, a pool, and one connection to the backend in the pool.
+    async fn pooled() -> (TcpListener, TcpStream, Arc<Pool>, PoolKey) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ep = Endpoint {
+            ip: addr.ip(),
+            port: addr.port(),
+            tls: BackendTls::Plaintext,
         };
-        tokio::select! {
-            r = take => r.ok(),
-            () = closed => None,
-            () = tokio::time::sleep(IDLE_TIMEOUT) => None,
-        }
-    };
-    match taken {
-        Some(tx) => {
-            let _ = tx.send(up);
-        }
-        None => pool.remove(&up.key, id),
+        let pool = Arc::new(Pool::default());
+        let up = connect_http(&pool, &Clients::default(), &ep, None, false)
+            .await
+            .unwrap();
+        let (server, _) = listener.accept().await.unwrap();
+        let key = up.key.clone();
+        pool.put(up);
+        (listener, server, pool, key)
+    }
+
+    #[tokio::test]
+    async fn a_connection_the_backend_closed_is_not_reused() {
+        let (_listener, server, pool, key) = pooled().await;
+        let up = pool.take(&key).expect("an open connection is reused");
+        pool.put(up);
+        drop(server);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(pool.take(&key).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_connection_that_idled_out_is_not_reused() {
+        let (_listener, _server, pool, key) = pooled().await;
+        tokio::time::advance(IDLE_TIMEOUT).await;
+        assert!(pool.take(&key).is_none());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_closes_connections_that_idled_out() {
+        let (_listener, mut server, pool, _key) = pooled().await;
+        tokio::spawn(pool.clone().sweep());
+        tokio::time::sleep(IDLE_TIMEOUT + SWEEP_INTERVAL).await;
+        assert_eq!(pool.lock().count, 0);
+        let mut buf = [0u8; 1];
+        let n = tokio::io::AsyncReadExt::read(&mut server, &mut buf).await.unwrap();
+        assert_eq!(n, 0, "the backend sees the close");
     }
 }
