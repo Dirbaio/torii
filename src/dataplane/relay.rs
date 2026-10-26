@@ -25,8 +25,12 @@ use super::MIN_BODY_PROGRESS;
 use super::h1::{BodyError, Decoder, Encoder};
 use super::io::{Outgoing, Stream, Timer, poll_read_lazy};
 
-/// Most body bytes read or sent at a time.
-pub const CHUNK: usize = 16 * 1024;
+/// Most body bytes read or sent at a time: a request in flight holds one such chunk
+/// per direction. 32 KiB moves a bulk transfer about as fast as Pingora's 64 KiB
+/// reads with 4 chunks of read-ahead did (bench/perf: 9.3 against 9.6 GB/s on
+/// loopback; 16 KiB managed 8.1), while a request stalled by its client holds
+/// ~43 KB (nginx: ~116 KB, plus temp files). 64 KiB: 10.2 GB/s and ~76 KB.
+pub const CHUNK: usize = 32 * 1024;
 
 /// Why an exchange ended early.
 #[derive(Debug)]
