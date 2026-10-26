@@ -178,6 +178,17 @@ async fn main() -> Result<()> {
 /// Run both planes: the kube controller on this tokio runtime, and the proxy on a
 /// dedicated OS thread (it blocks and manages its own runtime).
 async fn run(args: Cli) -> Result<()> {
+    // A port serves plain HTTP or TLS, so it may be listed once in all.
+    let mut ports = std::collections::HashSet::new();
+    if let Some(port) = args
+        .http_ports
+        .iter()
+        .chain(&args.tls_ports)
+        .find(|&&p| !ports.insert(p))
+    {
+        anyhow::bail!("port {port} is listed more than once in --http-ports and --tls-ports");
+    }
+
     let client = Client::try_default()
         .await
         .context("failed to build Kubernetes client")?;
@@ -276,6 +287,8 @@ async fn run(args: Cli) -> Result<()> {
     // Control plane on this runtime.
     let config = controller::ControllerConfig {
         advertise_address: args.advertise,
+        http_ports: args.http_ports,
+        tls_ports: args.tls_ports,
         acme_feed,
         acme_default_issuer: args.acme_issuer,
         acme_default_email: args.acme_email,
