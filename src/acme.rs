@@ -24,13 +24,12 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use arc_swap::ArcSwap;
 use futures::{FutureExt, StreamExt};
-use gateway_api::apis::standard::gateways::Gateway;
 use instant_acme::{
     Account, AccountCredentials, ChallengeType, Identifier, NewAccount, NewOrder, OrderStatus, RetryPolicy,
 };
@@ -58,18 +57,16 @@ pub const ANNO_EMAIL: &str = "torii.dirba.io/acme-email";
 
 const ACCOUNT_SECRET: &str = "torii-acme-account";
 const CHALLENGE_SECRET: &str = "torii-acme-challenge";
-/// Server-Side Apply field manager for ACME's writes. Public so the controller can
-/// reference it; distinct from the controller's manager so each owns its own fields
-/// (Secrets here, plus the `torii.dirba.io/ACMEIssued` listener condition) without
-/// clobbering the other.
+/// Server-Side Apply field manager for ACME's Secret writes.
 pub const FIELD_MANAGER: &str = "torii-acme";
 
-/// The custom listener condition type the ACME subsystem owns. Reports the full
+/// The custom listener condition type that reports ACME's state. Reports the full
 /// issuance/renewal lifecycle (Issued / Pending / Failed / unsupported hostname) on
 /// the Gateway, so operators can see ACME state and failure reasons via the k8s API
 /// — no controller-log access needed. Gateway API permits extra condition types and
-/// the conformance suite ignores unknown ones, so this is safe.
-const COND_ACME: &str = "torii.dirba.io/ACMEIssued";
+/// the conformance suite ignores unknown ones, so this is safe. The controller writes
+/// it, from what this task reports (see [`AcmeFeed::report`]).
+pub const COND_ACME: &str = "torii.dirba.io/ACMEIssued";
 const LEASE_NAME: &str = "torii-acme-leader";
 
 /// Renew when the cert is within this window of expiry (Let's Encrypt issues
@@ -175,7 +172,7 @@ async fn lead(client: &Client, lease: &LeaseLock, feed: &AcmeFeed, config: &Acme
         if is_leader && last_scan.elapsed() >= SCAN_INTERVAL {
             last_scan = std::time::Instant::now();
             let targets = feed.load();
-            if let Err(e) = scan_and_issue(client, &targets, config, &mut backoff).await {
+            if let Err(e) = scan_and_issue(client, feed, &targets, config, &mut backoff).await {
                 tracing::warn!(error = format!("{e:#}"), "ACME scan/issue failed");
             }
         }
@@ -201,9 +198,7 @@ async fn lead(client: &Client, lease: &LeaseLock, feed: &AcmeFeed, config: &Acme
 /// so their "unsupported" state is reported rather than silently skipped).
 ///
 /// Constructed by the CONTROLLER during reconcile and published via [`AcmeFeed`] —
-/// not derived by ACME itself. The controller already validates these listeners and
-/// writes their status, so by the time a target reaches ACME the Gateway's listener
-/// status (incl. `attachedRoutes`) is populated: ACME's condition patch can't race it.
+/// not derived by ACME itself.
 #[derive(Clone, PartialEq, Eq)]
 pub struct AcmeTarget {
     /// Gateway + listener identity, for the status condition we apply.
@@ -222,11 +217,6 @@ pub struct AcmeTarget {
     /// The listener's certificateRefs Secret (namespace, name) — issuance target.
     pub secret_ns: String,
     pub secret_name: String,
-    /// The listener's current `status.attachedRoutes`, supplied by the controller
-    /// (which owns the count). Echoed in our status patch because the CRD requires
-    /// `attachedRoutes` on every listener-status entry; sending the controller's value
-    /// keeps the apply a no-op for that field (no last-writer-wins flap).
-    pub attached_routes: i32,
     /// Whether a usable cert is currently loaded for this listener (the controller's
     /// view, from its CertStore). NOT used to decide issuance — ACME does its own
     /// `cert_check` for expiry — but it makes the target set change when the cert
@@ -242,11 +232,32 @@ impl AcmeTarget {
     fn key(&self) -> (String, String, String) {
         (self.secret_ns.clone(), self.secret_name.clone(), self.hostname.clone())
     }
+
+    /// The listener the target is for: (Gateway namespace, Gateway name, listener).
+    fn listener(&self) -> (String, String, String) {
+        (self.gw_ns.clone(), self.gw_name.clone(), self.listener_name.clone())
+    }
 }
 
-/// Control-plane → ACME hand-off: the desired set of issuance targets, republished by
-/// the controller after each reconcile (once status is synced), plus a notification so
-/// the ACME leader wakes and acts IMMEDIATELY instead of waiting for its renewal tick.
+/// What ACME last found for a listener, as its `torii.dirba.io/ACMEIssued`
+/// condition: status, reason, message, and the Gateway generation it is about.
+#[derive(Clone, PartialEq)]
+pub struct AcmeReport {
+    pub status: &'static str,
+    pub reason: &'static str,
+    pub message: String,
+    pub generation: i64,
+}
+
+/// [`AcmeReport`]s by listener: (Gateway namespace, Gateway name, listener).
+pub type AcmeReports = HashMap<(String, String, String), AcmeReport>;
+
+/// Control-plane ↔ ACME hand-off: the desired set of issuance targets, republished by
+/// the controller after each reconcile, plus a notification so the ACME leader wakes
+/// and acts IMMEDIATELY instead of waiting for its renewal tick; and back, what ACME
+/// found for each target, which the controller writes into the listener's status.
+/// The controller is the only writer of listener status: a field manager per
+/// listener, as ACME had, kept entries for removed listeners forever.
 ///
 /// Cheap to clone (Arc-backed). The controller holds one clone and calls [`publish`];
 /// the ACME loop holds another and `load`s the current set / awaits [`notified`].
@@ -257,6 +268,8 @@ impl AcmeTarget {
 pub struct AcmeFeed {
     targets: Arc<ArcSwap<Vec<AcmeTarget>>>,
     notify: Arc<tokio::sync::Notify>,
+    reports: Arc<Mutex<AcmeReports>>,
+    reported: Arc<tokio::sync::Notify>,
 }
 
 impl AcmeFeed {
@@ -269,9 +282,43 @@ impl AcmeFeed {
     /// (route edits, status writes) doesn't wake ACME for nothing.
     pub fn publish(&self, targets: Vec<AcmeTarget>) {
         let changed = **self.targets.load() != targets;
+        let mut reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
+        reports.retain(|listener, _| targets.iter().any(|t| t.listener() == *listener));
+        drop(reports);
         self.targets.store(Arc::new(targets));
         if changed {
             self.notify.notify_one();
+        }
+    }
+
+    /// Controller: what ACME last reported for the listeners of `targets`.
+    pub fn reports(&self, targets: &[AcmeTarget]) -> AcmeReports {
+        let reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
+        targets
+            .iter()
+            .filter_map(|t| Some((t.listener(), reports.get(&t.listener())?.clone())))
+            .collect()
+    }
+
+    /// Controller: resolves when ACME reports a changed state, which the next pass
+    /// writes. A report while no one awaits is remembered.
+    pub async fn reported(&self) {
+        self.reported.notified().await
+    }
+
+    /// ACME: report `state` for `target`'s listener, and wake the controller if it
+    /// changed.
+    fn report(&self, target: &AcmeTarget, state: &AcmeState) {
+        let (status, reason, message) = state.condition();
+        let report = AcmeReport {
+            status,
+            reason,
+            message,
+            generation: target.gw_gen,
+        };
+        let mut reports = self.reports.lock().unwrap_or_else(|e| e.into_inner());
+        if reports.insert(target.listener(), report.clone()).as_ref() != Some(&report) {
+            self.reported.notify_one();
         }
     }
 
@@ -317,57 +364,6 @@ impl AcmeState {
             ),
             AcmeState::Unsupported { reason } => ("False", "UnsupportedValue", reason.clone()),
         }
-    }
-}
-
-/// SSA-apply the `torii.dirba.io/ACMEIssued` condition onto one Gateway listener,
-/// under the ACME field manager. Because Gateway status conditions are merged by
-/// `type` (listMapKey=type) and the controller uses a different field manager, this
-/// touches ONLY our condition and leaves the standard Accepted/Programmed/ResolvedRefs
-/// conditions alone. The document also carries `attachedRoutes` — required on every
-/// listener-status entry by the CRD — set to the controller-supplied value, so it's a
-/// no-op for that field: a no-op apply doesn't bump resourceVersion, so it triggers no
-/// watch event and no reconcile. (Targets only reach ACME after the controller has
-/// written this listener's status, so the field is already present; echoing it is
-/// belt-and-suspenders against any cache-lag window.) Best-effort: a failure to write
-/// status must not abort issuance.
-async fn patch_acme_status(client: &Client, target: &AcmeTarget, state: &AcmeState) {
-    let (status, reason, message) = state.condition();
-    // A self-contained SSA document: just this listener + just our condition.
-    let doc = serde_json::json!({
-        "apiVersion": "gateway.networking.k8s.io/v1",
-        "kind": "Gateway",
-        "metadata": { "name": target.gw_name, "namespace": target.gw_ns },
-        "status": { "listeners": [{
-            "name": target.listener_name,
-            // Required on every listener-status entry by the CRD; echo the controller's
-            // value so this apply never changes the count it owns (no flap).
-            "attachedRoutes": target.attached_routes,
-            // SSA requires the listMapKey fields of every list we touch; conditions
-            // is keyed by `type`, listeners by `name` (set above).
-            "conditions": [{
-                "type": COND_ACME,
-                "status": status,
-                "reason": reason,
-                "message": message,
-                "observedGeneration": target.gw_gen,
-                "lastTransitionTime": "1970-01-01T00:00:00Z",
-            }],
-        }]},
-    });
-    let api: Api<Gateway> = Api::namespaced(client.clone(), &target.gw_ns);
-    // PER-LISTENER field manager. An SSA apply expresses the COMPLETE intent of its
-    // manager, so two single-listener applies under ONE manager would make the second
-    // orphan the first listener's condition. A distinct manager per listener keeps
-    // each condition independently owned (and lets successive Pending→Issued/Failed
-    // applies on the same listener just update in place).
-    let manager = format!("{FIELD_MANAGER}.{}", target.listener_name);
-    let pp = PatchParams::apply(&manager).force();
-    if let Err(e) = api.patch_status(&target.gw_name, &pp, &Patch::Apply(&doc)).await {
-        tracing::warn!(
-            gw = %target.gw_name, listener = %target.listener_name, error = %e,
-            "ACME: failed to patch listener status condition"
-        );
     }
 }
 
@@ -446,6 +442,7 @@ fn backoff_delay(fails: u32) -> Duration {
 /// [`AcmeFeed`]; this never lists Gateways itself.
 async fn scan_and_issue(
     client: &Client,
+    feed: &AcmeFeed,
     targets: &[AcmeTarget],
     config: &AcmeConfig,
     backoff: &mut Backoff,
@@ -473,15 +470,13 @@ async fn scan_and_issue(
             missing.push("email (--acme-email or torii.dirba.io/acme-email)");
         }
         if !missing.is_empty() {
-            patch_acme_status(
-                client,
+            feed.report(
                 target,
                 &AcmeState::Failed {
                     detail: format!("ACME enabled but not configured: missing {}", missing.join(", ")),
                     retry_in_s: 0,
                 },
-            )
-            .await;
+            );
             continue;
         }
 
@@ -490,14 +485,13 @@ async fn scan_and_issue(
         if let Some(directory) = &target.directory
             && let Err(detail) = check_directory_url(directory)
         {
-            patch_acme_status(client, target, &AcmeState::Failed { detail, retry_in_s: 0 }).await;
+            feed.report(target, &AcmeState::Failed { detail, retry_in_s: 0 });
             continue;
         }
 
         // Wildcard / empty hostname → can never validate via TLS-ALPN-01. Report it.
         if !is_concrete_hostname(&target.hostname) {
-            patch_acme_status(
-                client,
+            feed.report(
                 target,
                 &AcmeState::Unsupported {
                     reason: format!(
@@ -506,8 +500,7 @@ async fn scan_and_issue(
                         target.hostname
                     ),
                 },
-            )
-            .await;
+            );
             continue;
         }
 
@@ -519,7 +512,7 @@ async fn scan_and_issue(
                  (--acme-namespace); reference a Secret there",
                 target.secret_ns, target.secret_name, config.namespace
             );
-            patch_acme_status(client, target, &AcmeState::Failed { detail, retry_in_s: 0 }).await;
+            feed.report(target, &AcmeState::Failed { detail, retry_in_s: 0 });
             continue;
         }
 
@@ -531,7 +524,7 @@ async fn scan_and_issue(
                  issues one hostname per Secret; give this listener its own Secret",
                 target.secret_ns, target.secret_name, owner.listener_name, owner.gw_ns, owner.gw_name, owner.hostname
             );
-            patch_acme_status(client, target, &AcmeState::Failed { detail, retry_in_s: 0 }).await;
+            feed.report(target, &AcmeState::Failed { detail, retry_in_s: 0 });
             continue;
         }
 
@@ -539,7 +532,7 @@ async fn scan_and_issue(
         let reason = match cert_check(client, target).await {
             CertCheck::Good { not_after } => {
                 backoff.record_success(target);
-                patch_acme_status(client, target, &AcmeState::Issued { not_after }).await;
+                feed.report(target, &AcmeState::Issued { not_after });
                 continue;
             }
             CertCheck::NeedsWork { reason } => reason,
@@ -549,21 +542,19 @@ async fn scan_and_issue(
         // failure (with the remaining wait) rather than re-hitting the CA.
         if !backoff.ready(target) {
             if let Some(state) = backoff.failed_state(target) {
-                patch_acme_status(client, target, &state).await;
+                feed.report(target, &state);
             }
             continue;
         }
 
         // Attempt issuance, reporting Pending up front so the condition reflects
         // "in progress" even if the order takes a while or the process restarts.
-        patch_acme_status(
-            client,
+        feed.report(
             target,
             &AcmeState::Pending {
                 stage: format!("ordering certificate ({reason})"),
             },
-        )
-        .await;
+        );
         // instant-acme panics on some bad URLs from the ACME server itself (an
         // unparseable `newNonce`), so a panic is this target's failure, not the loop's.
         let result = match AssertUnwindSafe(issue(client, config, target)).catch_unwind().await {
@@ -573,7 +564,7 @@ async fn scan_and_issue(
         match result {
             Ok(not_after) => {
                 backoff.record_success(target);
-                patch_acme_status(client, target, &AcmeState::Issued { not_after }).await;
+                feed.report(target, &AcmeState::Issued { not_after });
             }
             Err(e) => {
                 let detail = format!("{e:#}");
@@ -582,15 +573,13 @@ async fn scan_and_issue(
                     host = %target.hostname, error = %detail,
                     retry_in_s = delay.as_secs(), "ACME issuance failed; backing off",
                 );
-                patch_acme_status(
-                    client,
+                feed.report(
                     target,
                     &AcmeState::Failed {
                         detail,
                         retry_in_s: delay.as_secs(),
                     },
-                )
-                .await;
+                );
             }
         }
     }
@@ -1195,7 +1184,6 @@ mod tests {
             hostname: host.into(),
             secret_ns: "default".into(),
             secret_name: format!("{host}-tls"),
-            attached_routes: 0,
             has_cert: false,
         }
     }

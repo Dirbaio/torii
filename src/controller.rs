@@ -12,8 +12,7 @@ use std::time::Duration;
 use anyhow::Result;
 use futures::{Stream, StreamExt, TryStreamExt};
 use gateway_api::apis::standard::backendtlspolicies::{
-    BackendTLSPolicy, BackendTlsPolicyStatus, BackendTlsPolicyStatusAncestors,
-    BackendTlsPolicyStatusAncestorsAncestorRef,
+    BackendTLSPolicy, BackendTlsPolicyStatusAncestors, BackendTlsPolicyStatusAncestorsAncestorRef,
 };
 use gateway_api::apis::standard::gatewayclasses::{
     GatewayClass, GatewayClassStatus, GatewayClassStatusSupportedFeatures,
@@ -21,13 +20,9 @@ use gateway_api::apis::standard::gatewayclasses::{
 use gateway_api::apis::standard::gateways::{
     Gateway, GatewayStatus, GatewayStatusAddresses, GatewayStatusListeners, GatewayStatusListenersSupportedKinds,
 };
-use gateway_api::apis::standard::httproutes::{
-    HTTPRoute, HttpRouteStatus, HttpRouteStatusParents, HttpRouteStatusParentsParentRef,
-};
+use gateway_api::apis::standard::httproutes::{HTTPRoute, HttpRouteStatusParents, HttpRouteStatusParentsParentRef};
 use gateway_api::apis::standard::referencegrants::ReferenceGrant;
-use gateway_api::apis::standard::tlsroutes::{
-    TLSRoute, TlsRouteStatus, TlsRouteStatusParents, TlsRouteStatusParentsParentRef,
-};
+use gateway_api::apis::standard::tlsroutes::{TLSRoute, TlsRouteStatusParents, TlsRouteStatusParentsParentRef};
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
@@ -263,8 +258,12 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
     // timer is needed to "heal" convergence. If something fails to converge,
     // that is a real bug — fix the bug, never paper over it with a resync.
     loop {
-        // Block until at least one event arrives.
-        let _ = rx.recv().await;
+        // Block until at least one event arrives, or ACME reports a new state for a
+        // listener (which only the controller writes).
+        tokio::select! {
+            _ = rx.recv() => {}
+            () = acme_reported(ctx.config.acme_feed.as_ref()) => {}
+        }
         // Coalesce a short burst, then drain so events that arrive *after* this
         // point (e.g. during the reconcile) trigger a fresh pass next iteration.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -286,6 +285,14 @@ fn identity_only<K>(obj: &mut PartialObjectMeta<K>) {
         resource_version: meta.resource_version,
         ..Default::default()
     };
+}
+
+/// Resolves when the ACME task reports a changed state; never without `--acme`.
+async fn acme_reported(feed: Option<&crate::acme::AcmeFeed>) {
+    match feed {
+        Some(feed) => feed.reported().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Whether a watcher error is the API server refusing the initial list for good:
@@ -761,7 +768,14 @@ struct StatusPatch {
     target: PatchTarget,
     ns: Option<String>,
     name: String,
+    /// The apply document's body: `{"status": ...}`, or nothing, which releases
+    /// every field the manager owns.
     json: serde_json::Value,
+    /// The field manager to apply as.
+    manager: String,
+    /// The object's version the write was computed from, when it must not
+    /// overwrite a newer one (see [`list_status_patch`]).
+    resource_version: Option<String>,
 }
 
 impl ReconcileCtx {
@@ -785,7 +799,31 @@ impl ReconcileCtx {
             .collect();
         let owned_class_names: Vec<String> = owned_classes.iter().map(|gc| gc.name_any()).collect();
         for gc in &owned_classes {
-            patches.push(self.gatewayclass_patch(gc));
+            patches.extend(self.gatewayclass_patch(gc));
+        }
+
+        // Release what torii wrote before that nothing computes any more: its
+        // status on a Gateway that left its classes (the class changed, or is
+        // gone), and the ACMEIssued conditions that the ACME task used to write
+        // under a field manager per listener (the controller writes them now).
+        // Applying an empty document under a manager drops the fields it owned,
+        // and the CRD defaults come back.
+        for gw in self.stores.gateways.state() {
+            let owned = owned_class_names.contains(&gw.spec.gateway_class_name);
+            for fields in gw.managed_fields() {
+                let manager = fields.manager.as_deref().unwrap_or_default();
+                let stale = (manager == FIELD_MANAGER && !owned) || manager.starts_with(LEGACY_ACME_MANAGERS);
+                if stale && fields.subresource.as_deref() == Some("status") {
+                    patches.push(StatusPatch {
+                        target: PatchTarget::Gateway,
+                        ns: gw.namespace(),
+                        name: gw.name_any(),
+                        json: serde_json::json!({}),
+                        manager: manager.to_string(),
+                        resource_version: None,
+                    });
+                }
+            }
         }
 
         // Gateways whose class we own.
@@ -866,8 +904,15 @@ impl ReconcileCtx {
         }
 
         // ── Stage 3: derive Gateway + Policy status from the computed data ──
+        // The ACME issuance targets come from the same data; their listeners show
+        // what ACME last reported for them. Cheap when --acme is off (no feed).
+        let acme_targets = self.config.acme_feed.as_ref().map(|_| self.acme_targets(&models));
+        let acme_reports = match (&self.config.acme_feed, &acme_targets) {
+            (Some(feed), Some(targets)) => feed.reports(targets),
+            _ => HashMap::new(),
+        };
         for model in &models {
-            patches.push(self.gateway_patch(model, &attach_counts));
+            patches.extend(self.gateway_patch(model, &attach_counts, &acme_reports));
         }
         // Policy ancestors: the Gateways that accept routes to their Services (a
         // rejected Gateway accepts none).
@@ -884,16 +929,6 @@ impl ReconcileCtx {
             tls: tls_table,
         });
 
-        // Compute the ACME issuance targets from the SAME data, but publish them AFTER
-        // the status flush below — so the ACME leader only ever sees a target once this
-        // listener's status (incl. attachedRoutes) is written, and its condition patch
-        // can't race the controller. Cheap when --acme is off (feed is None).
-        let acme_targets = self
-            .config
-            .acme_feed
-            .as_ref()
-            .map(|_| self.acme_targets(&models, &attach_counts));
-
         let flushed = self.flush_status(patches).await;
 
         if let (Some(feed), Some(targets)) = (&self.config.acme_feed, acme_targets) {
@@ -905,11 +940,10 @@ impl ReconcileCtx {
     /// Build the desired ACME issuance-target set from the reconcile's per-Gateway
     /// models: every ACME-opted-in (`torii.dirba.io/acme` annotation) HTTPS/TLS-terminate
     /// listener with a concrete core-Secret certificateRef. Issuer/email resolve from the
-    /// Gateway annotations falling back to the CLI defaults; `attached_routes` comes from
-    /// the counts we just computed (so ACME echoes the controller's value). Wildcard/empty
-    /// hostnames and missing issuer/email are NOT filtered here — they're included so ACME
-    /// reports their Unsupported/Failed state, matching the old self-listing behaviour.
-    fn acme_targets(&self, models: &[GatewayModel], attach_counts: &AttachCounts) -> Vec<crate::acme::AcmeTarget> {
+    /// Gateway annotations falling back to the CLI defaults. Wildcard/empty hostnames and
+    /// missing issuer/email are NOT filtered here — they're included so ACME reports their
+    /// Unsupported/Failed state, matching the old self-listing behaviour.
+    fn acme_targets(&self, models: &[GatewayModel]) -> Vec<crate::acme::AcmeTarget> {
         use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
         let mut out = Vec::new();
         // A rejected Gateway serves no certificate.
@@ -930,7 +964,6 @@ impl ReconcileCtx {
                 .or_else(|| self.config.acme_default_email.clone());
             let gw_ns = gw.metadata.namespace.clone().unwrap_or_default();
             let gw_name = gw.metadata.name.clone().unwrap_or_default();
-            let counts = attach_counts.get(&(gw_ns.clone(), gw_name.clone()));
             for l in &gw.spec.listeners {
                 if !matches!(l.protocol.as_str(), "HTTPS" | "TLS") {
                     continue;
@@ -945,7 +978,6 @@ impl ReconcileCtx {
                     continue;
                 };
                 let hostname = l.hostname.clone().unwrap_or_default();
-                let attached_routes = counts.and_then(|c| c.get(&l.name)).copied().unwrap_or(0);
                 // Does a usable cert currently exist for this listener? From the same
                 // CertStore-resolution the controller just did. Flips when the cert
                 // Secret is created/deleted, so a deletion changes the target set and
@@ -969,7 +1001,6 @@ impl ReconcileCtx {
                         email: email.clone(),
                         secret_ns,
                         secret_name: r.name.clone(),
-                        attached_routes,
                         has_cert,
                     });
                 }
@@ -1002,13 +1033,12 @@ impl ReconcileCtx {
     /// its apiVersion+kind so the patch is a self-contained Server-Side Apply
     /// document (see [`Self::patch_status`]).
     async fn apply_patch(&self, p: StatusPatch) -> Result<()> {
-        let ns = p.ns.as_deref();
         match p.target {
-            PatchTarget::GatewayClass => self.patch_status::<GatewayClass>(ns, &p.name, p.json).await,
-            PatchTarget::Gateway => self.patch_status::<Gateway>(ns, &p.name, p.json).await,
-            PatchTarget::HttpRoute => self.patch_status::<HTTPRoute>(ns, &p.name, p.json).await,
-            PatchTarget::TlsRoute => self.patch_status::<TLSRoute>(ns, &p.name, p.json).await,
-            PatchTarget::BackendTlsPolicy => self.patch_status::<BackendTLSPolicy>(ns, &p.name, p.json).await,
+            PatchTarget::GatewayClass => self.patch_status::<GatewayClass>(p).await,
+            PatchTarget::Gateway => self.patch_status::<Gateway>(p).await,
+            PatchTarget::HttpRoute => self.patch_status::<HTTPRoute>(p).await,
+            PatchTarget::TlsRoute => self.patch_status::<TLSRoute>(p).await,
+            PatchTarget::BackendTlsPolicy => self.patch_status::<BackendTLSPolicy>(p).await,
         }
     }
 
@@ -1093,7 +1123,7 @@ impl ReconcileCtx {
             .collect()
     }
 
-    fn gatewayclass_patch(&self, gc: &GatewayClass) -> StatusPatch {
+    fn gatewayclass_patch(&self, gc: &GatewayClass) -> Option<StatusPatch> {
         let generation = gc.meta().generation.unwrap_or(0);
         let status = GatewayClassStatus {
             conditions: Some(vec![condition("Accepted", "True", "Accepted", "", generation)]),
@@ -1104,12 +1134,12 @@ impl ReconcileCtx {
                     .collect(),
             ),
         };
-        StatusPatch {
-            target: PatchTarget::GatewayClass,
-            ns: None,
-            name: gc.name_any(),
-            json: serde_json::json!({ "status": status }),
-        }
+        status_patch(
+            PatchTarget::GatewayClass,
+            gc.meta(),
+            json_of(&gc.status),
+            json_of(&status),
+        )
     }
 
     /// STAGE 1: build the per-Gateway compute model — usability + per-listener
@@ -1307,7 +1337,12 @@ impl ReconcileCtx {
 
     /// STAGE 3: derive a Gateway's status from its computed model + attachment
     /// counts. Conditions come from `ListenerOutcome` DATA, never from conditions.
-    fn gateway_patch(&self, model: &GatewayModel, attach_counts: &AttachCounts) -> StatusPatch {
+    fn gateway_patch(
+        &self,
+        model: &GatewayModel,
+        attach_counts: &AttachCounts,
+        acme_reports: &crate::acme::AcmeReports,
+    ) -> Option<StatusPatch> {
         let gw = &model.gw;
         let generation = model.generation;
         let ns = gw.namespace().unwrap_or_default();
@@ -1361,14 +1396,23 @@ impl ReconcileCtx {
                         })
                         .collect()
                 };
-                // The three standard conditions. The ACME subsystem separately owns
-                // the `torii.dirba.io/ACMEIssued` listener condition via its own SSA
-                // field manager (merged by condition type), so we never touch it.
+                // The three standard conditions, and for a listener ACME issues for,
+                // `torii.dirba.io/ACMEIssued` as the ACME task last reported it.
+                let mut conditions = vec![accepted, programmed, resolved];
+                if let Some(r) = acme_reports.get(&(ns.clone(), gw.name_any(), o.name.clone())) {
+                    conditions.push(condition(
+                        crate::acme::COND_ACME,
+                        r.status,
+                        r.reason,
+                        &r.message,
+                        r.generation,
+                    ));
+                }
                 GatewayStatusListeners {
                     name: o.name.clone(),
                     attached_routes,
                     supported_kinds: Some(supported_kinds),
-                    conditions: vec![accepted, programmed, resolved],
+                    conditions,
                 }
             })
             .collect();
@@ -1425,12 +1469,7 @@ impl ReconcileCtx {
             listeners: Some(listeners),
             attached_listener_sets: None,
         };
-        StatusPatch {
-            target: PatchTarget::Gateway,
-            ns: Some(ns),
-            name: gw.name_any(),
-            json: serde_json::json!({ "status": status }),
-        }
+        status_patch(PatchTarget::Gateway, gw.meta(), json_of(&gw.status), json_of(&status))
     }
 
     /// Is a cross-namespace reference permitted by a ReferenceGrant in the target
@@ -1617,17 +1656,16 @@ impl ReconcileCtx {
             });
         }
 
-        if parents.is_empty() {
-            return None; // nothing of ours to claim
-        }
-
-        let status = HttpRouteStatus { parents };
-        Some(StatusPatch {
-            target: PatchTarget::HttpRoute,
-            ns: Some(route_ns),
-            name: route.name_any(),
-            json: serde_json::json!({ "status": status }),
-        })
+        // Other controllers' parents stay; torii's that it no longer has go.
+        let parents = parents.iter().map(json_of).collect();
+        list_status_patch(
+            PatchTarget::HttpRoute,
+            route.meta(),
+            json_of(&route.status),
+            "parents",
+            "parentRef",
+            parents,
+        )
     }
 
     /// Build an HTTPRoute's rules as the data plane runs them: each rule's backends
@@ -1918,16 +1956,15 @@ impl ReconcileCtx {
             });
         }
 
-        if parents.is_empty() {
-            return None;
-        }
-        let status = TlsRouteStatus { parents };
-        Some(StatusPatch {
-            target: PatchTarget::TlsRoute,
-            ns: Some(route_ns),
-            name: route.name_any(),
-            json: serde_json::json!({ "status": status }),
-        })
+        let parents = parents.iter().map(json_of).collect();
+        list_status_patch(
+            PatchTarget::TlsRoute,
+            route.meta(),
+            json_of(&route.status),
+            "parents",
+            "parentRef",
+            parents,
+        )
     }
 
     /// Resolve a TLSRoute's backends across all its rules, noting each backendRef
@@ -2367,16 +2404,15 @@ impl ReconcileCtx {
                     conditions: vec![accepted.clone(), resolved.clone()],
                 })
                 .collect();
-            if ancestors.is_empty() {
-                continue; // no ancestor → don't claim status
-            }
-            let status = BackendTlsPolicyStatus { ancestors };
-            patches.push(StatusPatch {
-                target: PatchTarget::BackendTlsPolicy,
-                ns: Some(pol_ns),
-                name: policy.name_any(),
-                json: serde_json::json!({ "status": status }),
-            });
+            // Other controllers' ancestors stay; torii's that it no longer has go.
+            patches.extend(list_status_patch(
+                PatchTarget::BackendTlsPolicy,
+                policy.meta(),
+                json_of(&policy.status),
+                "ancestors",
+                "ancestorRef",
+                ancestors.iter().map(json_of).collect(),
+            ));
         }
         patches
     }
@@ -2546,33 +2582,44 @@ impl ReconcileCtx {
     /// document (apiVersion/kind/metadata.name) as SSA requires. The API server
     /// answers with the whole object, read as a `DynamicObject`: a route that
     /// torii keeps as a stand-in does not decode into `K` (see [`route_stand_in`]).
-    async fn patch_status<K>(&self, ns: Option<&str>, name: &str, json: serde_json::Value) -> Result<()>
+    async fn patch_status<K>(&self, p: StatusPatch) -> Result<()>
     where
         K: Resource<DynamicType = ()>,
     {
         let resource = ApiResource::erase::<K>(&());
-        let api: Api<DynamicObject> = match ns {
+        let api: Api<DynamicObject> = match &p.ns {
             Some(ns) => Api::namespaced_with(self.client.clone(), ns, &resource),
             None => Api::all_with(self.client.clone(), &resource),
         };
         let mut doc = serde_json::json!({
             "apiVersion": resource.api_version,
             "kind": resource.kind,
-            "metadata": { "name": name },
+            "metadata": { "name": p.name },
         });
+        // A precondition: the API server refuses the write if the object changed.
+        if let Some(version) = &p.resource_version {
+            doc["metadata"]["resourceVersion"] = version.clone().into();
+        }
         // Merge the computed `{"status": ...}` into the apply document.
-        if let (Some(obj), Some(extra)) = (doc.as_object_mut(), json.as_object()) {
+        if let (Some(obj), Some(extra)) = (doc.as_object_mut(), p.json.as_object()) {
             for (k, v) in extra {
                 obj.insert(k.clone(), v.clone());
             }
         }
-        let pp = PatchParams::apply(FIELD_MANAGER).force();
+        let pp = PatchParams::apply(&p.manager).force();
+        let name = &p.name;
         match api.patch_status(name, &pp, &Patch::Apply(&doc)).await {
             Ok(_) => Ok(()),
             // The object was deleted between our cache snapshot and this write —
             // there's nothing to update. Don't abort the whole reconcile pass.
             Err(kube::Error::Api(ae)) if ae.code == 404 => {
                 tracing::debug!(name, "status target gone (404), skipping");
+                Ok(())
+            }
+            // Someone wrote the object since the pass read it: that write's event
+            // starts a new pass, which writes from the newer version.
+            Err(kube::Error::Api(ae)) if ae.code == 409 => {
+                tracing::debug!(name, "status target changed meanwhile (409), skipping");
                 Ok(())
             }
             Err(e) => Err(e.into()),
@@ -3274,6 +3321,134 @@ where
     store.get(&reflector::ObjectRef::new(name).within(ns))
 }
 
+/// The field managers the ACME task wrote listener conditions under, one per
+/// listener: `torii-acme.<listener>`.
+const LEGACY_ACME_MANAGERS: &str = "torii-acme.";
+
+/// `value` as JSON (null for None).
+fn json_of(value: &impl Serialize) -> serde_json::Value {
+    serde_json::to_value(value).unwrap_or_default()
+}
+
+/// The write that gives an object the status `desired`, computed from spec, with
+/// each condition's lastTransitionTime carried over from `cached` (the status the
+/// object has, as the store holds it) while the condition's status is the same
+/// (see [`carry_transition_times`]). None when the object has that status already:
+/// a pass writes only what changed.
+fn status_patch(
+    target: PatchTarget,
+    meta: &ObjectMeta,
+    cached: serde_json::Value,
+    mut desired: serde_json::Value,
+) -> Option<StatusPatch> {
+    let now = json_of(&Time(
+        k8s_openapi::jiff::Timestamp::now()
+            .round(k8s_openapi::jiff::Unit::Second)
+            .ok()?,
+    ));
+    carry_transition_times(&mut desired, &cached, &now);
+    if desired == cached {
+        return None;
+    }
+    Some(StatusPatch {
+        target,
+        ns: meta.namespace.clone(),
+        name: meta.name.clone().unwrap_or_default(),
+        json: serde_json::json!({ "status": desired }),
+        manager: FIELD_MANAGER.to_string(),
+        resource_version: None,
+    })
+}
+
+/// The write that makes the list `field` of an object's status (a route's
+/// `parents`, a policy's `ancestors`) hold `ours` as torii's entries. Several
+/// controllers write these lists, each the entries with its controllerName, but
+/// they are atomic: an apply replaces one whole. So torii writes the cached list
+/// with its own entries replaced in place (matched by `key`), the others' kept as
+/// they are, and its entries for parents it no longer has gone: the spec's
+/// read-modify-write that updates only torii's entries, and cleans them up. The
+/// write carries the cached resourceVersion, so that it cannot undo another
+/// controller's write since; that write's event starts a new pass. None when
+/// there is nothing to change.
+fn list_status_patch(
+    target: PatchTarget,
+    meta: &ObjectMeta,
+    cached: serde_json::Value,
+    field: &str,
+    key: &str,
+    ours: Vec<serde_json::Value>,
+) -> Option<StatusPatch> {
+    let cached = cached
+        .get(field)
+        .and_then(|l| l.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let mut ours: Vec<Option<serde_json::Value>> = ours.into_iter().map(Some).collect();
+    let mut list = Vec::new();
+    for entry in &cached {
+        if entry["controllerName"] != CONTROLLER_NAME {
+            list.push(entry.clone());
+        } else if let Some(new) = ours
+            .iter_mut()
+            .find(|o| o.as_ref().is_some_and(|o| o[key] == entry[key]))
+        {
+            list.extend(new.take());
+        }
+    }
+    list.extend(ours.into_iter().flatten());
+    let mut patch = status_patch(
+        target,
+        meta,
+        serde_json::json!({ field: cached }),
+        serde_json::json!({ field: list }),
+    )?;
+    patch.resource_version = meta.resource_version.clone();
+    Some(patch)
+}
+
+/// Give each condition in `new` (a status torii computed) the lastTransitionTime
+/// of the same condition in `old` (the status the object has) if their status is
+/// the same, else `now`: the time a condition last changed status. A condition is
+/// the same by type, in the list entry that is the same by the fields that
+/// identify it: a listener's name, a route parent's parentRef and controllerName,
+/// a policy ancestor's ancestorRef and controllerName. An old time in 1970 is the
+/// placeholder that torii once wrote, and counts as unknown.
+fn carry_transition_times(new: &mut serde_json::Value, old: &serde_json::Value, now: &serde_json::Value) {
+    use serde_json::Value;
+    match new {
+        Value::Object(fields) => {
+            for (name, value) in fields.iter_mut() {
+                let old = old.get(name).unwrap_or(&Value::Null);
+                if name != "conditions" {
+                    carry_transition_times(value, old, now);
+                    continue;
+                }
+                for c in value.as_array_mut().into_iter().flatten() {
+                    let same = old.as_array().into_iter().flatten().find(|o| o["type"] == c["type"]);
+                    c["lastTransitionTime"] = match same {
+                        Some(o) if o["status"] == c["status"] && o["lastTransitionTime"] != "1970-01-01T00:00:00Z" => {
+                            o["lastTransitionTime"].clone()
+                        }
+                        _ => now.clone(),
+                    };
+                }
+            }
+        }
+        Value::Array(entries) => {
+            for entry in entries {
+                let same = |o: &&Value| {
+                    ["name", "parentRef", "ancestorRef", "controllerName"]
+                        .iter()
+                        .all(|k| entry.get(k) == o.get(k))
+                };
+                let old = old.as_array().into_iter().flatten().find(same).unwrap_or(&Value::Null);
+                carry_transition_times(entry, old, now);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// The longest condition message torii writes, in bytes. The API server refuses
 /// a whole status with a message over 32768, and some are built from what users
 /// wrote (a regex, the list of a route's broken backendRefs).
@@ -3299,15 +3474,17 @@ fn condition(type_: &str, status: &str, reason: &str, message: &str, observed_ge
         reason: reason.to_string(),
         message,
         observed_generation: Some(observed_generation),
-        // A fixed timestamp is fine; the suite never inspects it. A stable value
-        // keeps the merge patch deterministic (avoids needless status churn).
-        // k8s-openapi 0.27 uses jiff (not chrono) for Time.
+        // A placeholder: the status write gives each condition the time it last
+        // changed status (see `carry_transition_times`).
         last_transition_time: Time(k8s_openapi::jiff::Timestamp::UNIX_EPOCH),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use gateway_api::apis::standard::backendtlspolicies::BackendTlsPolicyStatus;
+    use gateway_api::apis::standard::httproutes::HttpRouteStatus;
+
     use super::*;
 
     #[test]
@@ -3549,6 +3726,13 @@ mod tests {
         }
     }
 
+    /// The status a pass computes for `gw`, with these attachedRoutes counts.
+    fn gateway_status(ctx: &ReconcileCtx, gw: &Gateway, counts: &AttachCounts) -> GatewayStatus {
+        let model = ctx.build_gateway_model(gw);
+        let mut patch = ctx.gateway_patch(&model, counts, &HashMap::new()).unwrap();
+        serde_json::from_value(patch.json["status"].take()).unwrap()
+    }
+
     /// The metadata of a Secret or ConfigMap in the store, at version "1".
     fn meta_of<K>(ns: &str, name: &str) -> PartialObjectMeta<K> {
         use kube::core::PartialObjectMetaExt;
@@ -3659,8 +3843,7 @@ mod tests {
         assert!(snapshot.certs.select(Some("c.example")).is_none());
 
         // Reported: the others are not accepted, so neither is the whole Gateway.
-        let mut patch = ctx.gateway_patch(&ctx.build_gateway_model(&gw), &BTreeMap::new());
-        let status: GatewayStatus = serde_json::from_value(patch.json["status"].take()).unwrap();
+        let status = gateway_status(&ctx, &gw, &BTreeMap::new());
         let listener = |name: &str| {
             let listeners = status.listeners.as_deref().unwrap();
             reasons(&listeners.iter().find(|l| l.name == name).unwrap().conditions)
@@ -3868,8 +4051,7 @@ mod tests {
         assert!(table.entries.is_empty());
         assert_eq!(counts[&("ns".to_string(), "gw".to_string())]["http"], 0);
 
-        let mut patch = ctx.gateway_patch(&ctx.build_gateway_model(&gw), &counts);
-        let status: GatewayStatus = serde_json::from_value(patch.json["status"].take()).unwrap();
+        let status = gateway_status(&ctx, &gw, &counts);
         assert_eq!(status.addresses, None);
         let listener = &status.listeners.unwrap()[0];
         assert_eq!(reasons(&listener.conditions)[1], "Programmed=False/Invalid");
@@ -4105,6 +4287,70 @@ mod tests {
         assert_eq!(summary("b-new")[0].1[0], "Accepted=False/Conflicted");
     }
 
+    // Route parents (and policy ancestors) are written by several controllers,
+    // each its own entries, in a list that an apply replaces whole: torii keeps
+    // the others' entries, replaces its own in place, withdraws those it no longer
+    // has (T068, T162), and writes nothing when nothing changed. A condition keeps
+    // its lastTransitionTime while its status does not change (T153).
+    #[test]
+    fn route_parents_are_merged_with_other_controllers() {
+        let parent = |gw: &str, controller: &str, status: &str, time: &str| {
+            serde_json::json!({
+                "parentRef": { "name": gw },
+                "controllerName": controller,
+                "conditions": [{ "type": "Accepted", "status": status, "reason": "R", "message": "",
+                    "observedGeneration": 1, "lastTransitionTime": time }],
+            })
+        };
+        let placeholder = "1970-01-01T00:00:00Z";
+        let then = "2026-01-01T00:00:00Z";
+        let meta = ObjectMeta {
+            name: Some("r".into()),
+            namespace: Some("ns".into()),
+            resource_version: Some("7".into()),
+            ..Default::default()
+        };
+        let cached = serde_json::json!({ "parents": [
+            parent("other-gw", "example.com/other", "True", then),
+            parent("gw", CONTROLLER_NAME, "True", then),
+            parent("gone", CONTROLLER_NAME, "True", then),
+        ] });
+        let patch = |ours: Vec<serde_json::Value>| {
+            list_status_patch(
+                PatchTarget::HttpRoute,
+                &meta,
+                cached.clone(),
+                "parents",
+                "parentRef",
+                ours,
+            )
+        };
+
+        // Unchanged: no write, the other controller's entry and the times kept.
+        let ours = vec![
+            parent("gw", CONTROLLER_NAME, "True", placeholder),
+            parent("gone", CONTROLLER_NAME, "True", placeholder),
+        ];
+        assert!(patch(ours).is_none());
+
+        // `gone` withdrawn, `gw` changed status: a new time, written over version 7.
+        let p = patch(vec![parent("gw", CONTROLLER_NAME, "False", placeholder)]).unwrap();
+        assert_eq!(p.resource_version.as_deref(), Some("7"));
+        let parents = p.json["status"]["parents"].as_array().unwrap();
+        assert_eq!(parents.len(), 2);
+        assert_eq!(parents[0], cached["parents"][0]);
+        let time = parents[1]["conditions"][0]["lastTransitionTime"].as_str().unwrap();
+        assert!(time != then && time != placeholder, "{time}");
+
+        // No parent of torii's left: only the other controller's entry stays.
+        let p = patch(vec![]).unwrap();
+        assert_eq!(p.json["status"]["parents"], serde_json::json!([cached["parents"][0]]));
+
+        // Nothing of torii's, before or now: nothing to write.
+        let foreign = serde_json::json!({ "parents": [cached["parents"][0]] });
+        assert!(list_status_patch(PatchTarget::HttpRoute, &meta, foreign, "parents", "parentRef", vec![]).is_none());
+    }
+
     // A parent named twice (namespace left out, then set to the route's) is one
     // parent: one status entry, counted and programmed once (T163). A parentRef
     // to a Service or another kind is not a Gateway of the same name (T142).
@@ -4195,8 +4441,7 @@ mod tests {
             .collect();
         assert_eq!(listeners, [(80, None)]);
 
-        let mut patch = ctx.gateway_patch(&ctx.build_gateway_model(&gw), &BTreeMap::new());
-        let status: GatewayStatus = serde_json::from_value(patch.json["status"].take()).unwrap();
+        let status = gateway_status(&ctx, &gw, &BTreeMap::new());
         let listener = |name: &str| {
             let listeners = status.listeners.as_deref().unwrap();
             reasons(&listeners.iter().find(|l| l.name == name).unwrap().conditions)[..2].to_vec()
