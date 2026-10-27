@@ -534,38 +534,46 @@ struct GatewayModel {
     listeners: Vec<ListenerOutcome>,
 }
 
-/// The result of validating one BackendTLSPolicy's CA bundle. Distinguishes the
-/// two failure reasons the conformance suite checks.
-enum CaResult {
-    /// Valid CA PEM (empty = wellKnownCACertificates=System → system roots).
-    Valid(Vec<u8>),
-    /// A CACertificateRef has a non-ConfigMap group/kind → ResolvedRefs/InvalidKind.
-    InvalidKind,
-    /// Missing / wrong-key / unparseable CA, or no CA at all →
-    /// ResolvedRefs/InvalidCACertificateRef.
-    InvalidRef,
+/// A BackendTLSPolicy's CA bundle, from its CA references that resolve, and why
+/// each of the others does not.
+struct CaBundle {
+    /// The PEM of the CAs (empty = wellKnownCACertificates: the system roots), or
+    /// None when no reference resolves.
+    pem: Option<Vec<u8>>,
+    /// Each reference that does not resolve: InvalidKind for a kind other than
+    /// ConfigMap, InvalidCACertificateRef for a missing or malformed CA.
+    broken: Vec<Failure>,
 }
 
-/// The status a BackendTLSPolicy should report (drives its Accepted + ResolvedRefs).
-enum PolicyStatus {
-    /// Accepted=True, ResolvedRefs=True.
-    Accepted,
-    /// Lost a conflict for a target it would otherwise win → Accepted=False/Conflicted
-    /// (refs are valid, so ResolvedRefs stays True).
-    Conflicted,
-    /// Accepted=False/NoValidCACertificate, ResolvedRefs=False/InvalidKind.
-    InvalidKind,
-    /// Accepted=False/NoValidCACertificate, ResolvedRefs=False/InvalidCACertificateRef.
-    InvalidCaRef,
+impl CaBundle {
+    /// The policy's ResolvedRefs failure: every broken reference, InvalidKind
+    /// first.
+    fn refs_failure(&self) -> Option<Failure> {
+        let reason = ["InvalidKind", "InvalidCACertificateRef"]
+            .into_iter()
+            .find(|reason| self.broken.iter().any(|(r, _)| r == reason))?;
+        let msg: Vec<&str> = self.broken.iter().map(|(_, m)| m.as_str()).collect();
+        Some((reason, msg.join("; ")))
+    }
 }
 
-/// Per-policy status outcome (status side). The usable artifact (re-encrypt or
-/// "invalid → 5xx") lives in the [`UpstreamTlsMap`], keyed by target Service.
+/// Per-policy status outcome (status side): why the policy is not accepted, and
+/// why its references do not resolve (None: True). The usable artifact
+/// (re-encrypt or "invalid → 5xx") lives in the [`UpstreamTlsMap`], keyed by
+/// target Service.
 struct PolicyOutcome {
-    status: PolicyStatus,
-    /// Human-readable detail for a False condition (empty when Accepted).
-    message: String,
+    not_accepted: Option<Failure>,
+    refs_failure: Option<Failure>,
 }
+
+/// The Gateways each Service is used through: (namespace, Service name) →
+/// (namespace, name) of each Gateway that accepts a route whose backendRef to the
+/// Service resolves. These are the ancestors of the Service's BackendTLSPolicies.
+type PolicyAncestors = HashMap<(String, String), BTreeSet<(String, String)>>;
+
+/// At most this many ancestors in a BackendTLSPolicy's status (the CRD's limit;
+/// the API server refuses a status with more).
+const MAX_ANCESTORS: usize = 16;
 
 /// (service-namespace, service-name, service-port) → backend TLS mode for the data
 /// plane. Keyed by Service PORT (not just Service) because a BackendTLSPolicy's
@@ -632,6 +640,9 @@ struct RouteRules {
     dropped: Vec<String>,
     /// The backendRefs that did not resolve, for the route's ResolvedRefs.
     broken_refs: BrokenRefs,
+    /// The Services its implemented rules' backendRefs resolve to, as (namespace,
+    /// name), for the ancestors of their BackendTLSPolicies.
+    services: BTreeSet<(String, String)>,
 }
 
 impl RouteRules {
@@ -707,6 +718,14 @@ impl NotAttached {
             ),
         )
     }
+}
+
+/// A TLSRoute's backends, shared by all its SNIs, what they report in its
+/// ResolvedRefs, and the Services they are (see [`RouteRules::services`]).
+struct TlsRouteBackends {
+    backends: Arc<TlsBackends>,
+    broken_refs: BrokenRefs,
+    services: BTreeSet<(String, String)>,
 }
 
 /// A route's backendRef, of either route kind.
@@ -804,7 +823,6 @@ impl ReconcileCtx {
         // ── Stage 2b: routes → RouteTable, parent status, attachment counts ──
         // Attachment is computed ONCE per (route, gateway, parentRef) and feeds
         // both the data plane and the per-listener attachedRoutes counts.
-        let usable_gateways: Vec<Arc<Gateway>> = models.iter().filter(|m| m.usable).map(|m| m.gw.clone()).collect();
         let mut route_table = RouteTable::default();
         // Every HTTP(S) listener torii serves takes the requests for its hostname
         // on its port, also before (or without) any route: listener isolation.
@@ -817,13 +835,18 @@ impl ReconcileCtx {
         }
         let mut tls_table = crate::tls_table::TlsTable::default();
         let mut backends = BackendIndex::new(self.stores.endpoint_slices.state(), upstream_tls);
-        // (gw_ns, gw_name) → (listener_name → count).
-        let mut attach_counts: AttachCounts = BTreeMap::new();
+        let mut attach_counts = AttachCounts::new();
+        let mut ancestors = PolicyAncestors::new();
         for route in &routes {
-            if let Some(patch) = self.process_route(route, &models, &mut backends, &mut route_table, &mut attach_counts)
-            {
-                patches.push(patch);
-            }
+            let patch = self.process_route(
+                route,
+                &models,
+                &mut backends,
+                &mut route_table,
+                &mut attach_counts,
+                &mut ancestors,
+            );
+            patches.extend(patch);
         }
 
         // ── Stage 2c: TLSRoutes → TlsTable (SNI dispatch), parent status, counts.
@@ -831,20 +854,24 @@ impl ReconcileCtx {
         // (passthrough / terminate-then-TCP) data path, not HTTP entries.
         let tls_routes: Vec<Arc<TLSRoute>> = self.stores.tls_routes.state();
         for route in &tls_routes {
-            if let Some(patch) =
-                self.process_tls_route(route, &models, &mut backends, &mut tls_table, &mut attach_counts)
-            {
-                patches.push(patch);
-            }
+            let patch = self.process_tls_route(
+                route,
+                &models,
+                &mut backends,
+                &mut tls_table,
+                &mut attach_counts,
+                &mut ancestors,
+            );
+            patches.extend(patch);
         }
 
         // ── Stage 3: derive Gateway + Policy status from the computed data ──
         for model in &models {
             patches.push(self.gateway_patch(model, &attach_counts));
         }
-        // Policy ancestors are only usable Gateways (a rejected Gateway isn't an
-        // ancestor), matching the route-attachment gating above.
-        patches.extend(self.policy_patches(&usable_gateways, &routes, &tls_routes, &policy_outcomes));
+        // Policy ancestors: the Gateways that accept routes to their Services (a
+        // rejected Gateway accepts none).
+        patches.extend(self.policy_patches(&ancestors, &policy_outcomes));
 
         // ── Publish the data plane FIRST (convergence shouldn't wait on the API
         //    server), then flush all status writes concurrently. Route table and
@@ -1445,6 +1472,7 @@ impl ReconcileCtx {
         backends: &mut BackendIndex,
         table: &mut RouteTable,
         attach_counts: &mut AttachCounts,
+        ancestors: &mut PolicyAncestors,
     ) -> Option<StatusPatch> {
         let generation = route.meta().generation.unwrap_or(0);
         let route_ns = route.namespace().unwrap_or_default();
@@ -1508,6 +1536,16 @@ impl ReconcileCtx {
             if rejection.is_none() {
                 for l in &attached_listeners {
                     *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
+                }
+            }
+            // The Gateway accepts the route: the Services it sends to are used
+            // through it.
+            if accept_reason.is_none() && rejection.is_none() {
+                for svc in &rules.services {
+                    ancestors
+                        .entry(svc.clone())
+                        .or_default()
+                        .insert((parent_ns.clone(), gw.name_any()));
                 }
             }
 
@@ -1612,6 +1650,7 @@ impl ReconcileCtx {
             implemented: 0,
             dropped: Vec::new(),
             broken_refs: BrokenRefs::default(),
+            services: BTreeSet::new(),
         };
         if out.rejected.is_some() {
             return out;
@@ -1641,6 +1680,7 @@ impl ReconcileCtx {
             }
             // Resolve the rule's backends, noting each one that does not resolve.
             let mut rule_backends = Vec::new();
+            let mut services = Vec::new();
             for (ref_idx, backend_ref) in rule.backend_refs.iter().flatten().enumerate() {
                 let at = format!("rules[{rule_order}].backendRefs[{ref_idx}]");
                 let backend = BackendRef {
@@ -1667,6 +1707,7 @@ impl ReconcileCtx {
                             endpoints,
                             filters: backend_filters_from(backend_ref.filters.as_deref().unwrap_or_default()),
                         });
+                        services.push((ns, backend.name.to_string()));
                     }
                     // Not resolved: no endpoints → 500 at the data plane.
                     Err((reason, why)) => out.broken_refs.add(reason, format!("{at}: {why}")),
@@ -1674,6 +1715,7 @@ impl ReconcileCtx {
             }
 
             out.implemented += 1;
+            out.services.extend(services);
             out.rules.push(RouteRule {
                 order: rule_order,
                 rule: Arc::new(Rule {
@@ -1770,6 +1812,7 @@ impl ReconcileCtx {
         backends: &mut BackendIndex,
         tls_table: &mut TlsTable,
         attach_counts: &mut AttachCounts,
+        ancestors: &mut PolicyAncestors,
     ) -> Option<StatusPatch> {
         let generation = route.meta().generation.unwrap_or(0);
         let route_ns = route.namespace().unwrap_or_default();
@@ -1785,7 +1828,7 @@ impl ReconcileCtx {
 
         // The backends of all the rules, shared by every matched SNI of every
         // parent: built once, for the first parent we own.
-        let mut route_backends: Option<(Arc<TlsBackends>, BrokenRefs)> = None;
+        let mut route_backends: Option<TlsRouteBackends> = None;
         let mut parents: Vec<TlsRouteStatusParents> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut attached_to = std::collections::HashSet::new();
@@ -1834,8 +1877,15 @@ impl ReconcileCtx {
                 (None, None) => condition("Accepted", "True", "Accepted", "", generation),
             };
 
-            let (route_backends, broken_refs) =
-                route_backends.get_or_insert_with(|| self.tls_route_backends(route, backends));
+            let route_backends = route_backends.get_or_insert_with(|| self.tls_route_backends(route, backends));
+            if accept_reason.is_none() && rejected.is_none() {
+                for svc in &route_backends.services {
+                    ancestors
+                        .entry(svc.clone())
+                        .or_default()
+                        .insert((parent_ns.clone(), gw.name_any()));
+                }
+            }
 
             // For each attached listener, add its effective SNIs to the dispatch
             // table with the listener's mode (Passthrough vs Terminate). A rejected
@@ -1843,8 +1893,8 @@ impl ReconcileCtx {
             if rejected.is_none() {
                 for (l, mode) in &attached {
                     let action = match mode {
-                        TlsListenerMode::Passthrough => TlsAction::Passthrough(route_backends.clone()),
-                        TlsListenerMode::Terminate => TlsAction::Terminate(route_backends.clone()),
+                        TlsListenerMode::Passthrough => TlsAction::Passthrough(route_backends.backends.clone()),
+                        TlsListenerMode::Terminate => TlsAction::Terminate(route_backends.backends.clone()),
                     };
                     for sni in effective_hostnames(route_hostnames, l.hostname.as_deref()) {
                         tls_table.insert(l.port as u16, &sni, action.clone());
@@ -1852,7 +1902,7 @@ impl ReconcileCtx {
                 }
             }
 
-            let resolved = broken_refs.condition(generation);
+            let resolved = route_backends.broken_refs.condition(generation);
 
             parents.push(TlsRouteStatusParents {
                 parent_ref: TlsRouteStatusParentsParentRef {
@@ -1882,9 +1932,10 @@ impl ReconcileCtx {
 
     /// Resolve a TLSRoute's backends across all its rules, noting each backendRef
     /// that does not resolve.
-    fn tls_route_backends(&self, route: &TLSRoute, backends: &mut BackendIndex) -> (Arc<TlsBackends>, BrokenRefs) {
+    fn tls_route_backends(&self, route: &TLSRoute, backends: &mut BackendIndex) -> TlsRouteBackends {
         let route_ns = route.namespace().unwrap_or_default();
         let mut broken_refs = BrokenRefs::default();
+        let mut services = BTreeSet::new();
         let mut out = TlsBackends::default();
         for (rule_idx, rule) in route.spec.rules.iter().enumerate() {
             for (ref_idx, backend_ref) in rule.backend_refs.iter().enumerate() {
@@ -1899,17 +1950,24 @@ impl ReconcileCtx {
                 // PORT, as for an HTTPRoute. Only a Terminate listener uses it:
                 // Passthrough forwards the client's own TLS.
                 match self.resolve_backend(backends, "TLSRoute", &route_ns, &backend) {
-                    Ok((_, endpoints)) => out.backends.push(TlsBackend {
-                        weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
-                        endpoints,
-                    }),
+                    Ok((ns, endpoints)) => {
+                        out.backends.push(TlsBackend {
+                            weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
+                            endpoints,
+                        });
+                        services.insert((ns, backend_ref.name.clone()));
+                    }
                     Err((reason, why)) => {
                         broken_refs.add(reason, format!("rules[{rule_idx}].backendRefs[{ref_idx}]: {why}"));
                     }
                 }
             }
         }
-        (Arc::new(out), broken_refs)
+        TlsRouteBackends {
+            backends: Arc::new(out),
+            broken_refs,
+            services,
+        }
     }
 
     /// Compute which of a Gateway's `protocol: TLS` listeners a TLSRoute attaches
@@ -2084,75 +2142,69 @@ impl ReconcileCtx {
                 .iter()
                 .find(|t| !t.group.is_empty() || t.kind != "Service")
             {
-                outcomes.insert(
-                    pol_key,
-                    PolicyOutcome {
-                        status: PolicyStatus::InvalidKind,
-                        message: format!(
-                            "targetRef {}/{} is not a core Service",
-                            if bad.group.is_empty() { "core" } else { &bad.group },
-                            bad.kind
-                        ),
-                    },
+                let msg = format!(
+                    "targetRef {}/{} {} is not a core Service",
+                    if bad.group.is_empty() { "core" } else { &bad.group },
+                    bad.kind,
+                    bad.name,
                 );
+                let outcome = PolicyOutcome {
+                    not_accepted: Some(("NoValidCACertificate", msg.clone())),
+                    refs_failure: Some(("InvalidKind", msg)),
+                };
+                outcomes.insert(pol_key, outcome);
                 continue;
             }
 
             let ca = self.resolve_policy_ca(policy, &pol_ns);
+            let refs_failure = ca.refs_failure();
 
-            // Invalid policies: emit the right ResolvedRefs reason, and mark every
-            // Service PORT they target as Invalid so the data plane 5xxes (no
-            // plaintext fallback) — but never overwrite a valid ReEncrypt artifact.
-            let ca_pem = match ca {
-                CaResult::Valid(pem) => pem,
-                CaResult::InvalidKind | CaResult::InvalidRef => {
-                    let (status, message) = match ca {
-                        CaResult::InvalidKind => (
-                            PolicyStatus::InvalidKind,
-                            "a caCertificateRef is not a core ConfigMap".to_string(),
-                        ),
-                        _ => (
-                            PolicyStatus::InvalidCaRef,
-                            "no valid CA certificate could be resolved".to_string(),
-                        ),
-                    };
-                    outcomes.insert(pol_key, PolicyOutcome { status, message });
-                    for t in &policy.spec.target_refs {
-                        if !t.group.is_empty() || t.kind != "Service" {
-                            continue;
-                        }
-                        for port in self.target_ports(&pol_ns, &t.name, &t.section_name) {
-                            artifacts
-                                .entry((pol_ns.clone(), t.name.clone(), port))
-                                .or_insert(BackendTls::Invalid);
-                        }
+            // No CA resolves: report it, and mark every Service PORT the policy
+            // targets as Invalid so the data plane 5xxes (no plaintext fallback) —
+            // but never overwrite a valid ReEncrypt artifact.
+            let Some(ca_pem) = ca.pem else {
+                let msg = refs_failure.as_ref().map(|(_, m)| m.as_str()).unwrap_or_default();
+                let outcome = PolicyOutcome {
+                    not_accepted: Some(("NoValidCACertificate", format!("no CA certificate resolves: {msg}"))),
+                    refs_failure,
+                };
+                outcomes.insert(pol_key, outcome);
+                for t in &policy.spec.target_refs {
+                    for port in self.target_ports(&pol_ns, &t.name, &t.section_name) {
+                        artifacts
+                            .entry((pol_ns.clone(), t.name.clone(), port))
+                            .or_insert(BackendTls::Invalid);
                     }
-                    continue;
                 }
+                continue;
             };
 
-            // Valid policy: claim each target section; first claimant wins, later
-            // claimants are Conflicted. A policy is Conflicted only if it loses
-            // every target it has (won_any wins).
+            // Valid policy: claim each target section; first claimant wins. A policy
+            // that loses any target is Conflicted (the spec: one that does not take
+            // precedence), and still applies to the targets it won.
             let upstream = Arc::new(crate::route_table::UpstreamTls {
                 hostname: policy.spec.validation.hostname.clone(),
                 ca_pem,
             });
-            let mut won_any = false;
-            let mut lost_any = false;
+            let mut lost = Vec::new();
             for t in &policy.spec.target_refs {
-                if !t.group.is_empty() || t.kind != "Service" {
-                    continue;
-                }
                 // Conflict key includes sectionName (per spec): two policies on the
                 // same Service with different/absent sections do NOT conflict.
                 let ckey = (pol_ns.clone(), t.name.clone(), t.section_name.clone());
-                if winners.contains_key(&ckey) {
-                    lost_any = true; // an earlier policy already owns this section
+                if let Some((winner_ns, winner)) = winners.get(&ckey) {
+                    let section = t
+                        .section_name
+                        .as_ref()
+                        .map(|s| format!(" port {s}"))
+                        .unwrap_or_default();
+                    lost.push(format!(
+                        "Service {pol_ns}/{}{section}: BackendTLSPolicy {winner_ns}/{winner} takes precedence (it is \
+                         older, or first by name)",
+                        t.name
+                    ));
                     continue;
                 }
                 winners.insert(ckey, pol_key.clone());
-                won_any = true;
                 // Data-plane map is keyed by Service PORT (sectionName → port name →
                 // number; absent section → all ports). Precedence per port: a
                 // section-specific policy beats a Service-wide one (and beats an
@@ -2170,15 +2222,11 @@ impl ReconcileCtx {
                     }
                 }
             }
-            let (status, message) = if lost_any && !won_any {
-                (
-                    PolicyStatus::Conflicted,
-                    "another BackendTLSPolicy already targets this Service section".to_string(),
-                )
-            } else {
-                (PolicyStatus::Accepted, String::new())
+            let outcome = PolicyOutcome {
+                not_accepted: (!lost.is_empty()).then(|| ("Conflicted", lost.join("; "))),
+                refs_failure,
             };
-            outcomes.insert(pol_key, PolicyOutcome { status, message });
+            outcomes.insert(pol_key, outcome);
         }
         (artifacts, outcomes)
     }
@@ -2201,113 +2249,124 @@ impl ReconcileCtx {
     }
 
     /// Resolve + validate a policy's CA bundle. The single CA validation path —
-    /// both the artifact and the status derive from its [`CaResult`], which
-    /// distinguishes a wrong-kind ref (InvalidKind) from a missing/malformed CA
-    /// (InvalidCACertificateRef).
-    fn resolve_policy_ca(&self, policy: &BackendTLSPolicy, pol_ns: &str) -> CaResult {
+    /// both the artifact and the status derive from its [`CaBundle`]: the CAs of
+    /// the references that resolve, and why each of the others does not.
+    fn resolve_policy_ca(&self, policy: &BackendTLSPolicy, pol_ns: &str) -> CaBundle {
         let v = &policy.spec.validation;
-        match &v.ca_certificate_refs {
-            None => {
-                // No explicit CA refs: valid only if it uses well-known CAs.
-                if v.well_known_ca_certificates.is_some() {
-                    CaResult::Valid(Vec::new()) // system roots
-                } else {
-                    CaResult::InvalidRef
+        let Some(refs) = &v.ca_certificate_refs else {
+            // No explicit CA refs: valid only if it uses well-known CAs.
+            return if v.well_known_ca_certificates.is_some() {
+                CaBundle {
+                    pem: Some(Vec::new()), // system roots
+                    broken: Vec::new(),
                 }
+            } else {
+                let msg = "neither caCertificateRefs nor wellKnownCACertificates is set".to_string();
+                CaBundle {
+                    pem: None,
+                    broken: vec![("InvalidCACertificateRef", msg)],
+                }
+            };
+        };
+        let mut pem = Vec::new();
+        let mut resolved = false;
+        let mut broken = Vec::new();
+        for (i, r) in refs.iter().enumerate() {
+            if !r.group.is_empty() || r.kind != "ConfigMap" {
+                let group = if r.group.is_empty() { "core" } else { &r.group };
+                let msg = format!(
+                    "caCertificateRefs[{i}]: {group}/{} {} is not a ConfigMap, the only kind torii reads CA \
+                     certificates from",
+                    r.kind, r.name
+                );
+                broken.push(("InvalidKind", msg));
+                continue;
             }
-            Some(refs) => {
-                let mut pem = Vec::new();
-                for r in refs {
-                    if !r.group.is_empty() || r.kind != "ConfigMap" {
-                        return CaResult::InvalidKind;
-                    }
-                    let Some(bytes) = self.load_configmap_ca(pol_ns, &r.name) else {
-                        return CaResult::InvalidRef;
-                    };
-                    if !ca_pem_is_valid(&bytes) {
-                        return CaResult::InvalidRef;
-                    }
+            match self.load_configmap_ca(pol_ns, &r.name) {
+                Err(why) => {
+                    let msg = format!("caCertificateRefs[{i}]: ConfigMap {pol_ns}/{} {why}", r.name);
+                    broken.push(("InvalidCACertificateRef", msg));
+                }
+                Ok(bytes) if !ca_pem_is_valid(&bytes) => {
+                    let msg = format!(
+                        "caCertificateRefs[{i}]: ca.crt of ConfigMap {pol_ns}/{} holds no PEM certificate",
+                        r.name
+                    );
+                    broken.push(("InvalidCACertificateRef", msg));
+                }
+                Ok(bytes) => {
                     pem.extend_from_slice(&bytes);
                     pem.push(b'\n');
+                    resolved = true;
                 }
-                CaResult::Valid(pem)
             }
+        }
+        CaBundle {
+            pem: resolved.then_some(pem),
+            broken,
         }
     }
 
-    /// STAGE 3: build each BackendTLSPolicy's status patch. Ancestors are derived
-    /// from raw route + gateway SPECS (never from route outcomes — that would make
-    /// policy status depend on route processing and create a cycle). The per-policy
+    /// STAGE 3: build each BackendTLSPolicy's status patch. Its ancestors are the
+    /// Gateways that route processing found its target Services used through
+    /// (`ancestors`): they accept a route whose backendRef to the Service resolves,
+    /// so is allowed by a ReferenceGrant where it crosses namespaces. Attachment
+    /// and grants depend on no policy, so this makes no cycle. The per-policy
     /// Accepted/ResolvedRefs come from the already-computed [`PolicyOutcome`].
     fn policy_patches(
         &self,
-        gateways: &[Arc<Gateway>],
-        routes: &[Arc<HTTPRoute>],
-        tls_routes: &[Arc<TLSRoute>],
+        ancestors: &PolicyAncestors,
         outcomes: &BTreeMap<(String, String), PolicyOutcome>,
     ) -> Vec<StatusPatch> {
         let mut patches = Vec::new();
         for policy in self.stores.backend_tls_policies.state() {
             let generation = policy.meta().generation.unwrap_or(0);
             let pol_ns = policy.namespace().unwrap_or_default();
-            let outcome = outcomes.get(&(pol_ns.clone(), policy.name_any()));
-            // The message explaining a False condition (empty when Accepted).
-            let msg = outcome.map(|o| o.message.as_str()).unwrap_or("");
-            // Map the computed PolicyStatus to its (ResolvedRefs, Accepted) pair.
-            let (resolved, accepted) = match outcome.map(|o| &o.status) {
-                Some(PolicyStatus::Accepted) => (
-                    condition("ResolvedRefs", "True", "ResolvedRefs", "", generation),
-                    condition("Accepted", "True", "Accepted", "", generation),
-                ),
-                Some(PolicyStatus::Conflicted) => (
-                    // Conflicted policies have valid refs → ResolvedRefs stays True.
-                    condition("ResolvedRefs", "True", "ResolvedRefs", "", generation),
-                    condition("Accepted", "False", "Conflicted", msg, generation),
-                ),
-                Some(PolicyStatus::InvalidKind) => (
-                    condition("ResolvedRefs", "False", "InvalidKind", msg, generation),
-                    condition("Accepted", "False", "NoValidCACertificate", msg, generation),
-                ),
-                // InvalidCaRef, or no outcome (shouldn't happen) → invalid-ref reason.
-                _ => (
-                    condition("ResolvedRefs", "False", "InvalidCACertificateRef", msg, generation),
-                    condition("Accepted", "False", "NoValidCACertificate", msg, generation),
-                ),
+            let Some(outcome) = outcomes.get(&(pol_ns.clone(), policy.name_any())) else {
+                continue;
+            };
+            let accepted = match &outcome.not_accepted {
+                None => condition("Accepted", "True", "Accepted", "", generation),
+                Some((reason, msg)) => condition("Accepted", "False", reason, msg, generation),
+            };
+            let resolved = match &outcome.refs_failure {
+                None => condition("ResolvedRefs", "True", "ResolvedRefs", "", generation),
+                Some((reason, msg)) => condition("ResolvedRefs", "False", reason, msg, generation),
             };
 
-            // Ancestors: Gateways that a route (HTTPRoute or TLSRoute) targeting this
-            // Service attaches to.
-            let target_svcs: Vec<String> = policy
+            // In (namespace, name) order, and no more than the CRD allows: GEP-713
+            // says to add no further entries once the list is full.
+            let gateways: BTreeSet<&(String, String)> = policy
                 .spec
                 .target_refs
                 .iter()
-                .filter(|t| t.group.is_empty() && t.kind == "Service")
-                .map(|t| t.name.clone())
+                .filter_map(|t| ancestors.get(&(pol_ns.clone(), t.name.clone())))
+                .flatten()
                 .collect();
-            let mut ancestors: Vec<BackendTlsPolicyStatusAncestors> = Vec::new();
-            for gw in gateways {
-                let gw_ns = gw.namespace().unwrap_or_default();
-                let routes_to_gw_target = routes.iter().any(|r| {
-                    route_has_parent(r, &gw.name_any(), &gw_ns) && route_targets_service_in(r, &target_svcs, &pol_ns)
-                }) || tls_routes.iter().any(|r| {
-                    tls_route_has_parent(r, &gw.name_any(), &gw_ns)
-                        && tls_route_targets_service_in(r, &target_svcs, &pol_ns)
-                });
-                if routes_to_gw_target {
-                    ancestors.push(BackendTlsPolicyStatusAncestors {
-                        ancestor_ref: BackendTlsPolicyStatusAncestorsAncestorRef {
-                            group: Some("gateway.networking.k8s.io".into()),
-                            kind: Some("Gateway".into()),
-                            name: gw.name_any(),
-                            namespace: Some(gw_ns),
-                            port: None,
-                            section_name: None,
-                        },
-                        controller_name: CONTROLLER_NAME.to_string(),
-                        conditions: vec![accepted.clone(), resolved.clone()],
-                    });
-                }
+            if gateways.len() > MAX_ANCESTORS {
+                tracing::warn!(
+                    namespace = pol_ns,
+                    name = policy.name_any(),
+                    ancestors = gateways.len(),
+                    "BackendTLSPolicy has more ancestors than its status can list; listing the first {MAX_ANCESTORS}"
+                );
             }
+            let ancestors: Vec<BackendTlsPolicyStatusAncestors> = gateways
+                .into_iter()
+                .take(MAX_ANCESTORS)
+                .map(|(gw_ns, gw_name)| BackendTlsPolicyStatusAncestors {
+                    ancestor_ref: BackendTlsPolicyStatusAncestorsAncestorRef {
+                        group: Some("gateway.networking.k8s.io".into()),
+                        kind: Some("Gateway".into()),
+                        name: gw_name.clone(),
+                        namespace: Some(gw_ns.clone()),
+                        port: None,
+                        section_name: None,
+                    },
+                    controller_name: CONTROLLER_NAME.to_string(),
+                    conditions: vec![accepted.clone(), resolved.clone()],
+                })
+                .collect();
             if ancestors.is_empty() {
                 continue; // no ancestor → don't claim status
             }
@@ -2322,10 +2381,14 @@ impl ReconcileCtx {
         patches
     }
 
-    /// A ConfigMap's CA bundle (ca.crt), as [`Self::fetch_referenced`] read it.
-    fn load_configmap_ca(&self, ns: &str, name: &str) -> Option<Arc<[u8]>> {
+    /// A ConfigMap's CA bundle (ca.crt), as [`Self::fetch_referenced`] read it, or
+    /// why there is none.
+    fn load_configmap_ca(&self, ns: &str, name: &str) -> Result<Arc<[u8]>, &'static str> {
         let config_maps = self.referenced.config_maps.lock().unwrap_or_else(|e| e.into_inner());
-        config_maps.get(&(ns.to_string(), name.to_string()))?.data.clone()
+        let fetched = config_maps
+            .get(&(ns.to_string(), name.to_string()))
+            .ok_or("was not found")?;
+        fetched.data.clone().ok_or("has no ca.crt")
     }
 
     /// The endpoints of Service port `ns/name:port`, with the port's BackendTLSPolicy
@@ -3126,51 +3189,6 @@ fn is_gateway_ref(group: Option<&str>, kind: Option<&str>) -> bool {
         && kind.unwrap_or("Gateway") == "Gateway"
 }
 
-/// Does an HTTPRoute have a parentRef pointing at the given Gateway (name + ns)?
-fn route_has_parent(route: &HTTPRoute, gw_name: &str, gw_ns: &str) -> bool {
-    let r_ns = route.namespace().unwrap_or_default();
-    route
-        .spec
-        .parent_refs
-        .iter()
-        .flatten()
-        .any(|p| p.name == gw_name && p.namespace.as_deref().unwrap_or(&r_ns) == gw_ns)
-}
-
-/// Does an HTTPRoute have a backendRef to one of `svc_names` in namespace `svc_ns`?
-fn route_targets_service_in(route: &HTTPRoute, svc_names: &[String], svc_ns: &str) -> bool {
-    let r_ns = route.namespace().unwrap_or_default();
-    route
-        .spec
-        .rules
-        .iter()
-        .flatten()
-        .flat_map(|rule| rule.backend_refs.iter().flatten())
-        .any(|b| svc_names.contains(&b.name) && b.namespace.as_deref().unwrap_or(&r_ns) == svc_ns)
-}
-
-/// [`route_has_parent`] for a TLSRoute.
-fn tls_route_has_parent(route: &TLSRoute, gw_name: &str, gw_ns: &str) -> bool {
-    let r_ns = route.namespace().unwrap_or_default();
-    route
-        .spec
-        .parent_refs
-        .iter()
-        .flatten()
-        .any(|p| p.name == gw_name && p.namespace.as_deref().unwrap_or(&r_ns) == gw_ns)
-}
-
-/// [`route_targets_service_in`] for a TLSRoute.
-fn tls_route_targets_service_in(route: &TLSRoute, svc_names: &[String], svc_ns: &str) -> bool {
-    let r_ns = route.namespace().unwrap_or_default();
-    route
-        .spec
-        .rules
-        .iter()
-        .flat_map(|rule| &rule.backend_refs)
-        .any(|b| svc_names.contains(&b.name) && b.namespace.as_deref().unwrap_or(&r_ns) == svc_ns)
-}
-
 /// One kind's part of [`ReconcileCtx::fetch_referenced`]: of the objects in
 /// `wanted`, GET those whose version in the metadata store `meta` is not the one in
 /// `cache`, and keep `extract` of each. Forget what is no longer wanted or gone.
@@ -3705,7 +3723,14 @@ mod tests {
         let mut backends = BackendIndex::new(ctx.stores.endpoint_slices.state(), UpstreamTlsMap::new());
         let mut table = RouteTable::default();
         let mut counts = BTreeMap::new();
-        let patch = ctx.process_route(route, &models, &mut backends, &mut table, &mut counts);
+        let patch = ctx.process_route(
+            route,
+            &models,
+            &mut backends,
+            &mut table,
+            &mut counts,
+            &mut PolicyAncestors::new(),
+        );
         let status = patch.map(|mut p| serde_json::from_value(p.json["status"].take()).unwrap());
         table.sort();
         (status, table, counts)
@@ -3940,6 +3965,144 @@ mod tests {
 
         let long = condition("Accepted", "False", "UnsupportedValue", &"é".repeat(MAX_MESSAGE), 1);
         assert!(long.message.len() <= MAX_MESSAGE && long.message.ends_with('…'));
+    }
+
+    /// The policies' status after a pass over every route in `ctx`, by policy name.
+    fn policy_pass(ctx: &ReconcileCtx) -> BTreeMap<String, BackendTlsPolicyStatus> {
+        let models: Vec<GatewayModel> = ctx
+            .stores
+            .gateways
+            .state()
+            .iter()
+            .map(|gw| ctx.build_gateway_model(gw))
+            .collect();
+        let (upstream_tls, outcomes) = ctx.build_policy_artifacts();
+        let mut backends = BackendIndex::new(ctx.stores.endpoint_slices.state(), upstream_tls);
+        let mut ancestors = PolicyAncestors::new();
+        for route in ctx.stores.routes.state() {
+            let (mut table, mut counts) = (RouteTable::default(), AttachCounts::new());
+            ctx.process_route(&route, &models, &mut backends, &mut table, &mut counts, &mut ancestors);
+        }
+        ctx.policy_patches(&ancestors, &outcomes)
+            .into_iter()
+            .map(|mut p| (p.name, serde_json::from_value(p.json["status"].take()).unwrap()))
+            .collect()
+    }
+
+    // A policy's ancestors are the Gateways that accept a route to its Service
+    // with a backendRef that resolves: not any Gateway some route names (T155).
+    // Each CA reference is checked: a policy with one valid CA is accepted, and
+    // ResolvedRefs names the broken ones. A policy that loses any target to an
+    // older one is Conflicted (T156).
+    #[tokio::test]
+    async fn backend_tls_policy_status() {
+        let gateway = |name: &str, from: &str| -> Gateway {
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "Gateway",
+                "metadata": { "name": name, "namespace": "ns", "generation": 1 },
+                "spec": {
+                    "gatewayClassName": "torii",
+                    "listeners": [{ "name": "http", "port": 80, "protocol": "HTTP",
+                        "allowedRoutes": { "namespaces": { "from": from } } }],
+                },
+            }))
+            .unwrap()
+        };
+        let service = |name: &str| -> Service {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": name, "namespace": "ns" },
+                "spec": { "ports": [{ "name": "https", "port": 443 }] },
+            }))
+            .unwrap()
+        };
+        let route = |ns: &str, name: &str, gateways: &[&str], svc: &str| -> HTTPRoute {
+            let parents: Vec<_> = gateways
+                .iter()
+                .map(|gw| serde_json::json!({ "name": gw, "namespace": "ns" }))
+                .collect();
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "HTTPRoute",
+                "metadata": { "name": name, "namespace": ns, "generation": 1 },
+                "spec": { "parentRefs": parents,
+                    "rules": [{ "backendRefs": [{ "name": svc, "namespace": "ns", "port": 443 }] }] },
+            }))
+            .unwrap()
+        };
+        let policy = |name: &str, created: &str, targets: &[&str], cas: &[&str]| -> BackendTLSPolicy {
+            let targets: Vec<_> = targets
+                .iter()
+                .map(|t| serde_json::json!({ "group": "", "kind": "Service", "name": t }))
+                .collect();
+            let cas: Vec<_> = cas
+                .iter()
+                .map(|c| serde_json::json!({ "group": "", "kind": "ConfigMap", "name": c }))
+                .collect();
+            serde_json::from_value(serde_json::json!({
+                "apiVersion": "gateway.networking.k8s.io/v1",
+                "kind": "BackendTLSPolicy",
+                "metadata": { "name": name, "namespace": "ns", "generation": 1, "creationTimestamp": created },
+                "spec": { "targetRefs": targets,
+                    "validation": { "hostname": "s.example", "caCertificateRefs": cas } },
+            }))
+            .unwrap()
+        };
+        let stores = Stores {
+            gateways: store_of(vec![gateway("open", "All"), gateway("own", "Same")]),
+            services: store_of(vec![service("s1"), service("s2"), service("s3")]),
+            routes: store_of(vec![
+                route("ns", "mine", &["open"], "s1"),
+                route("ns", "both", &["open"], "s2"),
+                route("ns", "three", &["open"], "s3"),
+                // Another tenant: no listener of `own` admits it, and no grant lets
+                // it send to `ns`.
+                route("other", "spoof", &["open", "own"], "s1"),
+            ]),
+            backend_tls_policies: store_of(vec![
+                policy("multi-ca", "2026-01-01T00:00:00Z", &["s1"], &["good", "missing"]),
+                policy("a-old", "2026-01-01T00:00:00Z", &["s2"], &["good"]),
+                policy("b-new", "2026-01-02T00:00:00Z", &["s2", "s3"], &["good"]),
+            ]),
+            ..no_objects()
+        };
+        let ctx = test_ctx(stores, &[80], &[]);
+        let (ca, _) = CertKey::generate_self_signed_pem().unwrap();
+        let fetched = Fetched {
+            version: None,
+            data: Some(Arc::from(ca)),
+        };
+        ctx.referenced
+            .config_maps
+            .lock()
+            .unwrap()
+            .insert(("ns".into(), "good".into()), fetched);
+
+        let status = policy_pass(&ctx);
+        let summary = |name: &str| -> Vec<(String, Vec<String>)> {
+            status[name]
+                .ancestors
+                .iter()
+                .map(|a| (a.ancestor_ref.name.clone(), reasons(&a.conditions)))
+                .collect()
+        };
+        assert_eq!(
+            summary("multi-ca"),
+            [(
+                "open".to_string(),
+                vec![
+                    "Accepted=True/Accepted".to_string(),
+                    "ResolvedRefs=False/InvalidCACertificateRef".to_string()
+                ]
+            )]
+        );
+        assert!(
+            status["multi-ca"].ancestors[0].conditions[1]
+                .message
+                .contains("caCertificateRefs[1]: ConfigMap ns/missing was not found")
+        );
+        assert_eq!(summary("a-old")[0].1[0], "Accepted=True/Accepted");
+        assert_eq!(summary("b-new")[0].1[0], "Accepted=False/Conflicted");
     }
 
     // A parent named twice (namespace left out, then set to the route's) is one
