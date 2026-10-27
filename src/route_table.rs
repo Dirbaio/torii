@@ -7,6 +7,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// The data plane's view of all programmed routing.
 ///
@@ -161,8 +162,13 @@ fn host_matches_suffix(suffix: &str, host: &str) -> bool {
     hostname_matches(suffix, host)
 }
 
-/// One flattened (match, backends) pair from an HTTPRoute rule, with the metadata
+/// One match of an HTTPRoute rule on one attached listener, with the metadata
 /// needed for precedence ordering.
+///
+/// A route has up to 128 matches and attaches to any number of listeners, so
+/// whatever an entry holds is multiplied by both. Everything sizeable is shared:
+/// the rule by all the entries of the rule, the match by its listeners, and the
+/// hostnames by the route's matches on one listener.
 #[derive(Debug, Clone)]
 pub struct RouteEntry {
     /// Listener port this entry is attached to.
@@ -172,9 +178,25 @@ pub struct RouteEntry {
     /// listener only.
     pub listener_hostname: Option<String>,
     /// Hostnames from the HTTPRoute. Empty = match any.
-    pub hostnames: Vec<String>,
+    pub hostnames: Arc<[String]>,
     /// The request match criteria.
-    pub r#match: RouteMatch,
+    pub r#match: Arc<RouteMatch>,
+    /// What the rule does with the requests it matches.
+    pub rule: Arc<Rule>,
+
+    // --- precedence tiebreakers (Gateway API spec order) ---
+    /// Route creationTimestamp as unix seconds (older wins).
+    pub route_creation: i64,
+    /// "{namespace}/{name}" (alphabetical tiebreak).
+    pub route_key: Arc<str>,
+    /// Index of the rule within the route, then the match within the rule.
+    pub rule_order: usize,
+    pub match_order: usize,
+}
+
+/// What an HTTPRoute rule does with the requests it matches.
+#[derive(Debug, Default)]
+pub struct Rule {
     /// Resolved backends to forward to.
     pub backends: Vec<Backend>,
     /// Filters applied to matching requests/responses.
@@ -183,15 +205,6 @@ pub struct RouteEntry {
     /// `request` and `backendRequest`). None = the rule sets none, so the data
     /// plane's default applies; zero = "0s", which disables it.
     pub request_timeout: Option<std::time::Duration>,
-
-    // --- precedence tiebreakers (Gateway API spec order) ---
-    /// Route creationTimestamp as unix seconds (older wins).
-    pub route_creation: i64,
-    /// "{namespace}/{name}" (alphabetical tiebreak).
-    pub route_key: String,
-    /// Index of the rule within the route, then the match within the rule.
-    pub rule_order: usize,
-    pub match_order: usize,
 }
 
 /// HTTPRoute match criteria: path AND headers AND method AND query (all must match).
@@ -234,7 +247,8 @@ pub struct QueryMatch {
 #[derive(Debug, Clone)]
 pub struct Backend {
     pub weight: u32,
-    pub endpoints: Vec<Endpoint>,
+    /// Shared by every backendRef to the same Service port.
+    pub endpoints: Arc<[Endpoint]>,
     /// Per-backendRef filters (applied only when this backend is selected, in
     /// addition to the rule-level filters).
     pub filters: Filters,
@@ -349,8 +363,9 @@ pub enum BackendTls {
     /// No BackendTLSPolicy applies → plain HTTP to the backend.
     #[default]
     Plaintext,
-    /// A valid BackendTLSPolicy applies → re-encrypt (TLS) to the backend.
-    ReEncrypt(UpstreamTls),
+    /// A valid BackendTLSPolicy applies → re-encrypt (TLS) to the backend. One
+    /// per policy, shared by all its endpoints (the CA bundle can be a MiB).
+    ReEncrypt(Arc<UpstreamTls>),
     /// A BackendTLSPolicy targets this Service but is invalid (bad CA / wrong
     /// kind) → the request must fail (5xx); we must NOT fall back to plaintext.
     Invalid,
@@ -376,14 +391,15 @@ impl RouteEntry {
     /// probability of a backend is `weight / sum(weights)`. We pick a backend by
     /// weight, then an endpoint within it uniformly (round-robin via the rng).
     pub fn pick_endpoint(&self, rng: u64) -> Option<(&Endpoint, &Backend)> {
-        let total: u64 = self.backends.iter().map(|b| b.weight as u64).sum();
+        let backends = &self.rule.backends;
+        let total: u64 = backends.iter().map(|b| b.weight as u64).sum();
         let backend = if total == 0 {
             // All weights zero (or single unweighted) → first backend with endpoints.
-            self.backends.iter().find(|b| !b.endpoints.is_empty())?
+            backends.iter().find(|b| !b.endpoints.is_empty())?
         } else {
             let mut pick = rng % total;
             let mut chosen = None;
-            for b in &self.backends {
+            for b in backends {
                 let w = b.weight as u64;
                 if pick < w {
                     chosen = Some(b);
@@ -446,7 +462,7 @@ impl RouteEntry {
     /// incoming path. ReplacePrefixMatch swaps the matched prefix; ReplaceFullPath
     /// replaces everything.
     pub fn rewrite_path(&self, incoming: &str) -> Option<String> {
-        let rw = self.filters.url_rewrite.as_ref()?.path.as_ref()?;
+        let rw = self.rule.filters.url_rewrite.as_ref()?.path.as_ref()?;
         Some(self.apply_path_rewrite(rw, incoming))
     }
 
@@ -822,8 +838,8 @@ mod tests {
         RouteEntry {
             listener_port: 80,
             listener_hostname: None,
-            hostnames: vec![],
-            r#match: RouteMatch {
+            hostnames: Arc::new([]),
+            r#match: Arc::new(RouteMatch {
                 path: Some(path),
                 headers: (0..headers)
                     .map(|i| HeaderMatch {
@@ -833,10 +849,8 @@ mod tests {
                     .collect(),
                 method: None,
                 query_params: vec![],
-            },
-            backends: vec![],
-            filters: Filters::default(),
-            request_timeout: None,
+            }),
+            rule: Arc::default(),
             route_creation: 0,
             route_key: "ns/n".into(),
             rule_order: 0,
@@ -877,30 +891,20 @@ mod tests {
             port: 80,
             tls: BackendTls::default(),
         };
+        let backend = |weight: u32, n: u8| Backend {
+            weight,
+            endpoints: Arc::new([ip(n)]),
+            filters: Filters::default(),
+        };
         let e = RouteEntry {
             listener_port: 80,
             listener_hostname: None,
-            hostnames: vec![],
-            r#match: RouteMatch::default(),
-            backends: vec![
-                Backend {
-                    weight: 70,
-                    endpoints: vec![ip(1)],
-                    filters: Filters::default(),
-                },
-                Backend {
-                    weight: 30,
-                    endpoints: vec![ip(2)],
-                    filters: Filters::default(),
-                },
-                Backend {
-                    weight: 0,
-                    endpoints: vec![ip(3)],
-                    filters: Filters::default(),
-                },
-            ],
-            filters: Filters::default(),
-            request_timeout: None,
+            hostnames: Arc::new([]),
+            r#match: Arc::default(),
+            rule: Arc::new(Rule {
+                backends: vec![backend(70, 1), backend(30, 2), backend(0, 3)],
+                ..Default::default()
+            }),
             route_creation: 0,
             route_key: "ns/n".into(),
             rule_order: 0,
@@ -1015,7 +1019,7 @@ mod tests {
                 .iter()
                 .map(|s| s.to_string())
                 .collect();
-            e.route_key = format!("ns/r{n}");
+            e.route_key = format!("ns/r{n}").into();
             entries.push(e);
         }
         let mut t = RouteTable {

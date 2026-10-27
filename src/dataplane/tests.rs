@@ -15,7 +15,7 @@ use tokio_openssl::SslStream;
 use super::h1::{self, Decoder, HeadEvent, HeadReader};
 use super::*;
 use crate::conn_limit::Caps;
-use crate::route_table::{Backend, Endpoint, Filters, RouteEntry, RouteMatch, RouteTable};
+use crate::route_table::{Backend, Endpoint, Filters, RouteEntry, RouteTable, Rule};
 
 const NO_LIMITS: ConnLimits = ConnLimits {
     connections: Caps {
@@ -77,15 +77,17 @@ fn one_route(port: u16, backend: SocketAddr, filters: Filters, timeout: Option<D
     routes.entries.push(RouteEntry {
         listener_port: port,
         listener_hostname: None,
-        hostnames: vec![],
-        r#match: RouteMatch::default(),
-        backends: vec![Backend {
-            weight: 1,
-            endpoints: vec![endpoint(backend)],
-            filters: Filters::default(),
-        }],
-        filters,
-        request_timeout: timeout,
+        hostnames: Arc::new([]),
+        r#match: Arc::default(),
+        rule: Arc::new(Rule {
+            backends: vec![Backend {
+                weight: 1,
+                endpoints: Arc::new([endpoint(backend)]),
+                filters: Filters::default(),
+            }],
+            filters,
+            request_timeout: timeout,
+        }),
         route_creation: 0,
         route_key: "ns/route".into(),
         rule_order: 0,
@@ -1029,11 +1031,13 @@ async fn tlsroute_passthrough_and_terminate() {
         }
     });
     let terminate = tcp_echo().await;
-    let backends = |addr: SocketAddr| TlsBackends {
-        backends: vec![TlsBackend {
-            weight: 1,
-            endpoints: vec![endpoint(addr)],
-        }],
+    let backends = |addr: SocketAddr| {
+        Arc::new(TlsBackends {
+            backends: vec![TlsBackend {
+                weight: 1,
+                endpoints: Arc::new([endpoint(addr)]),
+            }],
+        })
     };
     let (addr, _ctx, _stop) = tls_gateway(|port| {
         let mut tls = TlsTable::default();

@@ -173,7 +173,7 @@ pub fn decide(ctx: &Ctx, head: &RequestHead, conn: &ConnInfo) -> Decision {
     // CORS: answer a preflight here; for an actual request, add headers to the
     // response later.
     let mut cors_origin = None;
-    if let Some(cors) = &entry.filters.cors {
+    if let Some(cors) = &entry.rule.filters.cors {
         let origin = head.fields.get_str("origin").unwrap_or("");
         let allowed = !origin.is_empty() && cors.allows_origin(origin);
         if method.eq_ignore_ascii_case("OPTIONS") && head.fields.get("access-control-request-method").is_some() {
@@ -191,7 +191,7 @@ pub fn decide(ctx: &Ctx, head: &RequestHead, conn: &ConnInfo) -> Decision {
     }
 
     // A RequestRedirect filter produces an early 3xx response — no upstream.
-    if let Some(redirect) = &entry.filters.redirect {
+    if let Some(redirect) = &entry.rule.filters.redirect {
         if host.is_empty() && redirect.hostname.is_none() {
             // No host to send the client to (T117: `https:///evil.test/x`).
             return Decision::Local(Local::status(400));
@@ -216,7 +216,7 @@ pub fn decide(ctx: &Ctx, head: &RequestHead, conn: &ConnInfo) -> Decision {
                 return Decision::Local(Local::status(503));
             };
             tracing::debug!(%host, %path, %method, ip = %ep.ip, port = ep.port, "matched route");
-            let filters = entry.filters.merged_with(&backend.filters);
+            let filters = entry.rule.filters.merged_with(&backend.filters);
             let query = String::from_utf8_lossy(target.query);
             let target = match entry.rewrite_path(&path) {
                 Some(rewritten) => format!("{rewritten}{query}"),
@@ -226,12 +226,12 @@ pub fn decide(ctx: &Ctx, head: &RequestHead, conn: &ConnInfo) -> Decision {
             let host = rewrite_host.or_else(|| (!authority.is_empty()).then(|| authority.to_string()));
             // The rule's `timeouts` replace the default backend timeout ("0s"
             // disables it), and can only shorten the connect deadline.
-            let timeout = match entry.request_timeout {
+            let timeout = match entry.rule.request_timeout {
                 None => ctx.timeouts.response,
                 Some(t) => Some(t).filter(|t| !t.is_zero()),
             };
             let connect_timeout = ctx.timeouts.connect.into_iter().chain(timeout).min();
-            let deadline = entry.request_timeout.filter(|t| !t.is_zero());
+            let deadline = entry.rule.request_timeout.filter(|t| !t.is_zero());
             Decision::Proxy(Box::new(Plan {
                 endpoint: ep.clone(),
                 filters,

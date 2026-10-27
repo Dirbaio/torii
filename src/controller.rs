@@ -4,7 +4,7 @@
 //! Level-triggered and idempotent: any watched-object change triggers a full
 //! recompute of the entire world from cached state. We never accumulate deltas.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,7 +42,7 @@ use serde::de::DeserializeOwned;
 use crate::cert_store::{CertKey, CertStore};
 use crate::route_table::{
     Backend, Endpoint, Filters, HeaderMatch, HeaderMods, HeaderValueMatch, PathMatch, PathRewrite, QueryMatch,
-    Redirect, RouteEntry, RouteMatch, RouteTable, UrlRewrite, normalize_path,
+    Redirect, RouteEntry, RouteMatch, RouteTable, Rule, UrlRewrite, normalize_path,
 };
 use crate::snapshot::{DataPlane, Snapshot};
 use crate::tls_table::{TlsAction, TlsBackend, TlsBackends, TlsTable};
@@ -474,7 +474,61 @@ struct PolicyOutcome {
 /// covers every port of the Service. Built once (conflict tiebreak applied) so
 /// route resolution and policy status agree. Only `ReEncrypt`/`Invalid` are stored
 /// (no policy → absent → the route defaults the endpoint to Plaintext).
-type UpstreamTlsMap = std::collections::HashMap<(String, String, u16), crate::route_table::BackendTls>;
+type UpstreamTlsMap = HashMap<ServicePort, crate::route_table::BackendTls>;
+
+/// A Service port: (namespace, Service name, port number).
+type ServicePort = (String, String, u16);
+
+/// The Services that routes send to, as one pass sees them. Each Service port is
+/// resolved once per pass, into one list of endpoints that every backendRef to it
+/// shares (see [`ReconcileCtx::service_endpoints`]).
+struct BackendIndex {
+    /// Each Service's EndpointSlices, by (namespace, Service name).
+    slices: HashMap<(String, String), Vec<Arc<EndpointSlice>>>,
+    /// The BackendTLSPolicy decision for each Service port one covers.
+    upstream_tls: UpstreamTlsMap,
+    /// The Service ports resolved so far; None for a Service or port that does
+    /// not exist.
+    resolved: HashMap<ServicePort, Option<Arc<[Endpoint]>>>,
+}
+
+impl BackendIndex {
+    fn new(slices: Vec<Arc<EndpointSlice>>, upstream_tls: UpstreamTlsMap) -> Self {
+        let mut by_service: HashMap<(String, String), Vec<Arc<EndpointSlice>>> = HashMap::new();
+        for slice in slices {
+            let ns = slice.metadata.namespace.clone().unwrap_or_default();
+            let Some(svc) = slice.labels().get("kubernetes.io/service-name").cloned() else {
+                continue;
+            };
+            by_service.entry((ns, svc)).or_default().push(slice);
+        }
+        BackendIndex {
+            slices: by_service,
+            upstream_tls,
+            resolved: HashMap::new(),
+        }
+    }
+}
+
+/// An HTTPRoute's rules as the data plane runs them, and what they report in the
+/// route's status: the same for each of the route's parents.
+struct RouteRules {
+    /// The rules torii programs.
+    rules: Vec<RouteRule>,
+    /// Why some rule is not programmed, for the route's Accepted condition.
+    unsupported: Option<String>,
+    /// Why some backendRef did not resolve, for the route's ResolvedRefs condition.
+    refs_failure: Option<&'static str>,
+}
+
+/// One programmed HTTPRoute rule: what it does, shared by all its entries, and
+/// its matches, each shared by its listeners.
+struct RouteRule {
+    /// The rule's index in the route, for precedence.
+    order: usize,
+    rule: Arc<Rule>,
+    matches: Vec<Arc<RouteMatch>>,
+}
 
 /// Which API kind a deferred status patch targets (for building the right `Api<K>`).
 enum PatchTarget {
@@ -555,10 +609,11 @@ impl ReconcileCtx {
         let usable_gateways: Vec<Arc<Gateway>> = models.iter().filter(|m| m.usable).map(|m| m.gw.clone()).collect();
         let mut route_table = RouteTable::default();
         let mut tls_table = crate::tls_table::TlsTable::default();
+        let mut backends = BackendIndex::new(self.stores.endpoint_slices.state(), upstream_tls);
         // (gw_ns, gw_name) → (listener_name → count).
         let mut attach_counts: BTreeMap<(String, String), BTreeMap<String, i32>> = BTreeMap::new();
         for route in &routes {
-            if let Some(patch) = self.process_route(route, &models, &upstream_tls, &mut route_table, &mut attach_counts)
+            if let Some(patch) = self.process_route(route, &models, &mut backends, &mut route_table, &mut attach_counts)
             {
                 patches.push(patch);
             }
@@ -570,7 +625,7 @@ impl ReconcileCtx {
         let tls_routes: Vec<Arc<TLSRoute>> = self.stores.tls_routes.state();
         for route in &tls_routes {
             if let Some(patch) =
-                self.process_tls_route(route, &models, &upstream_tls, &mut tls_table, &mut attach_counts)
+                self.process_tls_route(route, &models, &mut backends, &mut tls_table, &mut attach_counts)
             {
                 patches.push(patch);
             }
@@ -1093,21 +1148,33 @@ impl ReconcileCtx {
             .is_some()
     }
 
-    /// STAGE 2b: resolve a route's backends, build its RouteEntries, count its
-    /// attachment per listener, and produce its parent status patch (or None if it
-    /// has no parent we own). Attachment is computed ONCE here and used for both
-    /// routing and the `attachedRoutes` counts (written into `attach_counts`).
+    /// STAGE 2b: build a route's RouteEntries, count its attachment per listener,
+    /// and produce its parent status patch (or None if it has no parent we own).
+    /// Attachment is computed ONCE here and used for both routing and the
+    /// `attachedRoutes` counts (written into `attach_counts`). The rules are the
+    /// same for every parent, so they are built once, for the first parent we own.
     fn process_route(
         &self,
         route: &HTTPRoute,
         models: &[GatewayModel],
-        upstream_tls: &UpstreamTlsMap,
+        backends: &mut BackendIndex,
         table: &mut RouteTable,
         attach_counts: &mut BTreeMap<(String, String), BTreeMap<String, i32>>,
     ) -> Option<StatusPatch> {
         let generation = route.meta().generation.unwrap_or(0);
         let route_ns = route.namespace().unwrap_or_default();
 
+        // Tiebreaker metadata for precedence ordering.
+        let route_creation = route
+            .meta()
+            .creation_timestamp
+            .as_ref()
+            .map(|t| t.0.as_second())
+            .unwrap_or(0);
+        let route_key: Arc<str> = format!("{}/{}", route_ns, route.name_any()).into();
+        let hostnames: &[String] = route.spec.hostnames.as_deref().unwrap_or_default();
+
+        let mut rules: Option<RouteRules> = None;
         let mut parents: Vec<HttpRouteStatusParents> = Vec::new();
 
         for pref in route.spec.parent_refs.iter().flatten() {
@@ -1136,117 +1203,30 @@ impl ReconcileCtx {
                 *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
             }
 
-            // Tiebreaker metadata for precedence ordering.
-            let route_creation = route
-                .meta()
-                .creation_timestamp
-                .as_ref()
-                .map(|t| t.0.as_second())
-                .unwrap_or(0);
-            let route_key = format!("{}/{}", route_ns, route.name_any());
-            let hostnames: &[String] = route.spec.hostnames.as_deref().unwrap_or_default();
+            let rules = rules.get_or_insert_with(|| self.route_rules(route, backends));
 
-            // Resolve backends across all rules, tracking the most specific
-            // ResolvedRefs failure reason (RefNotPermitted takes priority).
-            let mut refs_failure: Option<&'static str> = None;
-            // First unsupported-value problem found in any rule. The offending rule
-            // is skipped (not programmed) and the route is Accepted=False. A route
-            // torii cannot decode is a stand-in with no rules (see `route_stand_in`).
-            let mut unsupported: Option<String> = route.annotations().get(UNDECODABLE_ANNOTATION).cloned();
-            for (rule_order, rule) in route.spec.rules.iter().flatten().enumerate() {
-                // A rule with a CRD-valid but unsupported value is not programmed;
-                // record the reason for the route's Accepted condition and skip it.
-                if let Some(msg) = validate_http_rule(rule_order, rule) {
-                    if unsupported.is_none() {
-                        unsupported = Some(msg);
-                    }
+            // Contribute one RouteEntry per (attached HTTP(S) listener × match).
+            // HTTPS listeners terminate TLS then route HTTP, so they carry
+            // HTTPRoute entries too (keyed by the listener port, e.g. 443).
+            for l in &attached_listeners {
+                if l.protocol != "HTTP" && l.protocol != "HTTPS" {
                     continue;
                 }
-                let mut backends = Vec::new();
-                for backend_ref in rule.backend_refs.iter().flatten() {
-                    let svc_port = backend_ref.port.unwrap_or(0) as u16;
-                    let bns = backend_ref.namespace.clone().unwrap_or_else(|| route_ns.clone());
-
-                    // Only core Services are supported backends. Any other
-                    // group/kind → ResolvedRefs=False, InvalidKind.
-                    let group = backend_ref.group.as_deref().unwrap_or("");
-                    let kind = backend_ref.kind.as_deref().unwrap_or("Service");
-                    if !group.is_empty() || kind != "Service" {
-                        refs_failure = Some("InvalidKind");
-                        continue;
-                    }
-
-                    // Cross-namespace backendRefs require a permitting ReferenceGrant.
-                    if bns != route_ns
-                        && !self.ref_grant_permits(&route_ns, "HTTPRoute", &bns, "Service", &backend_ref.name)
-                    {
-                        refs_failure = Some("RefNotPermitted");
-                        continue; // no endpoints → 500 at the data plane
-                    }
-
-                    match self.resolve_endpoints(&bns, &backend_ref.name, svc_port) {
-                        // Service exists (ResolvedRefs=True) — even with zero ready
-                        // endpoints, the ref is resolved; an empty backend yields a
-                        // 503 at traffic time, not BackendNotFound.
-                        Some(mut endpoints) => {
-                            // Apply any BackendTLSPolicy decision for this Service
-                            // PORT (re-encrypt, or invalid→must-5xx), from the map.
-                            if let Some(bt) = upstream_tls.get(&(bns.clone(), backend_ref.name.clone(), svc_port)) {
-                                for ep in &mut endpoints {
-                                    ep.tls = bt.clone();
-                                }
-                            }
-                            backends.push(Backend {
-                                weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
-                                endpoints,
-                                filters: backend_filters_from(backend_ref.filters.as_deref().unwrap_or_default()),
-                            });
-                        }
-                        // Service does not exist → BackendNotFound (don't downgrade
-                        // a more specific failure like RefNotPermitted).
-                        None => {
-                            refs_failure.get_or_insert("BackendNotFound");
-                        }
-                    }
-                }
-
-                // Parse this rule's filters and timeouts once.
-                let rule_filters = rule.filters.as_deref().unwrap_or_default();
-                let filters = filters_from(rule_filters);
-                let request_timeout = rule.timeouts.as_ref().and_then(request_timeout_from);
-
-                // Each `match` in the rule is an independent OR alternative. A rule
-                // with no matches defaults to a single match-all (PathPrefix "/").
-                let matches = rule.matches.as_deref().unwrap_or_default();
-                let route_matches: Vec<RouteMatch> = if matches.is_empty() {
-                    vec![RouteMatch::default()]
-                } else {
-                    matches.iter().map(route_match_from).collect()
-                };
-
-                // Contribute one RouteEntry per (match × attached HTTP(S) listener).
-                // HTTPS listeners terminate TLS then route HTTP, so they carry
-                // HTTPRoute entries too (keyed by the listener port, e.g. 443).
-                for (match_order, rm) in route_matches.into_iter().enumerate() {
-                    for l in &attached_listeners {
-                        if l.protocol != "HTTP" && l.protocol != "HTTPS" {
-                            continue;
-                        }
-                        // Effective hostnames = intersection of route hostnames and
-                        // the listener hostname. Empty route hostnames inherit the
-                        // listener's; a listener with no hostname matches any.
-                        let effective_hosts = effective_hostnames(hostnames, l.hostname.as_deref());
+                // Effective hostnames = intersection of route hostnames and the
+                // listener hostname. Empty route hostnames inherit the listener's;
+                // a listener with no hostname matches any.
+                let effective_hosts: Arc<[String]> = effective_hostnames(hostnames, l.hostname.as_deref()).into();
+                for r in &rules.rules {
+                    for (match_order, m) in r.matches.iter().enumerate() {
                         table.entries.push(RouteEntry {
                             listener_port: l.port as u16,
                             listener_hostname: l.hostname.clone(),
-                            hostnames: effective_hosts,
-                            r#match: rm.clone(),
-                            backends: backends.clone(),
-                            filters: filters.clone(),
-                            request_timeout,
+                            hostnames: effective_hosts.clone(),
+                            r#match: m.clone(),
+                            rule: r.rule.clone(),
                             route_creation,
                             route_key: route_key.clone(),
-                            rule_order,
+                            rule_order: r.order,
                             match_order,
                         });
                     }
@@ -1256,13 +1236,13 @@ impl ReconcileCtx {
             // Accepted: attachment failure (no listener took the route) wins; then a
             // rule with an unsupported value → UnsupportedValue + an explanatory
             // message; otherwise Accepted.
-            let accepted = match (accept_reason, &unsupported) {
+            let accepted = match (accept_reason, &rules.unsupported) {
                 (Some(reason), _) => condition("Accepted", "False", reason, generation),
                 (None, Some(msg)) => condition_msg("Accepted", "False", "UnsupportedValue", msg, generation),
                 (None, None) => condition("Accepted", "True", "Accepted", generation),
             };
 
-            let resolved = match refs_failure {
+            let resolved = match rules.refs_failure {
                 None => condition("ResolvedRefs", "True", "ResolvedRefs", generation),
                 Some(reason) => condition("ResolvedRefs", "False", reason, generation),
             };
@@ -1292,6 +1272,87 @@ impl ReconcileCtx {
             name: route.name_any(),
             json: serde_json::json!({ "status": status }),
         })
+    }
+
+    /// Build an HTTPRoute's rules as the data plane runs them: each rule's backends
+    /// resolved and its filters and matches parsed, once for all of the route's
+    /// parents and listeners, which share them.
+    fn route_rules(&self, route: &HTTPRoute, backends: &mut BackendIndex) -> RouteRules {
+        let route_ns = route.namespace().unwrap_or_default();
+        // A route torii cannot decode is a stand-in with no rules (see
+        // `route_stand_in`).
+        let mut out = RouteRules {
+            rules: Vec::new(),
+            unsupported: route.annotations().get(UNDECODABLE_ANNOTATION).cloned(),
+            refs_failure: None,
+        };
+        for (rule_order, rule) in route.spec.rules.iter().flatten().enumerate() {
+            // A rule with a CRD-valid but unsupported value is not programmed;
+            // record the reason for the route's Accepted condition and skip it.
+            if let Some(msg) = validate_http_rule(rule_order, rule) {
+                out.unsupported.get_or_insert(msg);
+                continue;
+            }
+            // Resolve the rule's backends, tracking the most specific ResolvedRefs
+            // failure reason (RefNotPermitted takes priority).
+            let mut rule_backends = Vec::new();
+            for backend_ref in rule.backend_refs.iter().flatten() {
+                let svc_port = backend_ref.port.unwrap_or(0) as u16;
+                let bns = backend_ref.namespace.clone().unwrap_or_else(|| route_ns.clone());
+
+                // Only core Services are supported backends. Any other
+                // group/kind → ResolvedRefs=False, InvalidKind.
+                let group = backend_ref.group.as_deref().unwrap_or("");
+                let kind = backend_ref.kind.as_deref().unwrap_or("Service");
+                if !group.is_empty() || kind != "Service" {
+                    out.refs_failure = Some("InvalidKind");
+                    continue;
+                }
+
+                // Cross-namespace backendRefs require a permitting ReferenceGrant.
+                if bns != route_ns
+                    && !self.ref_grant_permits(&route_ns, "HTTPRoute", &bns, "Service", &backend_ref.name)
+                {
+                    out.refs_failure = Some("RefNotPermitted");
+                    continue; // no endpoints → 500 at the data plane
+                }
+
+                match self.service_endpoints(backends, &bns, &backend_ref.name, svc_port) {
+                    // Service exists (ResolvedRefs=True) — even with zero ready
+                    // endpoints, the ref is resolved; an empty backend yields a
+                    // 503 at traffic time, not BackendNotFound.
+                    Some(endpoints) => rule_backends.push(Backend {
+                        weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
+                        endpoints,
+                        filters: backend_filters_from(backend_ref.filters.as_deref().unwrap_or_default()),
+                    }),
+                    // Service does not exist → BackendNotFound (don't downgrade
+                    // a more specific failure like RefNotPermitted).
+                    None => {
+                        out.refs_failure.get_or_insert("BackendNotFound");
+                    }
+                }
+            }
+
+            // Each `match` in the rule is an independent OR alternative. A rule
+            // with no matches defaults to a single match-all (PathPrefix "/").
+            let matches = rule.matches.as_deref().unwrap_or_default();
+            let matches: Vec<Arc<RouteMatch>> = if matches.is_empty() {
+                vec![Arc::default()]
+            } else {
+                matches.iter().map(|m| Arc::new(route_match_from(m))).collect()
+            };
+            out.rules.push(RouteRule {
+                order: rule_order,
+                rule: Arc::new(Rule {
+                    backends: rule_backends,
+                    filters: filters_from(rule.filters.as_deref().unwrap_or_default()),
+                    request_timeout: rule.timeouts.as_ref().and_then(request_timeout_from),
+                }),
+                matches,
+            });
+        }
+        out
     }
 
     /// Compute which of a Gateway's listeners an HTTPRoute attaches to.
@@ -1381,7 +1442,7 @@ impl ReconcileCtx {
         &self,
         route: &TLSRoute,
         models: &[GatewayModel],
-        upstream_tls: &UpstreamTlsMap,
+        backends: &mut BackendIndex,
         tls_table: &mut TlsTable,
         attach_counts: &mut BTreeMap<(String, String), BTreeMap<String, i32>>,
     ) -> Option<StatusPatch> {
@@ -1392,6 +1453,9 @@ impl ReconcileCtx {
         // attaches like any other, but programs nothing and reports why.
         let undecodable = route.annotations().get(UNDECODABLE_ANNOTATION);
 
+        // The backends of all the rules, shared by every matched SNI of every
+        // parent: built once, for the first parent we own.
+        let mut route_backends: Option<(Arc<TlsBackends>, Option<&'static str>)> = None;
         let mut parents: Vec<TlsRouteStatusParents> = Vec::new();
 
         for pref in route.spec.parent_refs.iter().flatten() {
@@ -1423,48 +1487,8 @@ impl ReconcileCtx {
                 (None, None) => condition("Accepted", "True", "Accepted", generation),
             };
 
-            // Resolve backends across all rules (shared by every matched SNI), and
-            // track the ResolvedRefs failure reason (RefNotPermitted first).
-            let mut refs_failure: Option<&'static str> = None;
-            let mut backends = TlsBackends::default();
-            for rule in &route.spec.rules {
-                for backend_ref in &rule.backend_refs {
-                    let svc_port = backend_ref.port.unwrap_or(0) as u16;
-                    let bns = backend_ref.namespace.clone().unwrap_or_else(|| route_ns.clone());
-
-                    let group = backend_ref.group.as_deref().unwrap_or("");
-                    let kind = backend_ref.kind.as_deref().unwrap_or("Service");
-                    if !group.is_empty() || kind != "Service" {
-                        refs_failure = Some("InvalidKind");
-                        continue;
-                    }
-                    if bns != route_ns
-                        && !self.ref_grant_permits(&route_ns, "TLSRoute", &bns, "Service", &backend_ref.name)
-                    {
-                        refs_failure = Some("RefNotPermitted");
-                        continue;
-                    }
-                    match self.resolve_endpoints(&bns, &backend_ref.name, svc_port) {
-                        Some(mut endpoints) => {
-                            // Apply any BackendTLSPolicy decision for this Service
-                            // PORT, as for an HTTPRoute. Only a Terminate listener
-                            // uses it: Passthrough forwards the client's own TLS.
-                            if let Some(bt) = upstream_tls.get(&(bns.clone(), backend_ref.name.clone(), svc_port)) {
-                                for ep in &mut endpoints {
-                                    ep.tls = bt.clone();
-                                }
-                            }
-                            backends.backends.push(TlsBackend {
-                                weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
-                                endpoints,
-                            });
-                        }
-                        None => {
-                            refs_failure.get_or_insert("BackendNotFound");
-                        }
-                    }
-                }
-            }
+            let (route_backends, refs_failure) =
+                route_backends.get_or_insert_with(|| self.tls_route_backends(route, backends));
 
             // For each attached listener, add its effective SNIs to the dispatch
             // table with the listener's mode (Passthrough vs Terminate). A stand-in
@@ -1472,8 +1496,8 @@ impl ReconcileCtx {
             if undecodable.is_none() {
                 for (l, mode) in &attached {
                     let action = match mode {
-                        TlsListenerMode::Passthrough => TlsAction::Passthrough(backends.clone()),
-                        TlsListenerMode::Terminate => TlsAction::Terminate(backends.clone()),
+                        TlsListenerMode::Passthrough => TlsAction::Passthrough(route_backends.clone()),
+                        TlsListenerMode::Terminate => TlsAction::Terminate(route_backends.clone()),
                     };
                     for sni in effective_hostnames(route_hostnames, l.hostname.as_deref()) {
                         tls_table.insert(l.port as u16, &sni, action.clone());
@@ -1481,7 +1505,7 @@ impl ReconcileCtx {
                 }
             }
 
-            let resolved = match refs_failure {
+            let resolved = match *refs_failure {
                 None => condition("ResolvedRefs", "True", "ResolvedRefs", generation),
                 Some(reason) => condition("ResolvedRefs", "False", reason, generation),
             };
@@ -1510,6 +1534,49 @@ impl ReconcileCtx {
             name: route.name_any(),
             json: serde_json::json!({ "status": status }),
         })
+    }
+
+    /// Resolve a TLSRoute's backends across all its rules, and the ResolvedRefs
+    /// failure reason (RefNotPermitted first).
+    fn tls_route_backends(
+        &self,
+        route: &TLSRoute,
+        backends: &mut BackendIndex,
+    ) -> (Arc<TlsBackends>, Option<&'static str>) {
+        let route_ns = route.namespace().unwrap_or_default();
+        let mut refs_failure: Option<&'static str> = None;
+        let mut out = TlsBackends::default();
+        for rule in &route.spec.rules {
+            for backend_ref in &rule.backend_refs {
+                let svc_port = backend_ref.port.unwrap_or(0) as u16;
+                let bns = backend_ref.namespace.clone().unwrap_or_else(|| route_ns.clone());
+
+                let group = backend_ref.group.as_deref().unwrap_or("");
+                let kind = backend_ref.kind.as_deref().unwrap_or("Service");
+                if !group.is_empty() || kind != "Service" {
+                    refs_failure = Some("InvalidKind");
+                    continue;
+                }
+                if bns != route_ns && !self.ref_grant_permits(&route_ns, "TLSRoute", &bns, "Service", &backend_ref.name)
+                {
+                    refs_failure = Some("RefNotPermitted");
+                    continue;
+                }
+                // The endpoints carry any BackendTLSPolicy decision for this Service
+                // PORT, as for an HTTPRoute. Only a Terminate listener uses it:
+                // Passthrough forwards the client's own TLS.
+                match self.service_endpoints(backends, &bns, &backend_ref.name, svc_port) {
+                    Some(endpoints) => out.backends.push(TlsBackend {
+                        weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
+                        endpoints,
+                    }),
+                    None => {
+                        refs_failure.get_or_insert("BackendNotFound");
+                    }
+                }
+            }
+        }
+        (Arc::new(out), refs_failure)
     }
 
     /// Compute which of a Gateway's `protocol: TLS` listeners a TLSRoute attaches
@@ -1738,7 +1805,10 @@ impl ReconcileCtx {
             // Valid policy: claim each target section; first claimant wins, later
             // claimants are Conflicted. A policy is Conflicted only if it loses
             // every target it has (won_any wins).
-            let hostname = policy.spec.validation.hostname.clone();
+            let upstream = Arc::new(crate::route_table::UpstreamTls {
+                hostname: policy.spec.validation.hostname.clone(),
+                ca_pem,
+            });
             let mut won_any = false;
             let mut lost_any = false;
             for t in &policy.spec.target_refs {
@@ -1765,13 +1835,7 @@ impl ReconcileCtx {
                     if !specific && port_specific.contains(&pkey) {
                         continue; // a section-specific policy already owns this port
                     }
-                    artifacts.insert(
-                        pkey.clone(),
-                        BackendTls::ReEncrypt(crate::route_table::UpstreamTls {
-                            hostname: hostname.clone(),
-                            ca_pem: ca_pem.clone(),
-                        }),
-                    );
+                    artifacts.insert(pkey.clone(), BackendTls::ReEncrypt(upstream.clone()));
                     if specific {
                         port_specific.insert(pkey);
                     }
@@ -1943,13 +2007,32 @@ impl ReconcileCtx {
         Some(ca.clone().into_bytes())
     }
 
+    /// The endpoints of Service port `ns/name:port`, with the port's BackendTLSPolicy
+    /// decision. Resolved once per pass (see [`BackendIndex`]); None when the
+    /// Service or the port does not exist.
+    fn service_endpoints(&self, index: &mut BackendIndex, ns: &str, name: &str, port: u16) -> Option<Arc<[Endpoint]>> {
+        let key = (ns.to_string(), name.to_string(), port);
+        if let Some(endpoints) = index.resolved.get(&key) {
+            return endpoints.clone();
+        }
+        let endpoints = self.resolve_endpoints(index, ns, name, port).map(Arc::from);
+        index.resolved.insert(key, endpoints.clone());
+        endpoints
+    }
+
     /// Resolve a Service port's ready endpoints from the Service's EndpointSlices,
     /// as kube-proxy does: in each slice, the port named like the Service port (the
     /// EndpointSlice controller names slice ports after Service ports, and resolves
     /// `targetPort` into their numbers per pod). `targetPort` is never read here: a
     /// named one is a container port name, and a selector-less Service's slices are
     /// written by hand with any port.
-    fn resolve_endpoints(&self, ns: &str, svc_name: &str, svc_port: u16) -> Option<Vec<Endpoint>> {
+    fn resolve_endpoints(
+        &self,
+        index: &BackendIndex,
+        ns: &str,
+        svc_name: &str,
+        svc_port: u16,
+    ) -> Option<Vec<Endpoint>> {
         // Find the Service port, for its name and protocol.
         let svc = find_in(&self.stores.services, ns, svc_name)?;
 
@@ -1964,26 +2047,23 @@ impl ReconcileCtx {
 
         let port_name = port_spec.name.as_deref().unwrap_or_default();
         let port_protocol = port_spec.protocol.as_deref().unwrap_or("TCP");
+        // Plaintext by default; a BackendTLSPolicy targeting this Service port
+        // re-encrypts (or, when invalid, fails every request).
+        let tls = index
+            .upstream_tls
+            .get(&(ns.to_string(), svc_name.to_string(), svc_port))
+            .cloned()
+            .unwrap_or_default();
 
         // Collect ready endpoint IPs from EndpointSlices for this service.
         let mut endpoints = Vec::new();
-        for slice in self.stores.endpoint_slices.state() {
-            if slice.namespace().unwrap_or_default() != ns {
-                continue;
-            }
+        let slices = index.slices.get(&(ns.to_string(), svc_name.to_string()));
+        for slice in slices.into_iter().flatten() {
             // Route to IP endpoints of either family. The data plane dials an
             // (IpAddr, port), which works for v4 and v6 alike. Skip FQDN slices:
             // their "addresses" are DNS names, not IPs, so they don't parse below
             // (and would need separate resolution we don't do).
             if slice.address_type != "IPv4" && slice.address_type != "IPv6" {
-                continue;
-            }
-            let owner_svc = slice
-                .labels()
-                .get("kubernetes.io/service-name")
-                .cloned()
-                .unwrap_or_default();
-            if owner_svc != svc_name {
                 continue;
             }
 
@@ -2002,17 +2082,14 @@ impl ReconcileCtx {
                 if !ready {
                     continue;
                 }
-                for addr in &ep.addresses {
-                    if let Ok(ip) = addr.parse::<IpAddr>() {
-                        endpoints.push(Endpoint {
-                            ip,
-                            port: port as u16,
-                            // Plaintext by default; a BackendTLSPolicy targeting this
-                            // Service overrides it (ReEncrypt or Invalid) in process_route
-                            // and process_tls_route.
-                            tls: crate::route_table::BackendTls::Plaintext,
-                        });
-                    }
+                // An endpoint's addresses are fungible, and consumers may use only
+                // the first (EndpointSlice API); an endpoint may list 100.
+                if let Some(ip) = ep.addresses.first().and_then(|a| a.parse::<IpAddr>().ok()) {
+                    endpoints.push(Endpoint {
+                        ip,
+                        port: port as u16,
+                        tls: tls.clone(),
+                    });
                 }
             }
         }
@@ -3187,9 +3264,12 @@ mod tests {
             ..no_objects()
         };
         let ctx = test_ctx(stores, &[80], &[443]);
+        let endpoints = |svc: &str, port: u16| {
+            let mut index = BackendIndex::new(ctx.stores.endpoint_slices.state(), UpstreamTlsMap::new());
+            ctx.service_endpoints(&mut index, "ns", svc, port)
+        };
         let resolve = |svc: &str, port: u16| -> Vec<String> {
-            let mut eps: Vec<String> = ctx
-                .resolve_endpoints("ns", svc, port)
+            let mut eps: Vec<String> = endpoints(svc, port)
                 .unwrap()
                 .iter()
                 .map(|e| format!("{}:{}", e.ip, e.port))
@@ -3202,7 +3282,7 @@ mod tests {
         assert_eq!(resolve("crossed", 80), ["10.0.0.4:7001"]);
         assert_eq!(resolve("crossed", 81), ["10.0.0.4:7002"]);
         assert_eq!(resolve("external", 80), ["10.0.0.5:8443"]);
-        assert!(ctx.resolve_endpoints("ns", "named", 81).is_none());
+        assert!(endpoints("named", 81).is_none());
     }
 
     fn lbls(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {

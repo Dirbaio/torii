@@ -422,7 +422,7 @@ async fn tls_setup(ctx: &Ctx, tcp: TcpStream, info: &ConnInfo) -> Option<TlsConn
             // (the HTTP path answers 500), never fall back to plaintext.
             let upstream_tls = match &ep.tls {
                 BackendTls::Invalid => return None,
-                BackendTls::ReEncrypt(tls) => Some(tls),
+                BackendTls::ReEncrypt(tls) => Some(&**tls),
                 BackendTls::Plaintext => None,
             };
             let tls = tls_accept(ctx, tcp, hello.as_ref(), tls::Use::Pipe).await?;

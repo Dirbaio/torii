@@ -15,6 +15,7 @@
 //! lock-free per connection via [`TlsTable::lookup`].
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::route_table::Endpoint;
 
@@ -36,13 +37,14 @@ struct TlsPort {
     wildcard: Vec<(String, TlsAction)>,
 }
 
-/// What to do with a connection whose SNI matched a TLSRoute on this port.
+/// What to do with a connection whose SNI matched a TLSRoute on this port. The
+/// backends are shared by all the SNIs and listeners of the route.
 #[derive(Debug, Clone)]
 pub enum TlsAction {
     /// TLS passthrough: pipe the encrypted bytes to one of these backends.
-    Passthrough(TlsBackends),
+    Passthrough(Arc<TlsBackends>),
     /// TLS terminate-then-TCP: terminate TLS here, pipe cleartext to a backend.
-    Terminate(TlsBackends),
+    Terminate(Arc<TlsBackends>),
 }
 
 /// The decision the data plane acts on for one connection.
@@ -70,7 +72,8 @@ pub struct TlsBackends {
 #[derive(Debug, Clone)]
 pub struct TlsBackend {
     pub weight: u32,
-    pub endpoints: Vec<Endpoint>,
+    /// Shared by every backendRef to the same Service port.
+    pub endpoints: Arc<[Endpoint]>,
 }
 
 impl TlsBackends {
@@ -198,13 +201,13 @@ mod tests {
         }
     }
 
-    fn backends(n: u8) -> TlsBackends {
-        TlsBackends {
+    fn backends(n: u8) -> Arc<TlsBackends> {
+        Arc::new(TlsBackends {
             backends: vec![TlsBackend {
                 weight: 1,
-                endpoints: vec![ep(n)],
+                endpoints: Arc::new([ep(n)]),
             }],
-        }
+        })
     }
 
     #[test]
@@ -298,12 +301,12 @@ mod tests {
         t.insert(
             443,
             "echo.example.com",
-            TlsAction::Passthrough(TlsBackends {
+            TlsAction::Passthrough(Arc::new(TlsBackends {
                 backends: vec![TlsBackend {
                     weight: 1,
-                    endpoints: vec![],
+                    endpoints: Arc::new([]),
                 }],
-            }),
+            })),
         );
         assert!(matches!(
             t.lookup(443, Some("echo.example.com"), 0),
