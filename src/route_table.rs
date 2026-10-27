@@ -12,10 +12,11 @@ use std::sync::Arc;
 /// The data plane's view of all programmed routing.
 ///
 /// Entries are kept sorted in descending precedence order, and indexed by listener
-/// port *and listener hostname* so request dispatch scans only the handful of
-/// entries that can serve the request's `(port, Host)` — not the whole table. This
-/// matters because real deployments put everything on one port (443) with many
-/// distinct hostnames, so a port-only split wouldn't help; the hostname index does.
+/// port, listener hostname and route hostname, so request dispatch scans only the
+/// handful of entries that can serve the request's `(port, Host)` — not the whole
+/// table. This matters because real deployments put everything on one port (443)
+/// with many distinct hostnames, so a port-only split wouldn't help; the hostname
+/// index does.
 #[derive(Debug, Default, Clone)]
 pub struct RouteTable {
     /// All entries, in descending precedence order (built flat, then `sort()`ed).
@@ -25,17 +26,88 @@ pub struct RouteTable {
 }
 
 /// A port's entries indexed by their *listener hostname* — the field that drives
-/// listener isolation. Each bucket holds indices into `RouteTable::entries`, in
-/// precedence order. The three tiers mirror `listener_specificity`: exact (2) >
+/// listener isolation. The three tiers mirror `listener_specificity`: exact (2) >
 /// wildcard (1) > none (0).
 #[derive(Debug, Default, Clone)]
 struct PortIndex {
     /// listener_hostname is an exact host → that host (lowercased) → entries.
-    exact: HashMap<String, Vec<usize>>,
+    exact: HashMap<String, HostIndex>,
     /// listener_hostname is `*.suffix` → (suffix, entries). Few in practice.
-    wildcard: Vec<(String, Vec<usize>)>,
+    wildcard: Vec<(String, HostIndex)>,
     /// listener_hostname is None (matches any host) → entries.
+    any: Option<HostIndex>,
+}
+
+/// One listener tier's entries indexed by the route hostnames they match a host
+/// with. Among routes that match a request, the spec gives precedence to the one
+/// with the most characters in a matching non-wildcard hostname, then in a matching
+/// hostname, before any of the match criteria: so an exact hostname beats every
+/// wildcard, a longer wildcard beats a shorter one, and both beat a route with no
+/// hostnames. Each bucket holds indices into `RouteTable::entries`, in precedence
+/// order.
+#[derive(Debug, Default, Clone)]
+struct HostIndex {
+    /// Entries of routes that name an exact hostname → that host (lowercased).
+    exact: HashMap<String, Vec<usize>>,
+    /// Entries of routes that name a `*.` wildcard → (wildcard, entries), longest
+    /// wildcard first.
+    wildcard: Vec<(String, Vec<usize>)>,
+    /// Entries of routes that name no hostname.
     any: Vec<usize>,
+}
+
+impl HostIndex {
+    fn add(&mut self, i: usize, hostnames: &[String]) {
+        let push = |bucket: &mut Vec<usize>| {
+            // A route may name a host twice (in different case).
+            if bucket.last() != Some(&i) {
+                bucket.push(i);
+            }
+        };
+        if hostnames.is_empty() {
+            push(&mut self.any);
+        }
+        for h in hostnames {
+            let h = h.to_ascii_lowercase();
+            if h.starts_with("*.") {
+                match self.wildcard.iter_mut().find(|(w, _)| *w == h) {
+                    Some((_, bucket)) => push(bucket),
+                    None => self.wildcard.push((h, vec![i])),
+                }
+            } else {
+                push(self.exact.entry(h).or_default());
+            }
+        }
+    }
+
+    /// The first entry, by hostname precedence and then by match precedence, that
+    /// matches the request.
+    fn first_match<'a>(
+        &self,
+        entries: &'a [RouteEntry],
+        host: &str,
+        path: &str,
+        method: &str,
+        headers: &dyn HeaderLookup,
+        query: &str,
+    ) -> Option<&'a RouteEntry> {
+        let exact = self.exact.get(&host.to_ascii_lowercase());
+        let wildcards = self
+            .wildcard
+            .iter()
+            .filter(|(w, _)| hostname_matches(w, host))
+            .map(|(_, bucket)| bucket);
+        exact
+            .into_iter()
+            .chain(wildcards)
+            .chain([&self.any])
+            .find_map(|bucket| {
+                bucket
+                    .iter()
+                    .map(|&i| &entries[i])
+                    .find(|e| e.r#match.matches(path, method, headers, query))
+            })
+    }
 }
 
 /// A request's header fields, as route matching sees them.
@@ -58,8 +130,9 @@ impl RouteTable {
     /// hostnames, the request is served only by routes on the *most specific*
     /// listener whose hostname matches the Host. We pick the most-specific
     /// non-empty listener tier (exact > wildcard > any) whose hostname matches,
-    /// then return the first full match within that tier ONLY (in precedence
-    /// order) — never falling through to a less-specific tier.
+    /// then return the first full match within that tier ONLY (by route hostname
+    /// precedence, then match precedence) — never falling through to a
+    /// less-specific tier.
     ///
     /// Only the matched tier's entries are scanned, so dispatch cost is
     /// proportional to the routes serving that one hostname, not the whole port.
@@ -76,42 +149,18 @@ impl RouteTable {
         let host_lc = host.to_ascii_lowercase();
 
         // Tier 1 (most specific): an exact-hostname listener for this host.
-        if let Some(bucket) = idx.exact.get(&host_lc) {
-            return self.first_match(bucket, host, path, method, headers, query);
-        }
-
         // Tier 2: wildcard-hostname listeners whose suffix covers the host. Among
         // those that match, the most specific (most labels) wins the isolation tier.
-        let best_wild = idx
-            .wildcard
-            .iter()
-            .filter(|(suffix, _)| host_matches_suffix(suffix, host))
-            .max_by_key(|(suffix, _)| suffix.matches('.').count());
-        if let Some((_, bucket)) = best_wild {
-            return self.first_match(bucket, host, path, method, headers, query);
-        }
-
         // Tier 3 (least specific): no-hostname listeners (match any host).
-        if !idx.any.is_empty() {
-            return self.first_match(&idx.any, host, path, method, headers, query);
-        }
-        None
-    }
-
-    /// First entry in a precedence-ordered bucket that fully matches the request.
-    fn first_match(
-        &self,
-        bucket: &[usize],
-        host: &str,
-        path: &str,
-        method: &str,
-        headers: &dyn HeaderLookup,
-        query: &str,
-    ) -> Option<&RouteEntry> {
-        bucket
-            .iter()
-            .map(|&i| &self.entries[i])
-            .find(|e| e.matches(host, path, method, headers, query))
+        let tier = idx.exact.get(&host_lc).or_else(|| {
+            idx.wildcard
+                .iter()
+                .filter(|(suffix, _)| host_matches_suffix(suffix, host))
+                .max_by_key(|(suffix, _)| suffix.matches('.').count())
+                .map(|(_, tier)| tier)
+                .or(idx.any.as_ref())
+        })?;
+        tier.first_match(&self.entries, host, path, method, headers, query)
     }
 
     /// Whether a listener on `port` with routes attached serves the hostname
@@ -121,7 +170,7 @@ impl RouteTable {
         let Some(idx) = self.by_port.get(&port) else {
             return false;
         };
-        if !idx.any.is_empty() {
+        if idx.any.is_some() {
             return true;
         }
         let Some(host) = host else {
@@ -140,17 +189,30 @@ impl RouteTable {
         self.by_port.clear();
         for (i, e) in self.entries.iter().enumerate() {
             let idx = self.by_port.entry(e.listener_port).or_default();
-            match e.listener_hostname.as_deref() {
-                None => idx.any.push(i),
+            let tier = match e.listener_hostname.as_deref() {
+                None => idx.any.get_or_insert_default(),
                 Some(h) if h.starts_with("*.") => {
                     let suffix = h.to_ascii_lowercase();
-                    match idx.wildcard.iter_mut().find(|(s, _)| *s == suffix) {
-                        Some((_, v)) => v.push(i),
-                        None => idx.wildcard.push((suffix, vec![i])),
+                    match idx.wildcard.iter().position(|(s, _)| *s == suffix) {
+                        Some(n) => &mut idx.wildcard[n].1,
+                        None => {
+                            idx.wildcard.push((suffix, HostIndex::default()));
+                            &mut idx.wildcard.last_mut().unwrap().1
+                        }
                     }
                 }
-                Some(h) => idx.exact.entry(h.to_ascii_lowercase()).or_default().push(i),
-            }
+                Some(h) => idx.exact.entry(h.to_ascii_lowercase()).or_default(),
+            };
+            tier.add(i, &e.hostnames);
+        }
+        let tiers = self.by_port.values_mut().flat_map(|idx| {
+            idx.exact
+                .values_mut()
+                .chain(idx.wildcard.iter_mut().map(|(_, tier)| tier))
+                .chain(idx.any.as_mut())
+        });
+        for tier in tiers {
+            tier.wildcard.sort_by_key(|(w, _)| std::cmp::Reverse(w.len()));
         }
     }
 }
@@ -177,7 +239,8 @@ pub struct RouteEntry {
     /// listener isolation: a request is served by the most-specific matching
     /// listener only.
     pub listener_hostname: Option<String>,
-    /// Hostnames from the HTTPRoute. Empty = match any.
+    /// The route's hostnames that the listener's hostname covers or overlaps.
+    /// Empty when the route names none: it matches any host its listener does.
     pub hostnames: Arc<[String]>,
     /// The request match criteria.
     pub r#match: Arc<RouteMatch>,
@@ -381,10 +444,6 @@ pub struct UpstreamTls {
 }
 
 impl RouteEntry {
-    pub fn matches(&self, host: &str, path: &str, method: &str, headers: &dyn HeaderLookup, query: &str) -> bool {
-        self.matches_host(host) && self.r#match.matches(path, method, headers, query)
-    }
-
     /// Pick a backend endpoint for one request, weighted by backend weight.
     ///
     /// Gateway API semantics: a backend with weight 0 receives no traffic; the
@@ -416,13 +475,6 @@ impl RouteEntry {
         }
         let idx = (rng as usize) % backend.endpoints.len();
         backend.endpoints.get(idx).map(|ep| (ep, backend))
-    }
-
-    fn matches_host(&self, host: &str) -> bool {
-        if self.hostnames.is_empty() {
-            return true;
-        }
-        self.hostnames.iter().any(|h| hostname_matches(h, host))
     }
 
     /// Does this entry's listener hostname match the request host? (None = any.)
@@ -957,8 +1009,9 @@ mod tests {
         assert!(t.match_request(9999, "x", "/a", "GET", &h, "").is_none());
     }
 
-    /// Reference implementation: the original O(n) linear scan with listener
-    /// isolation. The hostname index must produce identical results to this.
+    /// Reference implementation: an O(n) linear scan with listener isolation and
+    /// route hostname precedence, as the spec words them. The hostname index must
+    /// produce identical results to this.
     fn reference_match<'a>(
         t: &'a RouteTable,
         port: u16,
@@ -976,12 +1029,33 @@ mod tests {
         let best = on_port()
             .map(|e| listener_specificity(e.listener_hostname.as_deref()))
             .max()?;
-        t.entries.iter().find(|e| {
-            e.listener_port == port
-                && listener_specificity(e.listener_hostname.as_deref()) == best
-                && e.listener_hostname_matches(host)
-                && e.matches(host, path, method, headers, query)
-        })
+        // (characters in the longest matching non-wildcard hostname, characters in
+        // the longest matching hostname); a route that names none scores (0, 0).
+        let host_score = |e: &RouteEntry| {
+            if e.hostnames.is_empty() {
+                return Some((0, 0));
+            }
+            e.hostnames
+                .iter()
+                .filter(|h| hostname_matches(h, host))
+                .map(|h| {
+                    if h.starts_with("*.") {
+                        (0, h.len())
+                    } else {
+                        (h.len(), h.len())
+                    }
+                })
+                .max()
+        };
+        let mut found: Option<((usize, usize), &RouteEntry)> = None;
+        for e in on_port().filter(|e| listener_specificity(e.listener_hostname.as_deref()) == best) {
+            let Some(score) = host_score(e) else { continue };
+            // Entries are in precedence order: an equal score keeps the earlier one.
+            if e.r#match.matches(path, method, headers, query) && found.is_none_or(|(s, _)| score > s) {
+                found = Some((score, e));
+            }
+        }
+        found.map(|(_, e)| e)
     }
 
     /// The hostname index must agree with the reference linear scan on every
@@ -1051,6 +1125,41 @@ mod tests {
                 }
             }
         }
+    }
+
+    // Among the routes that match a request, the one whose hostname matches it most
+    // specifically wins, before any match criteria: a route with no hostnames, or a
+    // wildcard one with a longer path, never takes a request from a route that
+    // names its exact host, nor does an older route with no hostnames (T018).
+    #[test]
+    fn route_hostname_precedes_match_precedence() {
+        let route = |name: &str, hostnames: &[&str], path: PathMatch, created: i64| {
+            let mut e = entry(path, 0);
+            e.hostnames = hostnames.iter().map(|h| h.to_string()).collect();
+            e.route_key = format!("ns/{name}").into();
+            e.route_creation = created;
+            e
+        };
+        let mut t = RouteTable {
+            entries: vec![
+                route("default", &[], PathMatch::Prefix("/".into()), 0),
+                route("shop", &["shop.example"], PathMatch::Prefix("/".into()), 1),
+                route("grab", &[], PathMatch::Prefix("/login".into()), 2),
+                route("grab-wild", &["*.example"], PathMatch::Exact("/checkout".into()), 3),
+                route("wild-longer", &["*.b.example"], PathMatch::Prefix("/".into()), 4),
+            ],
+            ..Default::default()
+        };
+        t.sort();
+        let h = http::HeaderMap::new();
+        let served = |host: &str, path: &str| t.match_request(80, host, path, "GET", &h, "").map(|e| &*e.route_key);
+        assert_eq!(served("shop.example", "/login"), Some("ns/shop"));
+        assert_eq!(served("SHOP.example", "/checkout"), Some("ns/shop"));
+        assert_eq!(served("shop.example", "/"), Some("ns/shop"));
+        assert_eq!(served("other.example", "/checkout"), Some("ns/grab-wild"));
+        assert_eq!(served("other.example", "/login"), Some("ns/grab"));
+        assert_eq!(served("a.b.example", "/checkout"), Some("ns/wild-longer"));
+        assert_eq!(served("other.org", "/"), Some("ns/default"));
     }
 
     #[test]

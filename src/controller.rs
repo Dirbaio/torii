@@ -1212,16 +1212,21 @@ impl ReconcileCtx {
                 if l.protocol != "HTTP" && l.protocol != "HTTPS" {
                     continue;
                 }
-                // Effective hostnames = intersection of route hostnames and the
-                // listener hostname. Empty route hostnames inherit the listener's;
-                // a listener with no hostname matches any.
-                let effective_hosts: Arc<[String]> = effective_hostnames(hostnames, l.hostname.as_deref()).into();
+                // The route's hostnames that overlap the listener's: the data plane
+                // matches requests and ranks routes by them. None when the route
+                // names none: it then takes any host its listener does, below the
+                // routes that name it.
+                let route_hosts: Arc<[String]> = hostnames
+                    .iter()
+                    .filter(|h| l.hostname.as_deref().is_none_or(|lh| hostnames_intersect(lh, h)))
+                    .cloned()
+                    .collect();
                 for r in &rules.rules {
                     for (match_order, m) in r.matches.iter().enumerate() {
                         table.entries.push(RouteEntry {
                             listener_port: l.port as u16,
                             listener_hostname: l.hostname.clone(),
-                            hostnames: effective_hosts.clone(),
+                            hostnames: route_hosts.clone(),
                             r#match: m.clone(),
                             rule: r.rule.clone(),
                             route_creation,
