@@ -1318,6 +1318,15 @@ impl ReconcileCtx {
                 }
 
                 match self.service_endpoints(backends, &bns, &backend_ref.name, svc_port) {
+                    // A port whose appProtocol torii cannot speak is invalid (the
+                    // spec asks for ResolvedRefs=False/UnsupportedProtocol).
+                    Some(_)
+                        if self
+                            .unsupported_app_protocol(backends, &bns, &backend_ref.name, svc_port)
+                            .is_some() =>
+                    {
+                        out.refs_failure.get_or_insert("UnsupportedProtocol");
+                    }
                     // Service exists (ResolvedRefs=True) — even with zero ready
                     // endpoints, the ref is resolved; an empty backend yields a
                     // 503 at traffic time, not BackendNotFound.
@@ -1862,20 +1871,13 @@ impl ReconcileCtx {
         let Some(svc) = find_in(&self.stores.services, ns, svc_name) else {
             return Vec::new();
         };
-        let ports = svc.spec.as_ref().and_then(|s| s.ports.as_ref());
-        let Some(ports) = ports else {
-            return Vec::new();
-        };
-        match section {
-            // sectionName = a specific Service port name.
-            Some(name) => ports
-                .iter()
-                .filter(|p| p.name.as_deref() == Some(name.as_str()))
-                .map(|p| p.port as u16)
-                .collect(),
-            // No sectionName → all the Service's ports.
-            None => ports.iter().map(|p| p.port as u16).collect(),
-        }
+        // Only TCP ports: routes reach backends over TCP, and a UDP port may share
+        // its number with the TCP one the policy does not name.
+        tcp_service_ports(&svc)
+            // sectionName = a specific Service port name; none → all its ports.
+            .filter(|p| section.is_none() || p.name.as_ref() == section.as_ref())
+            .map(|p| p.port as u16)
+            .collect()
     }
 
     /// Resolve + validate a policy's CA bundle. The single CA validation path —
@@ -2020,6 +2022,32 @@ impl ReconcileCtx {
         endpoints
     }
 
+    /// Why an HTTPRoute cannot send to Service port `ns/name:port` with the protocol
+    /// its `appProtocol` names, if it cannot: torii speaks HTTP/1.1 to backends,
+    /// over TLS only where a BackendTLSPolicy covers the port. None also when the
+    /// port does not exist (that is reported as a missing backend).
+    fn unsupported_app_protocol(&self, index: &BackendIndex, ns: &str, name: &str, port: u16) -> Option<String> {
+        let svc = find_in(&self.stores.services, ns, name)?;
+        let app = tcp_service_ports(&svc)
+            .find(|p| p.port == port as i32)?
+            .app_protocol
+            .clone()?;
+        let tls = index
+            .upstream_tls
+            .contains_key(&(ns.to_string(), name.to_string(), port));
+        match app.to_ascii_lowercase().as_str() {
+            "http" | "kubernetes.io/ws" => None,
+            "https" | "kubernetes.io/wss" if tls => None,
+            "https" | "kubernetes.io/wss" => Some(format!(
+                "Service {ns}/{name} port {port} has appProtocol {app}, and no BackendTLSPolicy for it tells torii how \
+                 to verify the backend's TLS"
+            )),
+            _ => Some(format!(
+                "Service {ns}/{name} port {port} has appProtocol {app}, which torii does not speak to backends"
+            )),
+        }
+    }
+
     /// Resolve a Service port's ready endpoints from the Service's EndpointSlices,
     /// as kube-proxy does: in each slice, the port named like the Service port (the
     /// EndpointSlice controller names slice ports after Service ports, and resolves
@@ -2036,17 +2064,8 @@ impl ReconcileCtx {
         // Find the Service port, for its name and protocol.
         let svc = find_in(&self.stores.services, ns, svc_name)?;
 
-        let port_spec = svc
-            .spec
-            .as_ref()?
-            .ports
-            .as_ref()?
-            .iter()
-            .find(|p| p.port == svc_port as i32)?
-            .clone();
-
+        let port_spec = tcp_service_ports(&svc).find(|p| p.port == svc_port as i32)?;
         let port_name = port_spec.name.as_deref().unwrap_or_default();
-        let port_protocol = port_spec.protocol.as_deref().unwrap_or("TCP");
         // Plaintext by default; a BackendTLSPolicy targeting this Service port
         // re-encrypts (or, when invalid, fails every request).
         let tls = index
@@ -2070,8 +2089,7 @@ impl ReconcileCtx {
             // The Service port's number on this slice; a slice without it serves
             // other ports of the Service only.
             let port = slice.ports.iter().flatten().find(|p| {
-                p.name.as_deref().unwrap_or_default() == port_name
-                    && p.protocol.as_deref().unwrap_or("TCP") == port_protocol
+                p.name.as_deref().unwrap_or_default() == port_name && p.protocol.as_deref().unwrap_or("TCP") == "TCP"
             });
             let Some(port) = port.and_then(|p| p.port) else {
                 continue;
@@ -2701,6 +2719,15 @@ fn tls_route_targets_service_in(route: &TLSRoute, svc_names: &[String], svc_ns: 
         .any(|b| svc_names.contains(&b.name) && b.namespace.as_deref().unwrap_or(&r_ns) == svc_ns)
 }
 
+/// A Service's TCP ports (a port without a protocol is TCP): routes reach their
+/// backends over TCP.
+fn tcp_service_ports(svc: &Service) -> impl Iterator<Item = &k8s_openapi::api::core::v1::ServicePort> {
+    svc.spec
+        .iter()
+        .flat_map(|s| s.ports.iter().flatten())
+        .filter(|p| p.protocol.as_deref().unwrap_or("TCP") == "TCP")
+}
+
 /// Find a namespaced object by name in a reflector store. Centralizes the
 /// "scan store for name+namespace" lookup shared by the Secret/ConfigMap/Service
 /// resolvers.
@@ -3283,6 +3310,71 @@ mod tests {
         assert_eq!(resolve("crossed", 81), ["10.0.0.4:7002"]);
         assert_eq!(resolve("external", 80), ["10.0.0.5:8443"]);
         assert!(endpoints("named", 81).is_none());
+    }
+
+    // Routes reach backends over TCP: a UDP port with the same number is not theirs
+    // (T091). A port whose appProtocol torii cannot speak is invalid (T147).
+    #[tokio::test]
+    async fn backends_are_tcp_ports_in_a_protocol_torii_speaks() {
+        let service = |name: &str, ports: serde_json::Value| -> Service {
+            serde_json::from_value(serde_json::json!({
+                "metadata": { "name": name, "namespace": "ns" },
+                "spec": { "ports": ports },
+            }))
+            .unwrap()
+        };
+        let services = vec![
+            service(
+                "dns",
+                serde_json::json!([
+                    { "name": "dns-udp", "port": 53, "protocol": "UDP" },
+                    { "name": "dns-tcp", "port": 53, "protocol": "TCP" },
+                ]),
+            ),
+            service(
+                "apps",
+                serde_json::json!([
+                    { "name": "plain", "port": 80 },
+                    { "name": "http", "port": 81, "appProtocol": "http" },
+                    { "name": "ws", "port": 82, "appProtocol": "kubernetes.io/ws" },
+                    { "name": "h2c", "port": 83, "appProtocol": "kubernetes.io/h2c" },
+                    { "name": "https", "port": 443, "appProtocol": "HTTPS" },
+                ]),
+            ),
+        ];
+        let slice: EndpointSlice = serde_json::from_value(serde_json::json!({
+            "metadata": { "name": "dns", "namespace": "ns", "labels": { "kubernetes.io/service-name": "dns" } },
+            "addressType": "IPv4",
+            "endpoints": [{ "addresses": ["10.0.0.1", "10.0.0.2"] }],
+            "ports": [
+                { "name": "dns-udp", "port": 5353, "protocol": "UDP" },
+                { "name": "dns-tcp", "port": 8053, "protocol": "TCP" },
+            ],
+        }))
+        .unwrap();
+        let stores = Stores {
+            services: store_of(services),
+            endpoint_slices: store_of(vec![slice]),
+            ..no_objects()
+        };
+        let ctx = test_ctx(stores, &[80], &[443]);
+        let mut index = BackendIndex::new(ctx.stores.endpoint_slices.state(), UpstreamTlsMap::new());
+        let endpoints = ctx.service_endpoints(&mut index, "ns", "dns", 53).unwrap();
+        let endpoints: Vec<String> = endpoints.iter().map(|e| format!("{}:{}", e.ip, e.port)).collect();
+        // The TCP slice port, and only an endpoint's first address.
+        assert_eq!(endpoints, ["10.0.0.1:8053"]);
+
+        let unsupported = |index: &BackendIndex, port: u16| ctx.unsupported_app_protocol(index, "ns", "apps", port);
+        for port in [80, 81, 82] {
+            assert_eq!(unsupported(&index, port), None, "{port}");
+        }
+        assert!(unsupported(&index, 83).unwrap().contains("kubernetes.io/h2c"));
+        assert!(unsupported(&index, 443).unwrap().contains("BackendTLSPolicy"));
+        index.upstream_tls.insert(
+            ("ns".into(), "apps".into(), 443),
+            crate::route_table::BackendTls::Invalid,
+        );
+        assert_eq!(unsupported(&index, 443), None);
     }
 
     fn lbls(pairs: &[(&str, &str)]) -> std::collections::BTreeMap<String, String> {
