@@ -523,6 +523,10 @@ struct PolicyOutcome {
 /// (no policy → absent → the route defaults the endpoint to Plaintext).
 type UpstreamTlsMap = HashMap<ServicePort, crate::route_table::BackendTls>;
 
+/// The attachedRoutes of each listener: (Gateway namespace, Gateway name) →
+/// listener name → count.
+type AttachCounts = BTreeMap<(String, String), BTreeMap<String, i32>>;
+
 /// A Service port: (namespace, Service name, port number).
 type ServicePort = (String, String, u16);
 
@@ -560,12 +564,30 @@ impl BackendIndex {
 /// An HTTPRoute's rules as the data plane runs them, and what they report in the
 /// route's status: the same for each of the route's parents.
 struct RouteRules {
-    /// The rules torii programs.
+    /// The rules torii programs: those it implements, and those whose requests get
+    /// a 500 because it cannot do what they ask (see [`InvalidRule`]).
     rules: Vec<RouteRule>,
-    /// Why some rule is not programmed, for the route's Accepted condition.
-    unsupported: Option<String>,
+    /// Why none of the route is programmed: it does not decode, or two of its
+    /// rules have one name.
+    rejected: Option<String>,
+    /// How many of the route's rules torii implements.
+    implemented: usize,
+    /// Why each rule torii does not implement is dropped.
+    dropped: Vec<String>,
     /// Why some backendRef did not resolve, for the route's ResolvedRefs condition.
     refs_failure: Option<&'static str>,
+}
+
+impl RouteRules {
+    /// Why the route is not accepted where it attaches, if it is not: torii
+    /// implements none of it. (A route of which torii implements some rules is
+    /// accepted, and PartiallyInvalid.)
+    fn rejection(&self) -> Option<String> {
+        if let Some(why) = &self.rejected {
+            return Some(why.clone());
+        }
+        (self.implemented == 0 && !self.dropped.is_empty()).then(|| self.dropped.join("; "))
+    }
 }
 
 /// One programmed HTTPRoute rule: what it does, shared by all its entries, and
@@ -668,7 +690,7 @@ impl ReconcileCtx {
         let mut tls_table = crate::tls_table::TlsTable::default();
         let mut backends = BackendIndex::new(self.stores.endpoint_slices.state(), upstream_tls);
         // (gw_ns, gw_name) → (listener_name → count).
-        let mut attach_counts: BTreeMap<(String, String), BTreeMap<String, i32>> = BTreeMap::new();
+        let mut attach_counts: AttachCounts = BTreeMap::new();
         for route in &routes {
             if let Some(patch) = self.process_route(route, &models, &mut backends, &mut route_table, &mut attach_counts)
             {
@@ -732,11 +754,7 @@ impl ReconcileCtx {
     /// the counts we just computed (so ACME echoes the controller's value). Wildcard/empty
     /// hostnames and missing issuer/email are NOT filtered here — they're included so ACME
     /// reports their Unsupported/Failed state, matching the old self-listing behaviour.
-    fn acme_targets(
-        &self,
-        models: &[GatewayModel],
-        attach_counts: &BTreeMap<(String, String), BTreeMap<String, i32>>,
-    ) -> Vec<crate::acme::AcmeTarget> {
+    fn acme_targets(&self, models: &[GatewayModel], attach_counts: &AttachCounts) -> Vec<crate::acme::AcmeTarget> {
         use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
         let mut out = Vec::new();
         for model in models {
@@ -1109,11 +1127,7 @@ impl ReconcileCtx {
 
     /// STAGE 3: derive a Gateway's status from its computed model + attachment
     /// counts. Conditions come from `ListenerOutcome` DATA, never from conditions.
-    fn gateway_patch(
-        &self,
-        model: &GatewayModel,
-        attach_counts: &BTreeMap<(String, String), BTreeMap<String, i32>>,
-    ) -> StatusPatch {
+    fn gateway_patch(&self, model: &GatewayModel, attach_counts: &AttachCounts) -> StatusPatch {
         let gw = &model.gw;
         let generation = model.generation;
         let ns = gw.namespace().unwrap_or_default();
@@ -1267,7 +1281,7 @@ impl ReconcileCtx {
         models: &[GatewayModel],
         backends: &mut BackendIndex,
         table: &mut RouteTable,
-        attach_counts: &mut BTreeMap<(String, String), BTreeMap<String, i32>>,
+        attach_counts: &mut AttachCounts,
     ) -> Option<StatusPatch> {
         let generation = route.meta().generation.unwrap_or(0);
         let route_ns = route.namespace().unwrap_or_default();
@@ -1300,18 +1314,21 @@ impl ReconcileCtx {
             // listener hostname. Returns the attached listeners and, if none, the
             // Accepted=False reason. Computed ONCE; drives both counts and routing.
             let (attached_listeners, accept_reason) = self.attached_listeners(route, model, pref);
+            let rules = rules.get_or_insert_with(|| self.route_rules(route, backends));
+            let rejection = rules.rejection();
 
             // attachedRoutes counts: ensure every listener has a 0 entry, then
-            // increment the ones this route attached to.
+            // increment the ones this route attached to, if it is accepted there
+            // (the spec counts only routes with Accepted=True).
             let gw_counts = attach_counts.entry((parent_ns.clone(), gw.name_any())).or_default();
             for l in &gw.spec.listeners {
                 gw_counts.entry(l.name.clone()).or_insert(0);
             }
-            for l in &attached_listeners {
-                *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
+            if rejection.is_none() {
+                for l in &attached_listeners {
+                    *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
+                }
             }
-
-            let rules = rules.get_or_insert_with(|| self.route_rules(route, backends));
 
             // Contribute one RouteEntry per (attached HTTP(S) listener × match).
             // HTTPS listeners terminate TLS then route HTTP, so they carry
@@ -1347,9 +1364,10 @@ impl ReconcileCtx {
             }
 
             // Accepted: attachment failure (no listener took the route) wins; then a
-            // rule with an unsupported value → UnsupportedValue + an explanatory
-            // message; otherwise Accepted.
-            let accepted = match (accept_reason, &rules.unsupported) {
+            // route torii implements none of → UnsupportedValue + an explanatory
+            // message; otherwise Accepted, and PartiallyInvalid if torii dropped
+            // some rules (the spec's "Dropped Rule" approach).
+            let accepted = match (accept_reason, &rejection) {
                 (Some(reason), _) => condition("Accepted", "False", reason, generation),
                 (None, Some(msg)) => condition_msg("Accepted", "False", "UnsupportedValue", msg, generation),
                 (None, None) => condition("Accepted", "True", "Accepted", generation),
@@ -1359,6 +1377,17 @@ impl ReconcileCtx {
                 None => condition("ResolvedRefs", "True", "ResolvedRefs", generation),
                 Some(reason) => condition("ResolvedRefs", "False", reason, generation),
             };
+            let mut conditions = vec![accepted, resolved];
+            if accept_reason.is_none() && rejection.is_none() && !rules.dropped.is_empty() {
+                let msg = format!("Dropped Rule(s): {}", rules.dropped.join("; "));
+                conditions.push(condition_msg(
+                    "PartiallyInvalid",
+                    "True",
+                    "UnsupportedValue",
+                    &msg,
+                    generation,
+                ));
+            }
 
             parents.push(HttpRouteStatusParents {
                 parent_ref: HttpRouteStatusParentsParentRef {
@@ -1370,7 +1399,7 @@ impl ReconcileCtx {
                     section_name: pref.section_name.clone(),
                 },
                 controller_name: CONTROLLER_NAME.to_string(),
-                conditions: vec![accepted, resolved],
+                conditions,
             });
         }
 
@@ -1392,19 +1421,47 @@ impl ReconcileCtx {
     /// parents and listeners, which share them.
     fn route_rules(&self, route: &HTTPRoute, backends: &mut BackendIndex) -> RouteRules {
         let route_ns = route.namespace().unwrap_or_default();
+        let rules = route.spec.rules.as_deref().unwrap_or_default();
         // A route torii cannot decode is a stand-in with no rules (see
-        // `route_stand_in`).
+        // `route_stand_in`). Rule names must be unique within a route: the
+        // experimental channel's CRD rejects such a route, and so does torii.
+        let rejected = route
+            .annotations()
+            .get(UNDECODABLE_ANNOTATION)
+            .cloned()
+            .or_else(|| duplicate_rule_name(rules.iter().map(|r| r.name.as_deref())));
         let mut out = RouteRules {
             rules: Vec::new(),
-            unsupported: route.annotations().get(UNDECODABLE_ANNOTATION).cloned(),
+            rejected,
+            implemented: 0,
+            dropped: Vec::new(),
             refs_failure: None,
         };
-        for (rule_order, rule) in route.spec.rules.iter().flatten().enumerate() {
-            // A rule with a CRD-valid but unsupported value is not programmed;
-            // record the reason for the route's Accepted condition and skip it.
-            if let Some(msg) = validate_http_rule(rule_order, rule) {
-                out.unsupported.get_or_insert(msg);
-                continue;
+        if out.rejected.is_some() {
+            return out;
+        }
+        for (rule_order, rule) in rules.iter().enumerate() {
+            match validate_http_rule(rule_order, rule) {
+                None => {}
+                // The requests the rule matches cannot be told: they go to other
+                // rules (the spec's "Dropped Rule").
+                Some(InvalidRule::Unmatchable(why)) => {
+                    out.dropped.push(why);
+                    continue;
+                }
+                // torii cannot do what the rule asks of the requests it matches:
+                // they get a 500, rather than other rules' treatment without it
+                // (an ExtensionRef filter, say an authentication one, MUST NOT be
+                // skipped). A rule with no backends or filters answers 500.
+                Some(InvalidRule::Unsupported(why)) => {
+                    out.dropped.push(format!("{why}, so its requests get HTTP 500"));
+                    out.rules.push(RouteRule {
+                        order: rule_order,
+                        rule: Arc::default(),
+                        matches: rule_matches(rule),
+                    });
+                    continue;
+                }
             }
             // Resolve the rule's backends, tracking the most specific ResolvedRefs
             // failure reason (RefNotPermitted takes priority).
@@ -1456,14 +1513,7 @@ impl ReconcileCtx {
                 }
             }
 
-            // Each `match` in the rule is an independent OR alternative. A rule
-            // with no matches defaults to a single match-all (PathPrefix "/").
-            let matches = rule.matches.as_deref().unwrap_or_default();
-            let matches: Vec<Arc<RouteMatch>> = if matches.is_empty() {
-                vec![Arc::default()]
-            } else {
-                matches.iter().map(|m| Arc::new(route_match_from(m))).collect()
-            };
+            out.implemented += 1;
             out.rules.push(RouteRule {
                 order: rule_order,
                 rule: Arc::new(Rule {
@@ -1471,7 +1521,7 @@ impl ReconcileCtx {
                     filters: filters_from(rule.filters.as_deref().unwrap_or_default()),
                     request_timeout: rule.timeouts.as_ref().and_then(request_timeout_from),
                 }),
-                matches,
+                matches: rule_matches(rule),
             });
         }
         out
@@ -1566,14 +1616,19 @@ impl ReconcileCtx {
         models: &[GatewayModel],
         backends: &mut BackendIndex,
         tls_table: &mut TlsTable,
-        attach_counts: &mut BTreeMap<(String, String), BTreeMap<String, i32>>,
+        attach_counts: &mut AttachCounts,
     ) -> Option<StatusPatch> {
         let generation = route.meta().generation.unwrap_or(0);
         let route_ns = route.namespace().unwrap_or_default();
         let route_hostnames = &route.spec.hostnames;
         // A route torii cannot decode is a stand-in (see `route_stand_in`): it
-        // attaches like any other, but programs nothing and reports why.
-        let undecodable = route.annotations().get(UNDECODABLE_ANNOTATION);
+        // attaches like any other, but programs nothing and reports why. So does a
+        // route that names two rules alike (the spec wants rule names unique).
+        let rejected = route
+            .annotations()
+            .get(UNDECODABLE_ANNOTATION)
+            .cloned()
+            .or_else(|| duplicate_rule_name(route.spec.rules.iter().map(|r| r.name.as_deref())));
 
         // The backends of all the rules, shared by every matched SNI of every
         // parent: built once, for the first parent we own.
@@ -1594,16 +1649,19 @@ impl ReconcileCtx {
             // allowedRoutes + SNI hostname overlap + not protocol-conflicted).
             let (attached, accept_reason) = self.attached_tls_listeners(route, gw, model, pref);
 
-            // attachedRoutes counts: ensure every listener has a 0, then bump ours.
+            // attachedRoutes counts: ensure every listener has a 0, then bump ours
+            // if the route is accepted.
             let gw_counts = attach_counts.entry((parent_ns.clone(), gw.name_any())).or_default();
             for l in &gw.spec.listeners {
                 gw_counts.entry(l.name.clone()).or_insert(0);
             }
-            for (l, _) in &attached {
-                *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
+            if rejected.is_none() {
+                for (l, _) in &attached {
+                    *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
+                }
             }
 
-            let accepted = match (accept_reason, undecodable) {
+            let accepted = match (accept_reason, &rejected) {
                 (Some(reason), _) => condition("Accepted", "False", reason, generation),
                 (None, Some(msg)) => condition_msg("Accepted", "False", "UnsupportedValue", msg, generation),
                 (None, None) => condition("Accepted", "True", "Accepted", generation),
@@ -1613,9 +1671,9 @@ impl ReconcileCtx {
                 route_backends.get_or_insert_with(|| self.tls_route_backends(route, backends));
 
             // For each attached listener, add its effective SNIs to the dispatch
-            // table with the listener's mode (Passthrough vs Terminate). A stand-in
-            // has no backends and must not take its listeners' SNIs.
-            if undecodable.is_none() {
+            // table with the listener's mode (Passthrough vs Terminate). A rejected
+            // route must not take its listeners' SNIs.
+            if rejected.is_none() {
                 for (l, mode) in &attached {
                     let action = match mode {
                         TlsListenerMode::Passthrough => TlsAction::Passthrough(route_backends.clone()),
@@ -2273,18 +2331,31 @@ impl ReconcileCtx {
     }
 }
 
+/// Why torii does not implement an HTTPRoute rule whose values the CRD accepts.
+#[derive(Debug, PartialEq)]
+enum InvalidRule {
+    /// A match torii cannot evaluate: which requests the rule takes cannot be
+    /// told, so it is left out and they go to other rules.
+    Unmatchable(String),
+    /// torii can tell which requests the rule takes, but not do what the rule asks
+    /// of them (a filter it does not implement, or a value it cannot use): they
+    /// get a 500.
+    Unsupported(String),
+}
+
 /// Validate one HTTPRoute rule for values that are CRD-valid but that torii
-/// can't honor. Returns `Some(message)` describing the first such problem, or `None`
-/// if the rule is fully supported. A rule that fails this is NOT programmed into the
-/// data plane and the route reports `Accepted=False`/`UnsupportedValue` with this
-/// message — never silently dropped.
+/// can't honor, and say why for the first one found. The route then reports the
+/// rule dropped (`PartiallyInvalid`, or `Accepted=False`/`UnsupportedValue` when
+/// it has no rule torii implements) — never silently.
 fn validate_http_rule(
     rule_idx: usize,
     rule: &gateway_api::apis::standard::httproutes::HttpRouteRules,
-) -> Option<String> {
+) -> Option<InvalidRule> {
+    use InvalidRule::{Unmatchable, Unsupported};
     use gateway_api::apis::standard::httproutes::{
-        HttpRouteRulesFiltersType as FType, HttpRouteRulesMatchesHeadersType as HType,
-        HttpRouteRulesMatchesPathType as PType, HttpRouteRulesMatchesQueryParamsType as QType,
+        HttpRouteRulesBackendRefsFiltersType as BType, HttpRouteRulesFiltersType as FType,
+        HttpRouteRulesMatchesHeadersType as HType, HttpRouteRulesMatchesPathType as PType,
+        HttpRouteRulesMatchesQueryParamsType as QType,
     };
     let at = format!("rules[{rule_idx}]");
 
@@ -2293,36 +2364,36 @@ fn validate_http_rule(
         if let Some(p) = &m.path
             && matches!(p.r#type, Some(PType::RegularExpression))
         {
-            return Some(format!(
+            return Some(Unmatchable(format!(
                 "{at}.matches[{mi}].path: RegularExpression path matching is not supported"
-            ));
+            )));
         }
         // Path: the data plane refuses a request whose `;params` decide its route (see
-        // `GatewayProxy::request_filter`), so a value with them would only refuse.
+        // `proxy::decide`), so a value with them would only refuse.
         if let Some(p) = &m.path
             && p.value.as_deref().is_some_and(|v| v.contains(';'))
         {
-            return Some(format!(
+            return Some(Unmatchable(format!(
                 "{at}.matches[{mi}].path: ';' path parameters are not supported"
-            ));
+            )));
         }
         // Header match: a RegularExpression value must compile.
         for (hi, h) in m.headers.iter().flatten().enumerate() {
             if matches!(h.r#type, Some(HType::RegularExpression))
                 && let Err(e) = regex::Regex::new(&h.value)
             {
-                return Some(format!(
+                return Some(Unmatchable(format!(
                     "{at}.matches[{mi}].headers[{hi}]: invalid RegularExpression {:?}: {e}",
                     h.value
-                ));
+                )));
             }
         }
         // Query params: RegularExpression is not implemented (we match Exact only).
         for (qi, q) in m.query_params.iter().flatten().enumerate() {
             if matches!(q.r#type, Some(QType::RegularExpression)) {
-                return Some(format!(
+                return Some(Unmatchable(format!(
                     "{at}.matches[{mi}].queryParams[{qi}]: RegularExpression query matching is not supported"
-                ));
+                )));
             }
         }
     }
@@ -2336,10 +2407,14 @@ fn validate_http_rule(
             | FType::UrlRewrite
             | FType::Cors => {}
             FType::RequestMirror => {
-                return Some(format!("{at}.filters[{fi}]: RequestMirror is not supported"));
+                return Some(Unsupported(format!(
+                    "{at}.filters[{fi}]: RequestMirror is not supported"
+                )));
             }
             FType::ExtensionRef => {
-                return Some(format!("{at}.filters[{fi}]: ExtensionRef filters are not supported"));
+                return Some(Unsupported(format!(
+                    "{at}.filters[{fi}]: ExtensionRef filters are not supported"
+                )));
             }
         }
         // Redirect status code must be a valid HTTP redirect code.
@@ -2347,9 +2422,21 @@ fn validate_http_rule(
             && let Some(code) = r.status_code
             && !matches!(code, 301 | 302 | 303 | 307 | 308)
         {
-            return Some(format!(
+            return Some(Unsupported(format!(
                 "{at}.filters[{fi}].requestRedirect.statusCode: unsupported value {code}"
-            ));
+            )));
+        }
+    }
+    // A backendRef's own filters: torii applies the header modifiers only.
+    for (bi, b) in rule.backend_refs.iter().flatten().enumerate() {
+        for (fi, f) in b.filters.iter().flatten().enumerate() {
+            if !matches!(f.r#type, BType::RequestHeaderModifier | BType::ResponseHeaderModifier) {
+                let ty = serde_json::to_value(&f.r#type).unwrap_or_default();
+                let ty = ty.as_str().unwrap_or_default();
+                return Some(Unsupported(format!(
+                    "{at}.backendRefs[{bi}].filters[{fi}]: {ty} filters on a backendRef are not supported"
+                )));
+            }
         }
     }
 
@@ -2360,12 +2447,31 @@ fn validate_http_rule(
             if let Some(s) = val
                 && parse_gep2257_duration(s).is_none()
             {
-                return Some(format!("{at}.timeouts.{field}: invalid duration {s:?}"));
+                return Some(Unsupported(format!("{at}.timeouts.{field}: invalid duration {s:?}")));
             }
         }
     }
 
     None
+}
+
+/// The first rule name that an earlier rule of the route has too, as a message:
+/// the spec wants them unique within a route.
+fn duplicate_rule_name<'a>(names: impl Iterator<Item = Option<&'a str>>) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    names.enumerate().find_map(|(i, name)| {
+        let name = name?;
+        (!seen.insert(name)).then(|| format!("rules[{i}].name: an earlier rule is named {name:?} too"))
+    })
+}
+
+/// A rule's matches. Each `match` in the rule is an independent OR alternative;
+/// a rule with no matches defaults to a single match-all (PathPrefix "/").
+fn rule_matches(rule: &gateway_api::apis::standard::httproutes::HttpRouteRules) -> Vec<Arc<RouteMatch>> {
+    match rule.matches.as_deref() {
+        None | Some([]) => vec![Arc::default()],
+        Some(matches) => matches.iter().map(|m| Arc::new(route_match_from(m))).collect(),
+    }
 }
 
 /// Convert a Gateway API HTTPRouteMatch into our internal RouteMatch.
@@ -3317,6 +3423,155 @@ mod tests {
             reasons(status.conditions.as_deref().unwrap()),
             ["Accepted=True/ListenersNotValid", "Programmed=False/Invalid"]
         );
+    }
+
+    /// A Gateway `gw` in namespace `ns` with an HTTP listener `http` on port 80.
+    fn http_gateway() -> Gateway {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "Gateway",
+            "metadata": { "name": "gw", "namespace": "ns", "generation": 1 },
+            "spec": {
+                "gatewayClassName": "torii",
+                "listeners": [{ "name": "http", "port": 80, "protocol": "HTTP" }],
+            },
+        }))
+        .unwrap()
+    }
+
+    /// An HTTPRoute `name` in namespace `ns` with `spec`.
+    fn http_route_with(name: &str, spec: serde_json::Value) -> HTTPRoute {
+        serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "HTTPRoute",
+            "metadata": { "name": name, "namespace": "ns", "generation": 1 },
+            "spec": spec,
+        }))
+        .unwrap()
+    }
+
+    /// `route`'s pass on the Gateways in `ctx`: its status, its entries in the
+    /// route table, and the attachedRoutes counts.
+    fn route_pass(ctx: &ReconcileCtx, route: &HTTPRoute) -> (Option<HttpRouteStatus>, RouteTable, AttachCounts) {
+        let models: Vec<GatewayModel> = ctx
+            .stores
+            .gateways
+            .state()
+            .iter()
+            .map(|gw| ctx.build_gateway_model(gw))
+            .collect();
+        let mut backends = BackendIndex::new(ctx.stores.endpoint_slices.state(), UpstreamTlsMap::new());
+        let mut table = RouteTable::default();
+        let mut counts = BTreeMap::new();
+        let patch = ctx.process_route(route, &models, &mut backends, &mut table, &mut counts);
+        let status = patch.map(|mut p| serde_json::from_value(p.json["status"].take()).unwrap());
+        table.sort();
+        (status, table, counts)
+    }
+
+    /// The conditions of a route's first parent, as `type=status/reason`, and
+    /// their messages.
+    fn parent_conditions(status: &HttpRouteStatus) -> (Vec<String>, Vec<String>) {
+        let conditions = &status.parents[0].conditions;
+        (
+            reasons(conditions),
+            conditions.iter().map(|c| c.message.clone()).collect(),
+        )
+    }
+
+    // A rule torii cannot honor is dropped with a reason, and the route is
+    // accepted for the rules it implements (PartiallyInvalid, T161), or not at all
+    // when it implements none. A dropped rule that says which requests it takes
+    // keeps them, with a 500, instead of letting other rules take them without
+    // its filter (T049, T048). Only an accepted route counts in attachedRoutes
+    // (T154), and rule names must be unique (T199).
+    #[tokio::test]
+    async fn invalid_rules_are_dropped_and_fail_closed() {
+        let ctx = test_ctx(
+            Stores {
+                gateways: store_of(vec![http_gateway()]),
+                ..no_objects()
+            },
+            &[80],
+            &[],
+        );
+        let ext_auth = serde_json::json!({
+            "type": "ExtensionRef",
+            "extensionRef": { "group": "auth.example", "kind": "BasicAuth", "name": "admins" },
+        });
+        let rewrite = serde_json::json!({ "type": "URLRewrite", "urlRewrite": { "hostname": "internal.example" } });
+        let admin = serde_json::json!({ "path": { "type": "PathPrefix", "value": "/admin" } });
+        let regex = serde_json::json!({ "path": { "type": "RegularExpression", "value": "/r.*" } });
+        let counted = |counts: &AttachCounts| counts[&("ns".to_string(), "gw".to_string())]["http"];
+
+        // One implemented rule, one guarded by an ExtensionRef filter, one with a
+        // backendRef filter torii does not apply, one it cannot match.
+        let route = http_route_with(
+            "partial",
+            serde_json::json!({
+                "parentRefs": [{ "name": "gw" }],
+                "rules": [
+                    { "matches": [admin], "filters": [ext_auth] },
+                    { "matches": [{ "path": { "value": "/rw" } }],
+                      "backendRefs": [{ "name": "app", "port": 80, "filters": [rewrite] }] },
+                    { "matches": [regex] },
+                    {},
+                ],
+            }),
+        );
+        let (status, table, counts) = route_pass(&ctx, &route);
+        let (conditions, messages) = parent_conditions(&status.unwrap());
+        assert_eq!(
+            conditions,
+            [
+                "Accepted=True/Accepted",
+                "ResolvedRefs=True/ResolvedRefs",
+                "PartiallyInvalid=True/UnsupportedValue"
+            ]
+        );
+        assert!(messages[2].starts_with("Dropped Rule(s): rules[0].filters[0]: ExtensionRef"));
+        assert!(messages[2].contains("rules[1].backendRefs[0].filters[0]: URLRewrite"));
+        assert!(messages[2].contains("rules[2].matches[0].path: RegularExpression"));
+        assert_eq!(counted(&counts), 1);
+        let h = http::HeaderMap::new();
+        let rule_of = |path: &str| {
+            let entry = table.match_request(80, "a.example", path, "GET", &h, "").unwrap();
+            (
+                entry.rule_order,
+                entry.rule.backends.len(),
+                entry.rule.filters.url_rewrite.is_some(),
+            )
+        };
+        // The guarded rules keep their requests, with nothing to send them to.
+        assert_eq!(rule_of("/admin/x"), (0, 0, false));
+        assert_eq!(rule_of("/rw"), (1, 0, false));
+        assert_eq!(rule_of("/r1"), (3, 0, false));
+
+        // No rule implemented: not accepted, not counted, its guard still holds.
+        let route = http_route_with(
+            "guard",
+            serde_json::json!({ "parentRefs": [{ "name": "gw" }], "rules": [{ "matches": [admin], "filters": [ext_auth] }] }),
+        );
+        let (status, table, counts) = route_pass(&ctx, &route);
+        let (conditions, _) = parent_conditions(&status.unwrap());
+        assert_eq!(
+            conditions,
+            ["Accepted=False/UnsupportedValue", "ResolvedRefs=True/ResolvedRefs"]
+        );
+        assert_eq!(counted(&counts), 0);
+        assert_eq!(table.entries.len(), 1);
+
+        // Two rules named alike: none of the route is programmed.
+        let route = http_route_with(
+            "dup",
+            serde_json::json!({ "parentRefs": [{ "name": "gw" }], "rules": [{ "name": "a" }, { "name": "a" }] }),
+        );
+        let (status, table, counts) = route_pass(&ctx, &route);
+        let (conditions, messages) = parent_conditions(&status.unwrap());
+        assert_eq!(conditions[0], "Accepted=False/UnsupportedValue");
+        assert!(messages[0].contains("rules[1].name"), "{}", messages[0]);
+        assert_eq!(counted(&counts), 0);
+        assert!(table.entries.is_empty());
     }
 
     // The data plane serves HTTP on --http-ports and TLS on --tls-ports, nothing
