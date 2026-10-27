@@ -475,7 +475,7 @@ struct GatewayModel {
     gw: Arc<Gateway>,
     generation: i64,
     /// False when the Gateway is rejected (invalid parametersRef) — it must not
-    /// serve traffic, and routes must not claim it as a parent.
+    /// serve traffic, and none of its listeners accepts a route.
     usable: bool,
     invalid_parameters: bool,
     listeners: Vec<ListenerOutcome>,
@@ -757,7 +757,8 @@ impl ReconcileCtx {
     fn acme_targets(&self, models: &[GatewayModel], attach_counts: &AttachCounts) -> Vec<crate::acme::AcmeTarget> {
         use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
         let mut out = Vec::new();
-        for model in models {
+        // A rejected Gateway serves no certificate.
+        for model in models.iter().filter(|m| m.usable) {
             let gw = &model.gw;
             let anns = gw.metadata.annotations.clone().unwrap_or_default();
             // Opt-in: the enable annotation must be PRESENT (value ignored).
@@ -1169,7 +1170,16 @@ impl ReconcileCtx {
                 } else {
                     condition("ResolvedRefs", "True", "ResolvedRefs", generation)
                 };
-                let programmed = if o.programmed() {
+                // A rejected Gateway serves none of its listeners.
+                let programmed = if !model.usable {
+                    condition_msg(
+                        "Programmed",
+                        "False",
+                        "Invalid",
+                        "the Gateway is not accepted (InvalidParameters), so none of its listeners is served",
+                        generation,
+                    )
+                } else if o.programmed() {
                     condition("Programmed", "True", "Programmed", generation)
                 } else {
                     condition("Programmed", "False", "Invalid", generation)
@@ -1226,11 +1236,15 @@ impl ReconcileCtx {
             vec![accepted, programmed]
         };
 
-        let status = GatewayStatus {
-            addresses: Some(vec![GatewayStatusAddresses {
+        // The addresses bound for the Gateway: none for a rejected one.
+        let addresses = model.usable.then(|| {
+            vec![GatewayStatusAddresses {
                 r#type: Some("IPAddress".into()),
                 value: self.config.advertise_address.clone(),
-            }]),
+            }]
+        });
+        let status = GatewayStatus {
+            addresses,
             conditions: Some(conditions),
             listeners: Some(listeners),
             attached_listener_sets: None,
@@ -1313,11 +1327,13 @@ impl ReconcileCtx {
             if !seen.insert((parent_ns.clone(), &pref.name, &pref.section_name, pref.port)) {
                 continue;
             }
-            // Find the parent Gateway among the usable ones we own.
-            let Some(model) = models.iter().find(|m| {
-                m.usable && m.gw.name_any() == pref.name && m.gw.namespace().unwrap_or_default() == parent_ns
-            }) else {
-                continue; // not ours / not found / not usable — don't claim status
+            // Find the parent Gateway among the ones we own (a rejected one too:
+            // the route then learns it is not accepted there).
+            let Some(model) = models
+                .iter()
+                .find(|m| m.gw.name_any() == pref.name && m.gw.namespace().unwrap_or_default() == parent_ns)
+            else {
+                continue; // not ours / not found — don't claim status
             };
             let gw = &model.gw;
 
@@ -1562,6 +1578,10 @@ impl ReconcileCtx {
         let gw = &model.gw;
         let route_ns = route.namespace().unwrap_or_default();
         let route_hostnames: &[String] = route.spec.hostnames.as_deref().unwrap_or_default();
+        // A rejected Gateway serves nothing, so none of its listeners takes routes.
+        if !model.usable {
+            return (vec![], Some("NotAllowedByListeners"));
+        }
 
         // First narrow by sectionName / port (a hard parentRef selector). If the
         // ref names a section/port that no listener has, that's NoMatchingParent.
@@ -1662,11 +1682,12 @@ impl ReconcileCtx {
             if !seen.insert((parent_ns.clone(), &pref.name, &pref.section_name, pref.port)) {
                 continue;
             }
-            // Find the parent among usable Gateways we own.
-            let Some(model) = models.iter().find(|m| {
-                m.usable && m.gw.name_any() == pref.name && m.gw.namespace().unwrap_or_default() == parent_ns
-            }) else {
-                continue; // not ours / not found / not usable
+            // Find the parent among the Gateways we own.
+            let Some(model) = models
+                .iter()
+                .find(|m| m.gw.name_any() == pref.name && m.gw.namespace().unwrap_or_default() == parent_ns)
+            else {
+                continue; // not ours / not found
             };
             let gw = &model.gw;
 
@@ -1804,6 +1825,9 @@ impl ReconcileCtx {
     ) {
         let route_ns = route.namespace().unwrap_or_default();
         let route_hostnames = &route.spec.hostnames;
+        if !model.usable {
+            return (vec![], Some("NotAllowedByListeners"));
+        }
 
         // Narrow by sectionName / port first (a hard parentRef selector).
         let candidates: Vec<_> = gw
@@ -1835,8 +1859,10 @@ impl ReconcileCtx {
                 continue;
             };
             // A listener torii does not accept (mixed termination on its port, or a
-            // port that serves no TLS) accepts no routes.
-            if !outcome.accepted() {
+            // port that serves no TLS) accepts no routes. Nor does a Terminate one
+            // whose certificate did not resolve: it is not programmed, and must not
+            // terminate its routes' TLS with another certificate.
+            if !outcome.accepted() || (mode == TlsListenerMode::Terminate && outcome.tls_failure.is_some()) {
                 rejected_by_allow = true;
                 continue;
             }
@@ -3609,6 +3635,84 @@ mod tests {
         assert!(messages[0].contains("rules[1].name"), "{}", messages[0]);
         assert_eq!(counted(&counts), 0);
         assert!(table.entries.is_empty());
+    }
+
+    // A rejected Gateway serves nothing: its listeners are not Programmed, it has
+    // no address, and its routes learn they are not accepted there (T151).
+    #[tokio::test]
+    async fn a_rejected_gateway_reports_its_listeners_and_routes_unserved() {
+        let mut gw = http_gateway();
+        gw.spec.infrastructure = serde_json::from_value(serde_json::json!({
+            "parametersRef": { "group": "example.com", "kind": "Nope", "name": "x" },
+        }))
+        .unwrap();
+        let ctx = test_ctx(
+            Stores {
+                gateways: store_of(vec![gw.clone()]),
+                ..no_objects()
+            },
+            &[80],
+            &[],
+        );
+        let route = http_route_with(
+            "r",
+            serde_json::json!({ "parentRefs": [{ "name": "gw" }], "rules": [{}] }),
+        );
+        let (status, table, counts) = route_pass(&ctx, &route);
+        let (conditions, _) = parent_conditions(&status.unwrap());
+        assert_eq!(conditions[0], "Accepted=False/NotAllowedByListeners");
+        assert!(table.entries.is_empty());
+        assert_eq!(counts[&("ns".to_string(), "gw".to_string())]["http"], 0);
+
+        let mut patch = ctx.gateway_patch(&ctx.build_gateway_model(&gw), &counts);
+        let status: GatewayStatus = serde_json::from_value(patch.json["status"].take()).unwrap();
+        assert_eq!(status.addresses, None);
+        let listener = &status.listeners.unwrap()[0];
+        assert_eq!(reasons(&listener.conditions)[1], "Programmed=False/Invalid");
+    }
+
+    // A TLS Terminate listener whose certificate did not resolve is not programmed,
+    // and must not terminate its routes with another certificate (T152).
+    #[tokio::test]
+    async fn tls_routes_need_their_terminate_listener_certificate() {
+        let gw: Gateway = serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "Gateway",
+            "metadata": { "name": "gw", "namespace": "ns", "generation": 1 },
+            "spec": {
+                "gatewayClassName": "torii",
+                "listeners": [{ "name": "tls", "port": 443, "protocol": "TLS",
+                    "tls": { "mode": "Terminate", "certificateRefs": [{ "name": "missing" }] } }],
+            },
+        }))
+        .unwrap();
+        let route: TLSRoute = serde_json::from_value(serde_json::json!({
+            "apiVersion": "gateway.networking.k8s.io/v1",
+            "kind": "TLSRoute",
+            "metadata": { "name": "t", "namespace": "ns", "generation": 1 },
+            "spec": {
+                "parentRefs": [{ "name": "gw" }],
+                "hostnames": ["x.example"],
+                "rules": [{ "backendRefs": [{ "name": "app", "port": 443 }] }],
+            },
+        }))
+        .unwrap();
+        let ctx = test_ctx(
+            Stores {
+                gateway_classes: store_of(vec![torii_class()]),
+                gateways: store_of(vec![gw]),
+                tls_routes: store_of(vec![route]),
+                ..no_objects()
+            },
+            &[],
+            &[443],
+        );
+        ctx.reconcile_all().await.unwrap();
+        let decision = ctx.data_plane.load().tls.lookup(443, Some("x.example"), 0);
+        assert!(
+            matches!(decision, crate::tls_table::TlsDecision::NoRoute),
+            "{decision:?}"
+        );
     }
 
     // A parent named twice (namespace left out, then set to the route's) is one
