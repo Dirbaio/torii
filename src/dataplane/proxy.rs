@@ -434,9 +434,23 @@ fn push_field(out: &mut Vec<u8>, name: &[u8], value: &[u8]) {
     out.extend_from_slice(b"\r\n");
 }
 
+/// Response fields a CORS filter owns. The backend's are dropped, so that a
+/// client gets only what the filter allows: a backend's own
+/// `Access-Control-Allow-Credentials: true` next to an Origin the filter echoes,
+/// or its own reflected Origin for one the filter rejects, would grant reads the
+/// route's policy does not (GEP-1767 makes the gateway the CORS authority).
+const CORS_OWNED: &[&str] = &[
+    "access-control-allow-origin",
+    "access-control-allow-credentials",
+    "access-control-expose-headers",
+    "access-control-allow-methods",
+    "access-control-allow-headers",
+    "access-control-max-age",
+];
+
 /// The fields of the response to the client: the backend's, minus the ones about
-/// its connection, with the response filters and CORS applied. Framing fields are
-/// the caller's.
+/// its connection, with CORS and then the response filters applied (so that an
+/// explicit ResponseHeaderModifier still wins). Framing fields are the caller's.
 pub fn response_fields<'a>(resp: &'a ResponseHead, plan: &'a Plan) -> FieldList<'a> {
     let mut list = passed_fields(&resp.fields, RESPONSE_DROPPED);
     if resp.status == 101 {
@@ -445,18 +459,17 @@ pub fn response_fields<'a>(resp: &'a ResponseHead, plan: &'a Plan) -> FieldList<
             list.push((Cow::Borrowed(b"upgrade"), Cow::Borrowed(v)));
         }
     }
-    apply_mods(&mut list, &plan.filters.response_headers);
-    if let (Some(cors), Some(origin)) = (&plan.filters.cors, &plan.cors_origin) {
-        let mut extra = Vec::new();
-        cors_headers(&mut extra, cors, origin);
-        for (name, value) in extra {
-            if name == "vary" {
+    if let Some(cors) = &plan.filters.cors {
+        list.retain(|(n, _)| !is_named(n, CORS_OWNED));
+        if let Some(origin) = &plan.cors_origin {
+            let mut extra = Vec::new();
+            cors_headers(&mut extra, cors, origin);
+            for (name, value) in extra {
                 list.push((Cow::Borrowed(name.as_bytes()), Cow::Owned(value.into_bytes())));
-            } else {
-                set_field(&mut list, name, value.into_bytes());
             }
         }
     }
+    apply_mods(&mut list, &plan.filters.response_headers);
     list
 }
 

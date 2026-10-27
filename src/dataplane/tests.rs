@@ -281,6 +281,55 @@ async fn local_answers() {
     assert_eq!(resp.status, 400, "two Hosts");
 }
 
+// A route's CORS filter owns the CORS response fields: a backend's own never
+// reach the client, so it gets only what the filter allows (T050).
+#[tokio::test]
+async fn cors_owns_the_cors_response_fields() {
+    let (backend, _) = backend(|_, _| {
+        Some(
+            b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: https://app.example\r\n\
+              Access-Control-Allow-Credentials: true\r\nAccess-Control-Expose-Headers: X-Account\r\n\
+              Content-Length: 0\r\n\r\n"
+                .to_vec(),
+        )
+    })
+    .await;
+    let cors = |origins: &[&str]| Filters {
+        cors: Some(crate::route_table::Cors {
+            allow_origins: origins.iter().map(|o| o.to_string()).collect(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let get = |origin: &str| format!("GET / HTTP/1.1\r\nHost: a\r\nOrigin: {origin}\r\n\r\n");
+
+    // allowOrigins *, credentials not allowed: the Origin is echoed, nothing else.
+    let gw = gateway(|port| one_route(port, backend, cors(&["*"]), None)).await;
+    let resp = request(gw.addr, &get("https://evil.example")).await.unwrap();
+    assert_eq!(
+        resp.field("access-control-allow-origin").as_deref(),
+        Some("https://evil.example")
+    );
+    assert_eq!(resp.field("access-control-allow-credentials"), None);
+    assert_eq!(resp.field("access-control-expose-headers"), None);
+
+    // An Origin the filter rejects gets no CORS fields at all.
+    let gw = gateway(|port| one_route(port, backend, cors(&["https://app.example"]), None)).await;
+    let resp = request(gw.addr, &get("https://evil.example")).await.unwrap();
+    assert_eq!(resp.field("access-control-allow-origin"), None);
+    assert_eq!(resp.field("access-control-allow-credentials"), None);
+    let resp = request(gw.addr, &get("https://app.example")).await.unwrap();
+    assert_eq!(
+        resp.field("access-control-allow-origin").as_deref(),
+        Some("https://app.example")
+    );
+
+    // Without a CORS filter, the backend's fields pass.
+    let gw = gateway(|port| one_route(port, backend, Filters::default(), None)).await;
+    let resp = request(gw.addr, &get("https://evil.example")).await.unwrap();
+    assert_eq!(resp.field("access-control-allow-credentials").as_deref(), Some("true"));
+}
+
 #[tokio::test]
 async fn keep_alive_reuses_the_backend_connection() {
     let (backend, conns) = echo_backend().await;
