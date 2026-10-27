@@ -608,6 +608,15 @@ impl ReconcileCtx {
         // both the data plane and the per-listener attachedRoutes counts.
         let usable_gateways: Vec<Arc<Gateway>> = models.iter().filter(|m| m.usable).map(|m| m.gw.clone()).collect();
         let mut route_table = RouteTable::default();
+        // Every HTTP(S) listener torii serves takes the requests for its hostname
+        // on its port, also before (or without) any route: listener isolation.
+        for model in models.iter().filter(|m| m.usable) {
+            for (l, o) in model.gw.spec.listeners.iter().zip(&model.listeners) {
+                if o.accepted() && matches!(l.protocol.as_str(), "HTTP" | "HTTPS") {
+                    route_table.listeners.push((o.port, l.hostname.clone()));
+                }
+            }
+        }
         let mut tls_table = crate::tls_table::TlsTable::default();
         let mut backends = BackendIndex::new(self.stores.endpoint_slices.state(), upstream_tls);
         // (gw_ns, gw_name) → (listener_name → count).

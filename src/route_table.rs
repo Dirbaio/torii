@@ -21,6 +21,10 @@ use std::sync::Arc;
 pub struct RouteTable {
     /// All entries, in descending precedence order (built flat, then `sort()`ed).
     pub entries: Vec<RouteEntry>,
+    /// The HTTP and HTTPS listeners, as (port, hostname). A request belongs to the
+    /// most specific listener whose hostname matches it also when that listener
+    /// has no routes: it then gets a 404, not another listener's routes.
+    pub listeners: Vec<(u16, Option<String>)>,
     /// Per-port hostname index into `entries`. Built by `sort()`.
     by_port: HashMap<u16, PortIndex>,
 }
@@ -36,6 +40,26 @@ struct PortIndex {
     wildcard: Vec<(String, HostIndex)>,
     /// listener_hostname is None (matches any host) → entries.
     any: Option<HostIndex>,
+}
+
+impl PortIndex {
+    /// The tier of the listeners with hostname `hostname`, created if new.
+    fn tier(&mut self, hostname: Option<&str>) -> &mut HostIndex {
+        match hostname {
+            None => self.any.get_or_insert_default(),
+            Some(h) if h.starts_with("*.") => {
+                let suffix = h.to_ascii_lowercase();
+                match self.wildcard.iter().position(|(s, _)| *s == suffix) {
+                    Some(n) => &mut self.wildcard[n].1,
+                    None => {
+                        self.wildcard.push((suffix, HostIndex::default()));
+                        &mut self.wildcard.last_mut().unwrap().1
+                    }
+                }
+            }
+            Some(h) => self.exact.entry(h.to_ascii_lowercase()).or_default(),
+        }
+    }
 }
 
 /// One listener tier's entries indexed by the route hostnames they match a host
@@ -57,6 +81,11 @@ struct HostIndex {
 }
 
 impl HostIndex {
+    /// Whether no route is attached to the listener.
+    fn is_empty(&self) -> bool {
+        self.exact.is_empty() && self.wildcard.is_empty() && self.any.is_empty()
+    }
+
     fn add(&mut self, i: usize, hostnames: &[String]) {
         let push = |bucket: &mut Vec<usize>| {
             // A route may name a host twice (in different case).
@@ -129,7 +158,8 @@ impl RouteTable {
     /// Listener isolation: when multiple listeners share a port with different
     /// hostnames, the request is served only by routes on the *most specific*
     /// listener whose hostname matches the Host. We pick the most-specific
-    /// non-empty listener tier (exact > wildcard > any) whose hostname matches,
+    /// listener tier (exact > wildcard > any) whose hostname matches, with or
+    /// without routes,
     /// then return the first full match within that tier ONLY (by route hostname
     /// precedence, then match precedence) — never falling through to a
     /// less-specific tier.
@@ -170,14 +200,18 @@ impl RouteTable {
         let Some(idx) = self.by_port.get(&port) else {
             return false;
         };
-        if idx.any.is_some() {
+        if idx.any.as_ref().is_some_and(|tier| !tier.is_empty()) {
             return true;
         }
         let Some(host) = host else {
             return false;
         };
         let host_lc = host.to_ascii_lowercase();
-        idx.exact.contains_key(&host_lc) || idx.wildcard.iter().any(|(suffix, _)| host_matches_suffix(suffix, host))
+        idx.exact.get(&host_lc).is_some_and(|tier| !tier.is_empty())
+            || idx
+                .wildcard
+                .iter()
+                .any(|(suffix, tier)| host_matches_suffix(suffix, host) && !tier.is_empty())
     }
 
     /// Sort entries into Gateway API precedence order (highest precedence first),
@@ -187,23 +221,12 @@ impl RouteTable {
     pub fn sort(&mut self) {
         self.entries.sort_by(|a, b| a.precedence_cmp(b));
         self.by_port.clear();
+        for (port, hostname) in &self.listeners {
+            self.by_port.entry(*port).or_default().tier(hostname.as_deref());
+        }
         for (i, e) in self.entries.iter().enumerate() {
             let idx = self.by_port.entry(e.listener_port).or_default();
-            let tier = match e.listener_hostname.as_deref() {
-                None => idx.any.get_or_insert_default(),
-                Some(h) if h.starts_with("*.") => {
-                    let suffix = h.to_ascii_lowercase();
-                    match idx.wildcard.iter().position(|(s, _)| *s == suffix) {
-                        Some(n) => &mut idx.wildcard[n].1,
-                        None => {
-                            idx.wildcard.push((suffix, HostIndex::default()));
-                            &mut idx.wildcard.last_mut().unwrap().1
-                        }
-                    }
-                }
-                Some(h) => idx.exact.entry(h.to_ascii_lowercase()).or_default(),
-            };
-            tier.add(i, &e.hostnames);
+            idx.tier(e.listener_hostname.as_deref()).add(i, &e.hostnames);
         }
         let tiers = self.by_port.values_mut().flat_map(|idx| {
             idx.exact
@@ -1026,8 +1049,14 @@ mod tests {
                 .iter()
                 .filter(|e| e.listener_port == port && e.listener_hostname_matches(host))
         };
+        let listeners = t
+            .listeners
+            .iter()
+            .filter(|(p, h)| *p == port && h.as_deref().is_none_or(|h| hostname_matches(h, host)))
+            .map(|(_, h)| listener_specificity(h.as_deref()));
         let best = on_port()
             .map(|e| listener_specificity(e.listener_hostname.as_deref()))
+            .chain(listeners)
             .max()?;
         // (characters in the longest matching non-wildcard hostname, characters in
         // the longest matching hostname); a route that names none scores (0, 0).
@@ -1096,8 +1125,14 @@ mod tests {
             e.route_key = format!("ns/r{n}").into();
             entries.push(e);
         }
+        // Listeners with no routes.
+        let listeners = vec![
+            (80, Some("c.example.com".into())),
+            (443, Some("*.svc.example.com".into())),
+        ];
         let mut t = RouteTable {
             entries,
+            listeners,
             ..Default::default()
         };
         t.sort();
@@ -1125,6 +1160,31 @@ mod tests {
                 }
             }
         }
+    }
+
+    // A request belongs to the most specific listener that covers its host, also
+    // when that listener has no routes: it must not get another listener's (T056).
+    #[test]
+    fn a_listener_without_routes_still_isolates_its_host() {
+        let mut t = RouteTable {
+            entries: vec![entry(PathMatch::Prefix("/".into()), 0)],
+            listeners: vec![
+                (80, None),
+                (80, Some("bank.example".into())),
+                (80, Some("*.shop.example".into())),
+            ],
+            ..Default::default()
+        };
+        t.sort();
+        let h = http::HeaderMap::new();
+        assert!(t.match_request(80, "other.example", "/", "GET", &h, "").is_some());
+        assert!(t.match_request(80, "bank.example", "/", "GET", &h, "").is_none());
+        assert!(t.match_request(80, "a.shop.example", "/", "GET", &h, "").is_none());
+        // It does not take TLS connections from TLSRoutes on its port, though.
+        assert!(t.serves_host(80, Some("other.example")));
+        t.entries.clear();
+        t.sort();
+        assert!(!t.serves_host(80, Some("other.example")));
     }
 
     // Among the routes that match a request, the one whose hostname matches it most
