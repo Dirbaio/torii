@@ -418,16 +418,19 @@ struct ReconcileCtx {
 /// both the listener status and the CertStore come from `resolved_cert`).
 struct ListenerOutcome {
     name: String,
+    protocol: String,
     /// Whether the listener's protocol is one we understand (HTTP/HTTPS/TLS).
     /// Drives the listener `Accepted` condition.
     protocol_supported: bool,
-    /// A requested allowedRoutes.kind invalid for the protocol → InvalidRouteKinds.
-    invalid_kind: bool,
+    /// The requested allowedRoutes.kinds invalid for the protocol →
+    /// InvalidRouteKinds.
+    invalid_kinds: Vec<String>,
     /// The data plane does not serve the listener's protocol on its port (see
     /// [`ControllerConfig::http_ports`]) → Accepted=False/PortUnavailable.
     port_unavailable: bool,
-    /// HTTPS/TLS cert-ref failure reason, or None if it resolved (or N/A).
-    tls_failure: Option<&'static str>,
+    /// HTTPS/TLS cert-ref failure (reason, message), or None if it resolved (or
+    /// N/A).
+    tls_failure: Option<Failure>,
     supported_kinds: Vec<&'static str>,
     /// The validated cert for this listener, keyed by listener hostname ("" =
     /// default). Some only when the cert ref resolved AND parsed. Feeds CertStore.
@@ -454,9 +457,59 @@ impl ListenerOutcome {
         self.protocol_supported && !self.port_unavailable && !self.protocol_conflict && !self.frontend_validation
     }
 
-    /// Programmed: accepted, with its route kinds and certificate refs valid.
-    fn programmed(&self) -> bool {
-        self.accepted() && self.tls_failure.is_none() && !self.invalid_kind
+    /// Why torii does not accept the listener, as (reason, message); None when it
+    /// does.
+    fn rejection(&self, config: &ControllerConfig) -> Option<Failure> {
+        if !self.protocol_supported {
+            let msg = format!(
+                "protocol {} is not supported: torii serves HTTP, HTTPS and TLS",
+                self.protocol
+            );
+            Some(("UnsupportedProtocol", msg))
+        } else if self.port_unavailable {
+            let msg = format!(
+                "torii serves HTTP on ports {:?} and TLS on ports {:?} (its --http-ports and --tls-ports), so not \
+                 this listener on port {}: the listener is not served",
+                config.http_ports, config.tls_ports, self.port
+            );
+            Some(("PortUnavailable", msg))
+        } else if self.protocol_conflict {
+            let msg = format!(
+                "port {} has TLS listeners in both Terminate and Passthrough mode, which torii does not support \
+                 on one port",
+                self.port
+            );
+            Some(("ProtocolConflict", msg))
+        } else if self.frontend_validation {
+            let msg = format!(
+                "spec.tls.frontend asks for client certificate validation on port {}, which torii does not \
+                 support: the listener is not served",
+                self.port
+            );
+            Some(("UnsupportedValue", msg))
+        } else {
+            None
+        }
+    }
+
+    /// Why the listener's references do not resolve, as (reason, message); None
+    /// when they do. InvalidRouteKinds first, then the certificate.
+    fn refs_failure(&self) -> Option<Failure> {
+        if !self.invalid_kinds.is_empty() {
+            let msg = format!(
+                "allowedRoutes.kinds: torii attaches no {} to a {} listener",
+                self.invalid_kinds.join(", "),
+                self.protocol
+            );
+            return Some(("InvalidRouteKinds", msg));
+        }
+        self.tls_failure.clone()
+    }
+
+    /// Why the listener is not programmed, as (reason, message); None when it is:
+    /// accepted, with its route kinds and certificate refs valid.
+    fn not_programmed(&self, config: &ControllerConfig) -> Option<Failure> {
+        self.rejection(config).or_else(|| self.refs_failure())
     }
 }
 
@@ -523,6 +576,9 @@ struct PolicyOutcome {
 /// (no policy → absent → the route defaults the endpoint to Plaintext).
 type UpstreamTlsMap = HashMap<ServicePort, crate::route_table::BackendTls>;
 
+/// Why a condition is False: its reason and message.
+type Failure = (&'static str, String);
+
 /// The attachedRoutes of each listener: (Gateway namespace, Gateway name) →
 /// listener name → count.
 type AttachCounts = BTreeMap<(String, String), BTreeMap<String, i32>>;
@@ -574,8 +630,8 @@ struct RouteRules {
     implemented: usize,
     /// Why each rule torii does not implement is dropped.
     dropped: Vec<String>,
-    /// Why some backendRef did not resolve, for the route's ResolvedRefs condition.
-    refs_failure: Option<&'static str>,
+    /// The backendRefs that did not resolve, for the route's ResolvedRefs.
+    broken_refs: BrokenRefs,
 }
 
 impl RouteRules {
@@ -588,6 +644,78 @@ impl RouteRules {
         }
         (self.implemented == 0 && !self.dropped.is_empty()).then(|| self.dropped.join("; "))
     }
+}
+
+/// A route's backendRefs that did not resolve, for its ResolvedRefs condition:
+/// (reason, message) for each.
+#[derive(Default)]
+struct BrokenRefs(Vec<Failure>);
+
+impl BrokenRefs {
+    fn add(&mut self, reason: &'static str, message: String) {
+        self.0.push((reason, message));
+    }
+
+    /// The route's ResolvedRefs condition: one reason, the first of a fixed order
+    /// that any broken reference has, and every broken reference in the message.
+    fn condition(&self, generation: i64) -> Condition {
+        const ORDER: [&str; 4] = [
+            "RefNotPermitted",
+            "InvalidKind",
+            "BackendNotFound",
+            "UnsupportedProtocol",
+        ];
+        match ORDER.into_iter().find(|reason| self.0.iter().any(|(r, _)| r == reason)) {
+            None => condition("ResolvedRefs", "True", "ResolvedRefs", "", generation),
+            Some(reason) => {
+                let msg: Vec<&str> = self.0.iter().map(|(_, m)| m.as_str()).collect();
+                condition("ResolvedRefs", "False", reason, &msg.join("; "), generation)
+            }
+        }
+    }
+}
+
+/// Why a route attaches to none of the listeners its parentRef selects, from each
+/// listener's reason, for its Accepted=False reason and message.
+#[derive(Default)]
+struct NotAttached {
+    /// Listeners that do not allow the route: torii does not serve them, or
+    /// their allowedRoutes do not admit it.
+    not_allowed: Vec<String>,
+    /// Listeners whose hostname matches none of the route's.
+    no_hostname: Vec<String>,
+}
+
+impl NotAttached {
+    /// NotAllowedByListeners wins over NoMatchingListenerHostname (as upstream
+    /// when both apply).
+    fn reason(self, gw: &Gateway) -> Failure {
+        let reason = if !self.not_allowed.is_empty() {
+            "NotAllowedByListeners"
+        } else if !self.no_hostname.is_empty() {
+            "NoMatchingListenerHostname"
+        } else {
+            "NoMatchingParent"
+        };
+        let why: Vec<String> = self.not_allowed.into_iter().chain(self.no_hostname).collect();
+        (
+            reason,
+            format!(
+                "no listener of Gateway {} takes the route: {}",
+                object_name(gw),
+                why.join("; ")
+            ),
+        )
+    }
+}
+
+/// A route's backendRef, of either route kind.
+struct BackendRef<'a> {
+    group: Option<&'a str>,
+    kind: Option<&'a str>,
+    namespace: Option<&'a str>,
+    name: &'a str,
+    port: Option<i32>,
 }
 
 /// One programmed HTTPRoute rule: what it does, shared by all its entries, and
@@ -858,10 +986,17 @@ impl ReconcileCtx {
     }
 
     /// A Secret's cert+key (tls.crt / tls.key), as [`Self::fetch_referenced`] read
-    /// it.
-    fn load_tls_secret(&self, ns: &str, name: &str) -> Option<CertKey> {
+    /// it, or why there is none.
+    fn load_tls_secret(&self, ns: &str, name: &str) -> Result<CertKey, &'static str> {
         let secrets = self.referenced.secrets.lock().unwrap_or_else(|e| e.into_inner());
-        secrets.get(&(ns.to_string(), name.to_string()))?.data.clone()
+        let fetched = secrets
+            .get(&(ns.to_string(), name.to_string()))
+            .ok_or("was not found")?;
+        let ck = fetched.data.clone().ok_or("has no tls.crt and tls.key")?;
+        // The same OpenSSL parse the proxy serves.
+        ck.parsed()
+            .ok_or("does not hold a PEM certificate and key that parse")?;
+        Ok(ck)
     }
 
     /// Bring [`Referenced`] up to date for this pass: the Secrets that `gateways`'
@@ -934,7 +1069,7 @@ impl ReconcileCtx {
     fn gatewayclass_patch(&self, gc: &GatewayClass) -> StatusPatch {
         let generation = gc.meta().generation.unwrap_or(0);
         let status = GatewayClassStatus {
-            conditions: Some(vec![condition("Accepted", "True", "Accepted", generation)]),
+            conditions: Some(vec![condition("Accepted", "True", "Accepted", "", generation)]),
             supported_features: Some(
                 self.supported_features()
                     .into_iter()
@@ -1015,14 +1150,14 @@ impl ReconcileCtx {
 
         // Reconcile requested allowedRoutes.kinds against the protocol's valid set.
         // Any requested kind not valid → InvalidRouteKinds, dropped from supportedKinds.
-        let mut invalid_kind = false;
+        let mut invalid_kinds = Vec::new();
         let supported_kinds: Vec<&'static str> = match l.allowed_routes.as_ref().and_then(|ar| ar.kinds.as_ref()) {
             Some(requested) => requested
                 .iter()
                 .filter_map(|k| match protocol_kinds.iter().find(|p| **p == k.kind) {
                     Some(p) => Some(*p),
                     None => {
-                        invalid_kind = true;
+                        invalid_kinds.push(k.kind.clone());
                         None
                     }
                 })
@@ -1057,9 +1192,10 @@ impl ReconcileCtx {
 
         ListenerOutcome {
             name: l.name.clone(),
+            protocol: l.protocol.clone(),
             protocol_supported,
             port_unavailable,
-            invalid_kind,
+            invalid_kinds,
             tls_failure,
             supported_kinds,
             resolved_cert,
@@ -1071,56 +1207,72 @@ impl ReconcileCtx {
     }
 
     /// The single read+validate+use path for an HTTPS/TLS listener's certificate
-    /// ref. Returns `(failure_reason, loaded_cert)`:
+    /// ref. Returns `(failure, loaded_cert)`:
     /// - `(None, Some((host, cert)))` — resolved + parsed; serve it (host "" = default).
     /// - `(None, None)` — N/A (non-TLS protocol, or passthrough needs no cert).
-    /// - `(Some(reason), None)` — RefNotPermitted (cross-ns w/o grant) or
-    ///   InvalidCertificateRef (missing/wrong-kind/malformed). Not served.
+    /// - `(Some((reason, message)), None)` — RefNotPermitted (cross-ns w/o grant)
+    ///   or InvalidCertificateRef (missing/wrong-kind/malformed). Not served.
     fn listener_cert(
         &self,
         l: &gateway_api::apis::standard::gateways::GatewayListeners,
         gw: &Gateway,
-    ) -> (Option<&'static str>, Option<(String, CertKey)>) {
+    ) -> (Option<Failure>, Option<(String, CertKey)>) {
         if !matches!(l.protocol.as_str(), "HTTPS" | "TLS") {
             return (None, None);
         }
         use gateway_api::apis::standard::gateways::GatewayListenersTlsMode as Mode;
+        let missing = || {
+            let msg = format!(
+                "a {} listener that terminates TLS needs tls.certificateRefs",
+                l.protocol
+            );
+            (Some(("InvalidCertificateRef", msg)), None)
+        };
         let Some(tls) = l.tls.as_ref() else {
-            return (Some("InvalidCertificateRef"), None);
+            return missing();
         };
         let passthrough = matches!(tls.mode, Some(Mode::Passthrough));
         let refs = tls.certificate_refs.clone().unwrap_or_default();
         if refs.is_empty() {
             // Passthrough needs no cert; terminate without one is invalid.
-            return if passthrough {
-                (None, None)
-            } else {
-                (Some("InvalidCertificateRef"), None)
-            };
+            return if passthrough { (None, None) } else { missing() };
         }
         let gw_ns = gw.namespace().unwrap_or_default();
         // Key by the listener hostname; "" is the default cert.
         let host = l.hostname.clone().unwrap_or_default();
         let mut loaded: Option<(String, CertKey)> = None;
-        for r in &refs {
+        for (i, r) in refs.iter().enumerate() {
             // Only core Secrets are valid cert refs.
             let group = r.group.as_deref().unwrap_or("");
             let kind = r.kind.as_deref().unwrap_or("Secret");
             if !group.is_empty() || kind != "Secret" {
-                return (Some("InvalidCertificateRef"), None);
+                let msg = format!(
+                    "certificateRefs[{i}]: {group}/{kind} {} is not a Secret, the only kind torii reads \
+                     certificates from",
+                    r.name
+                );
+                return (Some(("InvalidCertificateRef", msg)), None);
             }
             let ref_ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
             // Cross-namespace cert Secret requires a permitting ReferenceGrant.
             if ref_ns != gw_ns && !self.ref_grant_permits(&gw_ns, "Gateway", &ref_ns, "Secret", &r.name) {
-                return (Some("RefNotPermitted"), None);
+                let msg = format!(
+                    "certificateRefs[{i}]: Secret {ref_ns}/{} is in another namespace, and no ReferenceGrant there \
+                     allows Gateways in {gw_ns} to use it",
+                    r.name
+                );
+                return (Some(("RefNotPermitted", msg)), None);
             }
             // The Secret must exist AND contain a valid tls.crt + tls.key.
             match self.load_tls_secret(&ref_ns, &r.name) {
-                Some(ck) if cert_key_is_valid(&ck) => {
+                Ok(ck) => {
                     // First valid cert is the one we serve for this listener host.
                     loaded.get_or_insert((host.clone(), ck));
                 }
-                _ => return (Some("InvalidCertificateRef"), None),
+                Err(why) => {
+                    let msg = format!("certificateRefs[{i}]: Secret {ref_ns}/{} {why}", r.name);
+                    return (Some(("InvalidCertificateRef", msg)), None);
+                }
             }
         }
         (None, loaded)
@@ -1140,49 +1292,33 @@ impl ReconcileCtx {
             .iter()
             .map(|o| {
                 let attached_routes = counts.and_then(|c| c.get(&o.name).copied()).unwrap_or(0);
-                let accepted = if !o.protocol_supported {
-                    condition("Accepted", "False", "UnsupportedProtocol", generation)
-                } else if o.port_unavailable {
-                    let msg = format!(
-                        "torii serves HTTP on ports {:?} and TLS on ports {:?} (its --http-ports and --tls-ports), \
-                         so not this listener on port {}: the listener is not served",
-                        self.config.http_ports, self.config.tls_ports, o.port
-                    );
-                    condition_msg("Accepted", "False", "PortUnavailable", &msg, generation)
-                } else if o.protocol_conflict {
-                    // Two TLS modes share this port and we don't support mixed.
-                    condition("Accepted", "False", "ProtocolConflict", generation)
-                } else if o.frontend_validation {
-                    let msg = format!(
-                        "spec.tls.frontend asks for client certificate validation on port {}, which torii does \
-                         not support: the listener is not served",
-                        o.port
-                    );
-                    condition_msg("Accepted", "False", "UnsupportedValue", &msg, generation)
-                } else {
-                    condition("Accepted", "True", "Accepted", generation)
+                let accepted = match o.rejection(&self.config) {
+                    Some((reason, msg)) => condition("Accepted", "False", reason, &msg, generation),
+                    None => condition("Accepted", "True", "Accepted", "", generation),
                 };
-                // ResolvedRefs precedence: InvalidRouteKinds, then TLS ref issue.
-                let resolved = if o.invalid_kind {
-                    condition("ResolvedRefs", "False", "InvalidRouteKinds", generation)
-                } else if let Some(reason) = o.tls_failure {
-                    condition("ResolvedRefs", "False", reason, generation)
-                } else {
-                    condition("ResolvedRefs", "True", "ResolvedRefs", generation)
+                let resolved = match o.refs_failure() {
+                    Some((reason, msg)) => condition("ResolvedRefs", "False", reason, &msg, generation),
+                    None => condition("ResolvedRefs", "True", "ResolvedRefs", "", generation),
                 };
                 // A rejected Gateway serves none of its listeners.
                 let programmed = if !model.usable {
-                    condition_msg(
+                    condition(
                         "Programmed",
                         "False",
                         "Invalid",
                         "the Gateway is not accepted (InvalidParameters), so none of its listeners is served",
                         generation,
                     )
-                } else if o.programmed() {
-                    condition("Programmed", "True", "Programmed", generation)
+                } else if let Some((reason, msg)) = o.not_programmed(&self.config) {
+                    condition(
+                        "Programmed",
+                        "False",
+                        "Invalid",
+                        &format!("{reason}: {msg}"),
+                        generation,
+                    )
                 } else {
-                    condition("Programmed", "False", "Invalid", generation)
+                    condition("Programmed", "True", "Programmed", "", generation)
                 };
                 // A protocol-conflicted listener (mixed TLS termination, which we
                 // don't support) is rejected and advertises NO supported kinds —
@@ -1212,26 +1348,39 @@ impl ReconcileCtx {
 
         // Gateway-level conditions from the OUTCOME DATA (not from the listener
         // conditions above), with the same `accepted`/`programmed` as each listener's:
-        // invalid_kind/tls_failure affect ResolvedRefs/Programmed, not Accepted.
+        // invalid kinds and certificates affect ResolvedRefs/Programmed, not Accepted.
+        // A message names the listeners at fault, and why.
         let conditions = if model.invalid_parameters {
+            let msg = "spec.infrastructure.parametersRef: torii supports no parameters, so it serves none of this \
+                       Gateway";
             vec![
-                condition("Accepted", "False", "InvalidParameters", generation),
-                condition("Programmed", "False", "InvalidParameters", generation),
+                condition("Accepted", "False", "InvalidParameters", msg, generation),
+                condition("Programmed", "False", "InvalidParameters", msg, generation),
             ]
         } else {
-            let any_accepted = model.listeners.iter().any(ListenerOutcome::accepted);
-            let all_accepted = model.listeners.iter().all(ListenerOutcome::accepted);
-            let all_programmed = model.listeners.iter().all(ListenerOutcome::programmed);
-            let accepted = if any_accepted {
-                let reason = if all_accepted { "Accepted" } else { "ListenersNotValid" };
-                condition("Accepted", "True", reason, generation)
-            } else {
-                condition("Accepted", "False", "ListenersNotValid", generation)
+            let at_fault = |why: &dyn Fn(&ListenerOutcome) -> Option<Failure>| {
+                let names: Vec<String> = model
+                    .listeners
+                    .iter()
+                    .filter_map(|o| why(o).map(|(reason, _)| format!("{} ({reason})", o.name)))
+                    .collect();
+                names.join(", ")
             };
-            let programmed = if all_programmed && any_accepted {
-                condition("Programmed", "True", "Programmed", generation)
+            let not_accepted = at_fault(&|o| o.rejection(&self.config));
+            let not_programmed = at_fault(&|o| o.not_programmed(&self.config));
+            let any_accepted = model.listeners.iter().any(ListenerOutcome::accepted);
+            let accepted = if !not_accepted.is_empty() {
+                let msg = format!("listeners not accepted: {not_accepted}");
+                let status = if any_accepted { "True" } else { "False" };
+                condition("Accepted", status, "ListenersNotValid", &msg, generation)
             } else {
-                condition("Programmed", "False", "Invalid", generation)
+                condition("Accepted", "True", "Accepted", "", generation)
+            };
+            let programmed = if not_programmed.is_empty() && any_accepted {
+                condition("Programmed", "True", "Programmed", "", generation)
+            } else {
+                let msg = format!("listeners not programmed: {not_programmed}");
+                condition("Programmed", "False", "Invalid", &msg, generation)
             };
             vec![accepted, programmed]
         };
@@ -1399,20 +1548,15 @@ impl ReconcileCtx {
             // route torii implements none of → UnsupportedValue + an explanatory
             // message; otherwise Accepted, and PartiallyInvalid if torii dropped
             // some rules (the spec's "Dropped Rule" approach).
-            let accepted = match (accept_reason, &rejection) {
-                (Some(reason), _) => condition("Accepted", "False", reason, generation),
-                (None, Some(msg)) => condition_msg("Accepted", "False", "UnsupportedValue", msg, generation),
-                (None, None) => condition("Accepted", "True", "Accepted", generation),
+            let accepted = match (&accept_reason, &rejection) {
+                (Some((reason, msg)), _) => condition("Accepted", "False", reason, msg, generation),
+                (None, Some(msg)) => condition("Accepted", "False", "UnsupportedValue", msg, generation),
+                (None, None) => condition("Accepted", "True", "Accepted", "", generation),
             };
-
-            let resolved = match rules.refs_failure {
-                None => condition("ResolvedRefs", "True", "ResolvedRefs", generation),
-                Some(reason) => condition("ResolvedRefs", "False", reason, generation),
-            };
-            let mut conditions = vec![accepted, resolved];
+            let mut conditions = vec![accepted, rules.broken_refs.condition(generation)];
             if accept_reason.is_none() && rejection.is_none() && !rules.dropped.is_empty() {
                 let msg = format!("Dropped Rule(s): {}", rules.dropped.join("; "));
-                conditions.push(condition_msg(
+                conditions.push(condition(
                     "PartiallyInvalid",
                     "True",
                     "UnsupportedValue",
@@ -1467,7 +1611,7 @@ impl ReconcileCtx {
             rejected,
             implemented: 0,
             dropped: Vec::new(),
-            refs_failure: None,
+            broken_refs: BrokenRefs::default(),
         };
         if out.rejected.is_some() {
             return out;
@@ -1495,53 +1639,37 @@ impl ReconcileCtx {
                     continue;
                 }
             }
-            // Resolve the rule's backends, tracking the most specific ResolvedRefs
-            // failure reason (RefNotPermitted takes priority).
+            // Resolve the rule's backends, noting each one that does not resolve.
             let mut rule_backends = Vec::new();
-            for backend_ref in rule.backend_refs.iter().flatten() {
-                let svc_port = backend_ref.port.unwrap_or(0) as u16;
-                let bns = backend_ref.namespace.clone().unwrap_or_else(|| route_ns.clone());
-
-                // Only core Services are supported backends. Any other
-                // group/kind → ResolvedRefs=False, InvalidKind.
-                let group = backend_ref.group.as_deref().unwrap_or("");
-                let kind = backend_ref.kind.as_deref().unwrap_or("Service");
-                if !group.is_empty() || kind != "Service" {
-                    out.refs_failure = Some("InvalidKind");
-                    continue;
-                }
-
-                // Cross-namespace backendRefs require a permitting ReferenceGrant.
-                if bns != route_ns
-                    && !self.ref_grant_permits(&route_ns, "HTTPRoute", &bns, "Service", &backend_ref.name)
-                {
-                    out.refs_failure = Some("RefNotPermitted");
-                    continue; // no endpoints → 500 at the data plane
-                }
-
-                match self.service_endpoints(backends, &bns, &backend_ref.name, svc_port) {
+            for (ref_idx, backend_ref) in rule.backend_refs.iter().flatten().enumerate() {
+                let at = format!("rules[{rule_order}].backendRefs[{ref_idx}]");
+                let backend = BackendRef {
+                    group: backend_ref.group.as_deref(),
+                    kind: backend_ref.kind.as_deref(),
+                    namespace: backend_ref.namespace.as_deref(),
+                    name: &backend_ref.name,
+                    port: backend_ref.port,
+                };
+                match self.resolve_backend(backends, "HTTPRoute", &route_ns, &backend) {
                     // A port whose appProtocol torii cannot speak is invalid (the
                     // spec asks for ResolvedRefs=False/UnsupportedProtocol).
-                    Some(_)
-                        if self
-                            .unsupported_app_protocol(backends, &bns, &backend_ref.name, svc_port)
-                            .is_some() =>
-                    {
-                        out.refs_failure.get_or_insert("UnsupportedProtocol");
+                    Ok((ns, endpoints)) => {
+                        let port = backend.port.unwrap_or(0) as u16;
+                        if let Some(why) = self.unsupported_app_protocol(backends, &ns, backend.name, port) {
+                            out.broken_refs.add("UnsupportedProtocol", format!("{at}: {why}"));
+                            continue;
+                        }
+                        // Service exists (ResolvedRefs=True) — even with zero ready
+                        // endpoints, the ref is resolved; an empty backend yields a
+                        // 5xx at traffic time, not BackendNotFound.
+                        rule_backends.push(Backend {
+                            weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
+                            endpoints,
+                            filters: backend_filters_from(backend_ref.filters.as_deref().unwrap_or_default()),
+                        });
                     }
-                    // Service exists (ResolvedRefs=True) — even with zero ready
-                    // endpoints, the ref is resolved; an empty backend yields a
-                    // 503 at traffic time, not BackendNotFound.
-                    Some(endpoints) => rule_backends.push(Backend {
-                        weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
-                        endpoints,
-                        filters: backend_filters_from(backend_ref.filters.as_deref().unwrap_or_default()),
-                    }),
-                    // Service does not exist → BackendNotFound (don't downgrade
-                    // a more specific failure like RefNotPermitted).
-                    None => {
-                        out.refs_failure.get_or_insert("BackendNotFound");
-                    }
+                    // Not resolved: no endpoints → 500 at the data plane.
+                    Err((reason, why)) => out.broken_refs.add(reason, format!("{at}: {why}")),
                 }
             }
 
@@ -1573,69 +1701,58 @@ impl ReconcileCtx {
         pref: &gateway_api::apis::standard::httproutes::HttpRouteParentRefs,
     ) -> (
         Vec<gateway_api::apis::standard::gateways::GatewayListeners>,
-        Option<&'static str>,
+        Option<Failure>,
     ) {
         let gw = &model.gw;
         let route_ns = route.namespace().unwrap_or_default();
         let route_hostnames: &[String] = route.spec.hostnames.as_deref().unwrap_or_default();
         // A rejected Gateway serves nothing, so none of its listeners takes routes.
-        if !model.usable {
-            return (vec![], Some("NotAllowedByListeners"));
+        if let Some(why) = gateway_not_accepted(model) {
+            return (vec![], Some(why));
         }
 
         // First narrow by sectionName / port (a hard parentRef selector). If the
         // ref names a section/port that no listener has, that's NoMatchingParent.
-        let candidates: Vec<_> = gw
-            .spec
-            .listeners
-            .iter()
-            .filter(|l| {
-                pref.section_name.as_ref().map(|s| &l.name == s).unwrap_or(true)
-                    && pref.port.map(|p| l.port == p).unwrap_or(true)
-            })
-            .cloned()
-            .collect();
-
-        if candidates.is_empty() {
-            return (vec![], Some("NoMatchingParent"));
-        }
+        let Some(candidates) = selected_listeners(gw, pref.section_name.as_deref(), pref.port) else {
+            return (
+                vec![],
+                Some(no_matching_parent(gw, pref.section_name.as_deref(), pref.port)),
+            );
+        };
 
         // Then filter by allowedRoutes (namespaces + kinds) and hostname overlap,
-        // tracking why listeners were rejected to report the right Accepted reason.
+        // noting why each listener was rejected to report the right Accepted reason.
         let mut attached = Vec::new();
-        let mut rejected_by_allow = false; // namespace/kind → NotAllowedByListeners
-        let mut rejected_by_hostname = false; // hostname → NoMatchingListenerHostname
+        let mut not_attached = NotAttached::default();
         for l in candidates {
-            if model.listeners.iter().any(|o| o.name == l.name && !o.accepted()) {
-                rejected_by_allow = true;
-                continue;
+            let outcome = model.listeners.iter().find(|o| o.name == l.name);
+            if let Some((reason, _)) = outcome.and_then(|o| o.rejection(&self.config)) {
+                not_attached
+                    .not_allowed
+                    .push(format!("{}: not served ({reason})", l.name));
+            } else if !self.listener_allows_namespace(&l, gw, &route_ns) {
+                let why = format!(
+                    "{}: allowedRoutes does not admit routes from namespace {route_ns}",
+                    l.name
+                );
+                not_attached.not_allowed.push(why);
+            } else if !listener_allows_kind(&l, "HTTPRoute") {
+                let why = format!("{}: allowedRoutes.kinds does not include HTTPRoute", l.name);
+                not_attached.not_allowed.push(why);
+            } else if !listener_hostname_overlaps(l.hostname.as_deref(), route_hostnames) {
+                let why = format!(
+                    "{}: its hostname {} matches none of the route's",
+                    l.name,
+                    l.hostname.as_deref().unwrap_or_default()
+                );
+                not_attached.no_hostname.push(why);
+            } else {
+                attached.push(l);
             }
-            if !self.listener_allows_namespace(&l, gw, &route_ns) {
-                rejected_by_allow = true;
-                continue;
-            }
-            if !listener_allows_kind(&l, "HTTPRoute") {
-                rejected_by_allow = true;
-                continue;
-            }
-            if !listener_hostname_overlaps(l.hostname.as_deref(), route_hostnames) {
-                rejected_by_hostname = true;
-                continue;
-            }
-            attached.push(l);
         }
 
         if attached.is_empty() {
-            // Prefer NotAllowedByListeners over hostname (matches upstream behavior
-            // when both apply); fall back to NoMatchingParent.
-            let reason = if rejected_by_allow {
-                "NotAllowedByListeners"
-            } else if rejected_by_hostname {
-                "NoMatchingListenerHostname"
-            } else {
-                "NoMatchingParent"
-            };
-            return (vec![], Some(reason));
+            return (vec![], Some(not_attached.reason(gw)));
         }
         (attached, None)
     }
@@ -1668,7 +1785,7 @@ impl ReconcileCtx {
 
         // The backends of all the rules, shared by every matched SNI of every
         // parent: built once, for the first parent we own.
-        let mut route_backends: Option<(Arc<TlsBackends>, Option<&'static str>)> = None;
+        let mut route_backends: Option<(Arc<TlsBackends>, BrokenRefs)> = None;
         let mut parents: Vec<TlsRouteStatusParents> = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut attached_to = std::collections::HashSet::new();
@@ -1711,13 +1828,13 @@ impl ReconcileCtx {
                 }
             }
 
-            let accepted = match (accept_reason, &rejected) {
-                (Some(reason), _) => condition("Accepted", "False", reason, generation),
-                (None, Some(msg)) => condition_msg("Accepted", "False", "UnsupportedValue", msg, generation),
-                (None, None) => condition("Accepted", "True", "Accepted", generation),
+            let accepted = match (&accept_reason, &rejected) {
+                (Some((reason, msg)), _) => condition("Accepted", "False", reason, msg, generation),
+                (None, Some(msg)) => condition("Accepted", "False", "UnsupportedValue", msg, generation),
+                (None, None) => condition("Accepted", "True", "Accepted", "", generation),
             };
 
-            let (route_backends, refs_failure) =
+            let (route_backends, broken_refs) =
                 route_backends.get_or_insert_with(|| self.tls_route_backends(route, backends));
 
             // For each attached listener, add its effective SNIs to the dispatch
@@ -1735,10 +1852,7 @@ impl ReconcileCtx {
                 }
             }
 
-            let resolved = match *refs_failure {
-                None => condition("ResolvedRefs", "True", "ResolvedRefs", generation),
-                Some(reason) => condition("ResolvedRefs", "False", reason, generation),
-            };
+            let resolved = broken_refs.condition(generation);
 
             parents.push(TlsRouteStatusParents {
                 parent_ref: TlsRouteStatusParentsParentRef {
@@ -1766,47 +1880,36 @@ impl ReconcileCtx {
         })
     }
 
-    /// Resolve a TLSRoute's backends across all its rules, and the ResolvedRefs
-    /// failure reason (RefNotPermitted first).
-    fn tls_route_backends(
-        &self,
-        route: &TLSRoute,
-        backends: &mut BackendIndex,
-    ) -> (Arc<TlsBackends>, Option<&'static str>) {
+    /// Resolve a TLSRoute's backends across all its rules, noting each backendRef
+    /// that does not resolve.
+    fn tls_route_backends(&self, route: &TLSRoute, backends: &mut BackendIndex) -> (Arc<TlsBackends>, BrokenRefs) {
         let route_ns = route.namespace().unwrap_or_default();
-        let mut refs_failure: Option<&'static str> = None;
+        let mut broken_refs = BrokenRefs::default();
         let mut out = TlsBackends::default();
-        for rule in &route.spec.rules {
-            for backend_ref in &rule.backend_refs {
-                let svc_port = backend_ref.port.unwrap_or(0) as u16;
-                let bns = backend_ref.namespace.clone().unwrap_or_else(|| route_ns.clone());
-
-                let group = backend_ref.group.as_deref().unwrap_or("");
-                let kind = backend_ref.kind.as_deref().unwrap_or("Service");
-                if !group.is_empty() || kind != "Service" {
-                    refs_failure = Some("InvalidKind");
-                    continue;
-                }
-                if bns != route_ns && !self.ref_grant_permits(&route_ns, "TLSRoute", &bns, "Service", &backend_ref.name)
-                {
-                    refs_failure = Some("RefNotPermitted");
-                    continue;
-                }
+        for (rule_idx, rule) in route.spec.rules.iter().enumerate() {
+            for (ref_idx, backend_ref) in rule.backend_refs.iter().enumerate() {
+                let backend = BackendRef {
+                    group: backend_ref.group.as_deref(),
+                    kind: backend_ref.kind.as_deref(),
+                    namespace: backend_ref.namespace.as_deref(),
+                    name: &backend_ref.name,
+                    port: backend_ref.port,
+                };
                 // The endpoints carry any BackendTLSPolicy decision for this Service
                 // PORT, as for an HTTPRoute. Only a Terminate listener uses it:
                 // Passthrough forwards the client's own TLS.
-                match self.service_endpoints(backends, &bns, &backend_ref.name, svc_port) {
-                    Some(endpoints) => out.backends.push(TlsBackend {
+                match self.resolve_backend(backends, "TLSRoute", &route_ns, &backend) {
+                    Ok((_, endpoints)) => out.backends.push(TlsBackend {
                         weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
                         endpoints,
                     }),
-                    None => {
-                        refs_failure.get_or_insert("BackendNotFound");
+                    Err((reason, why)) => {
+                        broken_refs.add(reason, format!("rules[{rule_idx}].backendRefs[{ref_idx}]: {why}"));
                     }
                 }
             }
         }
-        (Arc::new(out), refs_failure)
+        (Arc::new(out), broken_refs)
     }
 
     /// Compute which of a Gateway's `protocol: TLS` listeners a TLSRoute attaches
@@ -1821,75 +1924,66 @@ impl ReconcileCtx {
         pref: &gateway_api::apis::standard::tlsroutes::TlsRouteParentRefs,
     ) -> (
         Vec<(gateway_api::apis::standard::gateways::GatewayListeners, TlsListenerMode)>,
-        Option<&'static str>,
+        Option<Failure>,
     ) {
         let route_ns = route.namespace().unwrap_or_default();
         let route_hostnames = &route.spec.hostnames;
-        if !model.usable {
-            return (vec![], Some("NotAllowedByListeners"));
+        if let Some(why) = gateway_not_accepted(model) {
+            return (vec![], Some(why));
         }
 
         // Narrow by sectionName / port first (a hard parentRef selector).
-        let candidates: Vec<_> = gw
-            .spec
-            .listeners
-            .iter()
-            .filter(|l| {
-                pref.section_name.as_ref().map(|s| &l.name == s).unwrap_or(true)
-                    && pref.port.map(|p| l.port == p).unwrap_or(true)
-            })
-            .cloned()
-            .collect();
-        if candidates.is_empty() {
-            return (vec![], Some("NoMatchingParent"));
-        }
+        let Some(candidates) = selected_listeners(gw, pref.section_name.as_deref(), pref.port) else {
+            return (
+                vec![],
+                Some(no_matching_parent(gw, pref.section_name.as_deref(), pref.port)),
+            );
+        };
 
         let mut attached = Vec::new();
-        let mut rejected_by_allow = false;
-        let mut rejected_by_hostname = false;
+        let mut not_attached = NotAttached::default();
         for l in candidates {
+            let outcome = model.listeners.iter().find(|o| o.name == l.name);
             // Only TLS listeners carry TLSRoutes. A non-TLS listener selected by
             // sectionName/port is "not allowed" for this kind.
-            let Some(outcome) = model.listeners.iter().find(|o| o.name == l.name) else {
-                rejected_by_allow = true;
-                continue;
-            };
-            let Some(mode) = outcome.tls_mode else {
-                rejected_by_allow = true; // non-TLS protocol
+            let Some((outcome, mode)) = outcome.and_then(|o| Some((o, o.tls_mode?))) else {
+                not_attached.not_allowed.push(format!("{}: not a TLS listener", l.name));
                 continue;
             };
             // A listener torii does not accept (mixed termination on its port, or a
             // port that serves no TLS) accepts no routes. Nor does a Terminate one
             // whose certificate did not resolve: it is not programmed, and must not
             // terminate its routes' TLS with another certificate.
-            if !outcome.accepted() || (mode == TlsListenerMode::Terminate && outcome.tls_failure.is_some()) {
-                rejected_by_allow = true;
-                continue;
+            if let Some((reason, _)) = outcome.rejection(&self.config) {
+                not_attached
+                    .not_allowed
+                    .push(format!("{}: not served ({reason})", l.name));
+            } else if let (TlsListenerMode::Terminate, Some((reason, _))) = (mode, &outcome.tls_failure) {
+                let why = format!("{}: its certificate did not resolve ({reason})", l.name);
+                not_attached.not_allowed.push(why);
+            } else if !self.listener_allows_namespace(&l, gw, &route_ns) {
+                let why = format!(
+                    "{}: allowedRoutes does not admit routes from namespace {route_ns}",
+                    l.name
+                );
+                not_attached.not_allowed.push(why);
+            } else if !listener_allows_kind(&l, "TLSRoute") {
+                let why = format!("{}: allowedRoutes.kinds does not include TLSRoute", l.name);
+                not_attached.not_allowed.push(why);
+            } else if !listener_hostname_overlaps(l.hostname.as_deref(), route_hostnames) {
+                let why = format!(
+                    "{}: its hostname {} matches none of the route's",
+                    l.name,
+                    l.hostname.as_deref().unwrap_or_default()
+                );
+                not_attached.no_hostname.push(why);
+            } else {
+                attached.push((l, mode));
             }
-            if !self.listener_allows_namespace(&l, gw, &route_ns) {
-                rejected_by_allow = true;
-                continue;
-            }
-            if !listener_allows_kind(&l, "TLSRoute") {
-                rejected_by_allow = true;
-                continue;
-            }
-            if !listener_hostname_overlaps(l.hostname.as_deref(), route_hostnames) {
-                rejected_by_hostname = true;
-                continue;
-            }
-            attached.push((l, mode));
         }
 
         if attached.is_empty() {
-            let reason = if rejected_by_allow {
-                "NotAllowedByListeners"
-            } else if rejected_by_hostname {
-                "NoMatchingListenerHostname"
-            } else {
-                "NoMatchingParent"
-            };
-            return (vec![], Some(reason));
+            return (vec![], Some(not_attached.reason(gw)));
         }
         (attached, None)
     }
@@ -2162,22 +2256,22 @@ impl ReconcileCtx {
             // Map the computed PolicyStatus to its (ResolvedRefs, Accepted) pair.
             let (resolved, accepted) = match outcome.map(|o| &o.status) {
                 Some(PolicyStatus::Accepted) => (
-                    condition("ResolvedRefs", "True", "ResolvedRefs", generation),
-                    condition("Accepted", "True", "Accepted", generation),
+                    condition("ResolvedRefs", "True", "ResolvedRefs", "", generation),
+                    condition("Accepted", "True", "Accepted", "", generation),
                 ),
                 Some(PolicyStatus::Conflicted) => (
                     // Conflicted policies have valid refs → ResolvedRefs stays True.
-                    condition("ResolvedRefs", "True", "ResolvedRefs", generation),
-                    condition_msg("Accepted", "False", "Conflicted", msg, generation),
+                    condition("ResolvedRefs", "True", "ResolvedRefs", "", generation),
+                    condition("Accepted", "False", "Conflicted", msg, generation),
                 ),
                 Some(PolicyStatus::InvalidKind) => (
-                    condition_msg("ResolvedRefs", "False", "InvalidKind", msg, generation),
-                    condition("Accepted", "False", "NoValidCACertificate", generation),
+                    condition("ResolvedRefs", "False", "InvalidKind", msg, generation),
+                    condition("Accepted", "False", "NoValidCACertificate", msg, generation),
                 ),
                 // InvalidCaRef, or no outcome (shouldn't happen) → invalid-ref reason.
                 _ => (
-                    condition_msg("ResolvedRefs", "False", "InvalidCACertificateRef", msg, generation),
-                    condition("Accepted", "False", "NoValidCACertificate", generation),
+                    condition("ResolvedRefs", "False", "InvalidCACertificateRef", msg, generation),
+                    condition("Accepted", "False", "NoValidCACertificate", msg, generation),
                 ),
             };
 
@@ -2245,6 +2339,43 @@ impl ReconcileCtx {
         let endpoints = self.resolve_endpoints(index, ns, name, port).map(Arc::from);
         index.resolved.insert(key, endpoints.clone());
         endpoints
+    }
+
+    /// Resolve a route's backendRef, from a route of `route_kind` in `route_ns`:
+    /// its namespace and the endpoints of its Service port, or why it does not
+    /// resolve, as (ResolvedRefs reason, message).
+    fn resolve_backend(
+        &self,
+        index: &mut BackendIndex,
+        route_kind: &str,
+        route_ns: &str,
+        backend: &BackendRef,
+    ) -> Result<(String, Arc<[Endpoint]>), Failure> {
+        let name = backend.name;
+        let ns = backend.namespace.unwrap_or(route_ns);
+        // Only core Services are supported backends.
+        let group = backend.group.unwrap_or("");
+        let kind = backend.kind.unwrap_or("Service");
+        if !group.is_empty() || kind != "Service" {
+            let msg = format!("{group}/{kind} {name} is not a Service, the only kind of backend torii supports");
+            return Err(("InvalidKind", msg));
+        }
+        // Cross-namespace backendRefs require a permitting ReferenceGrant.
+        if ns != route_ns && !self.ref_grant_permits(route_ns, route_kind, ns, "Service", name) {
+            let msg = format!(
+                "Service {ns}/{name} is in another namespace, and no ReferenceGrant there allows {route_kind}s in \
+                 {route_ns} to use it"
+            );
+            return Err(("RefNotPermitted", msg));
+        }
+        let port = backend.port.unwrap_or(0) as u16;
+        match self.service_endpoints(index, ns, name, port) {
+            Some(endpoints) => Ok((ns.to_string(), endpoints)),
+            None if find_in(&self.stores.services, ns, name).is_none() => {
+                Err(("BackendNotFound", format!("Service {ns}/{name} was not found")))
+            }
+            None => Err(("BackendNotFound", format!("Service {ns}/{name} has no TCP port {port}"))),
+        }
     }
 
     /// Why an HTTPRoute cannot send to Service port `ns/name:port` with the protocol
@@ -2432,14 +2563,19 @@ fn validate_http_rule(
                 "{at}.matches[{mi}].path: ';' path parameters are not supported"
             )));
         }
-        // Header match: a RegularExpression value must compile.
+        // Header match: a RegularExpression value must compile. The message
+        // quotes the start of the value and the error's last line only: the value
+        // can be 4096 characters, and the error repeats it.
         for (hi, h) in m.headers.iter().flatten().enumerate() {
             if matches!(h.r#type, Some(HType::RegularExpression))
                 && let Err(e) = regex::Regex::new(&h.value)
             {
+                let start: String = h.value.chars().take(64).collect();
+                let more = if start.len() < h.value.len() { "…" } else { "" };
+                let e = e.to_string();
+                let why = e.lines().rfind(|l| !l.trim().is_empty()).unwrap_or_default().trim();
                 return Some(Unmatchable(format!(
-                    "{at}.matches[{mi}].headers[{hi}]: invalid RegularExpression {:?}: {e}",
-                    h.value
+                    "{at}.matches[{mi}].headers[{hi}]: invalid RegularExpression {start:?}{more}: {why}"
                 )));
             }
         }
@@ -2602,6 +2738,47 @@ fn protocol_route_kinds(protocol: &str) -> &'static [&'static str] {
     }
 }
 
+/// `namespace/name` of an object, for messages.
+fn object_name(obj: &impl Resource) -> String {
+    format!("{}/{}", obj.namespace().unwrap_or_default(), obj.name_any())
+}
+
+/// Why a Gateway takes no routes because torii rejected it, as an Accepted=False
+/// reason and message for them.
+fn gateway_not_accepted(model: &GatewayModel) -> Option<Failure> {
+    let msg = format!(
+        "Gateway {} is not accepted, so none of its listeners takes routes",
+        object_name(&*model.gw)
+    );
+    (!model.usable).then_some(("NotAllowedByListeners", msg))
+}
+
+/// The listeners of `gw` that a parentRef's sectionName and port select, or None
+/// when it selects none.
+fn selected_listeners(
+    gw: &Gateway,
+    section_name: Option<&str>,
+    port: Option<i32>,
+) -> Option<Vec<gateway_api::apis::standard::gateways::GatewayListeners>> {
+    let selected: Vec<_> = gw
+        .spec
+        .listeners
+        .iter()
+        .filter(|l| section_name.is_none_or(|s| l.name == s) && port.is_none_or(|p| l.port == p))
+        .cloned()
+        .collect();
+    (!selected.is_empty()).then_some(selected)
+}
+
+/// The Accepted=False reason and message for a parentRef that selects none of
+/// `gw`'s listeners.
+fn no_matching_parent(gw: &Gateway, section_name: Option<&str>, port: Option<i32>) -> Failure {
+    let named = section_name.map(|s| format!(" named {s}")).unwrap_or_default();
+    let on_port = port.map(|p| format!(" on port {p}")).unwrap_or_default();
+    let msg = format!("Gateway {} has no listener{named}{on_port}", object_name(gw));
+    ("NoMatchingParent", msg)
+}
+
 /// Does a listener's allowedRoutes.kinds permit the given route kind? An absent
 /// `kinds` list does NOT mean "all kinds" — it means the kinds the listener's
 /// PROTOCOL supports. So an HTTPRoute must not attach to a `protocol: TLS` listener
@@ -2722,12 +2899,6 @@ fn ca_pem_is_valid(pem: &[u8]) -> bool {
     openssl::x509::X509::stack_from_pem(pem)
         .map(|s| !s.is_empty())
         .unwrap_or(false)
-}
-
-/// Validate that a cert/key pair parses as PEM (used to reject malformed cert
-/// Secrets → InvalidCertificateRef). Uses the same OpenSSL parse the proxy serves.
-fn cert_key_is_valid(ck: &CertKey) -> bool {
-    ck.parsed().is_some()
 }
 
 /// Parse a Gateway API duration into a [`Duration`].
@@ -3085,22 +3256,30 @@ where
     store.get(&reflector::ObjectRef::new(name).within(ns))
 }
 
-/// Build a metav1 Condition with observedGeneration set and an empty message.
-fn condition(type_: &str, status: &str, reason: &str, observed_generation: i64) -> Condition {
-    condition_msg(type_, status, reason, "", observed_generation)
-}
+/// The longest condition message torii writes, in bytes. The API server refuses
+/// a whole status with a message over 32768, and some are built from what users
+/// wrote (a regex, the list of a route's broken backendRefs).
+const MAX_MESSAGE: usize = 1024;
 
-/// Build a metav1 Condition carrying a human-readable `message`. The Gateway API
-/// `message` field is meant to explain WHY a condition is False — infra users see
-/// it via `kubectl describe`/`get -o yaml` even without controller-log access. The
-/// conformance suite matches only on type/status/reason (helpers.go), so a detailed
-/// message is always safe to include and never breaks a test.
-fn condition_msg(type_: &str, status: &str, reason: &str, message: &str, observed_generation: i64) -> Condition {
+/// Build a metav1 Condition with observedGeneration set. The `message` says why a
+/// False condition is False: infra users see it via `kubectl describe`/`get -o
+/// yaml` even without controller-log access. The conformance suite matches only
+/// on type/status/reason (helpers.go), so a detailed message never breaks a test.
+fn condition(type_: &str, status: &str, reason: &str, message: &str, observed_generation: i64) -> Condition {
+    let mut message = message.to_string();
+    if message.len() > MAX_MESSAGE {
+        let mut end = MAX_MESSAGE - '…'.len_utf8();
+        while !message.is_char_boundary(end) {
+            end -= 1;
+        }
+        message.truncate(end);
+        message.push('…');
+    }
     Condition {
         type_: type_.to_string(),
         status: status.to_string(),
         reason: reason.to_string(),
-        message: message.to_string(),
+        message,
         observed_generation: Some(observed_generation),
         // A fixed timestamp is fine; the suite never inspects it. A stable value
         // keeps the merge patch deterministic (avoids needless status churn).
@@ -3713,6 +3892,54 @@ mod tests {
             matches!(decision, crate::tls_table::TlsDecision::NoRoute),
             "{decision:?}"
         );
+    }
+
+    // A False condition says what is wrong: a route's ResolvedRefs names every
+    // broken backendRef, under the reason that comes first in a fixed order, not
+    // the last one seen (T158). Messages are bounded (T157).
+    #[tokio::test]
+    async fn conditions_say_what_is_wrong() {
+        let ctx = test_ctx(
+            Stores {
+                gateways: store_of(vec![http_gateway()]),
+                ..no_objects()
+            },
+            &[80],
+            &[],
+        );
+        let route = http_route_with(
+            "bad",
+            serde_json::json!({
+                "parentRefs": [{ "name": "gw" }],
+                "rules": [
+                    { "backendRefs": [{ "name": "elsewhere", "namespace": "other", "port": 80 }] },
+                    { "backendRefs": [{ "group": "example.com", "kind": "Foo", "name": "foo" }] },
+                    { "backendRefs": [{ "name": "missing", "port": 80 }] },
+                ],
+            }),
+        );
+        let (status, _, _) = route_pass(&ctx, &route);
+        let (conditions, messages) = parent_conditions(&status.unwrap());
+        assert_eq!(conditions[1], "ResolvedRefs=False/RefNotPermitted");
+        for part in [
+            "rules[0].backendRefs[0]: Service other/elsewhere is in another namespace",
+            "rules[1].backendRefs[0]: example.com/Foo foo is not a Service",
+            "rules[2].backendRefs[0]: Service ns/missing was not found",
+        ] {
+            assert!(messages[1].contains(part), "{}", messages[1]);
+        }
+
+        let unmatched = http_route_with(
+            "nomatch",
+            serde_json::json!({ "parentRefs": [{ "name": "gw", "sectionName": "nope" }], "rules": [{}] }),
+        );
+        let (status, _, _) = route_pass(&ctx, &unmatched);
+        let (conditions, messages) = parent_conditions(&status.unwrap());
+        assert_eq!(conditions[0], "Accepted=False/NoMatchingParent");
+        assert_eq!(messages[0], "Gateway ns/gw has no listener named nope");
+
+        let long = condition("Accepted", "False", "UnsupportedValue", &"é".repeat(MAX_MESSAGE), 1);
+        assert!(long.message.len() <= MAX_MESSAGE && long.message.ends_with('…'));
     }
 
     // A parent named twice (namespace left out, then set to the route's) is one
