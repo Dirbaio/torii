@@ -1298,10 +1298,22 @@ impl ReconcileCtx {
 
         let mut rules: Option<RouteRules> = None;
         let mut parents: Vec<HttpRouteStatusParents> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        // The listeners the route is programmed on and counted in, once each,
+        // however many of its parentRefs select them.
+        let mut attached_to = std::collections::HashSet::new();
 
         for pref in route.spec.parent_refs.iter().flatten() {
-            // Find the parent Gateway among the usable ones we own.
+            if !is_gateway_ref(pref.group.as_deref(), pref.kind.as_deref()) {
+                continue; // a Service (GAMMA) or other kind of parent, not ours
+            }
             let parent_ns = pref.namespace.clone().unwrap_or_else(|| route_ns.clone());
+            // `{name: gw}` and `{name: gw, namespace: <the route's>}` are one parent:
+            // it gets one status entry.
+            if !seen.insert((parent_ns.clone(), &pref.name, &pref.section_name, pref.port)) {
+                continue;
+            }
+            // Find the parent Gateway among the usable ones we own.
             let Some(model) = models.iter().find(|m| {
                 m.usable && m.gw.name_any() == pref.name && m.gw.namespace().unwrap_or_default() == parent_ns
             }) else {
@@ -1324,6 +1336,10 @@ impl ReconcileCtx {
             for l in &gw.spec.listeners {
                 gw_counts.entry(l.name.clone()).or_insert(0);
             }
+            let attached_listeners: Vec<_> = attached_listeners
+                .into_iter()
+                .filter(|l| attached_to.insert((parent_ns.clone(), gw.name_any(), l.name.clone())))
+                .collect();
             if rejection.is_none() {
                 for l in &attached_listeners {
                     *gw_counts.entry(l.name.clone()).or_insert(0) += 1;
@@ -1634,9 +1650,18 @@ impl ReconcileCtx {
         // parent: built once, for the first parent we own.
         let mut route_backends: Option<(Arc<TlsBackends>, Option<&'static str>)> = None;
         let mut parents: Vec<TlsRouteStatusParents> = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut attached_to = std::collections::HashSet::new();
 
         for pref in route.spec.parent_refs.iter().flatten() {
+            if !is_gateway_ref(pref.group.as_deref(), pref.kind.as_deref()) {
+                continue;
+            }
             let parent_ns = pref.namespace.clone().unwrap_or_else(|| route_ns.clone());
+            // One parent named two ways gets one status entry (see process_route).
+            if !seen.insert((parent_ns.clone(), &pref.name, &pref.section_name, pref.port)) {
+                continue;
+            }
             // Find the parent among usable Gateways we own.
             let Some(model) = models.iter().find(|m| {
                 m.usable && m.gw.name_any() == pref.name && m.gw.namespace().unwrap_or_default() == parent_ns
@@ -1648,6 +1673,10 @@ impl ReconcileCtx {
             // Which TLS listeners this route attaches to (sectionName/port +
             // allowedRoutes + SNI hostname overlap + not protocol-conflicted).
             let (attached, accept_reason) = self.attached_tls_listeners(route, gw, model, pref);
+            let attached: Vec<_> = attached
+                .into_iter()
+                .filter(|(l, _)| attached_to.insert((parent_ns.clone(), gw.name_any(), l.name.clone())))
+                .collect();
 
             // attachedRoutes counts: ensure every listener has a 0, then bump ours
             // if the route is accepted.
@@ -2892,6 +2921,14 @@ fn method_to_string(m: &gateway_api::apis::standard::httproutes::HttpRouteRulesM
     .to_string()
 }
 
+/// Whether a parentRef of this group and kind (defaults: a Gateway's) names a
+/// Gateway: a route's parent may also be a Service (GAMMA) or another kind,
+/// which torii does not serve, whatever its name.
+fn is_gateway_ref(group: Option<&str>, kind: Option<&str>) -> bool {
+    group.unwrap_or("gateway.networking.k8s.io") == "gateway.networking.k8s.io"
+        && kind.unwrap_or("Gateway") == "Gateway"
+}
+
 /// Does an HTTPRoute have a parentRef pointing at the given Gateway (name + ns)?
 fn route_has_parent(route: &HTTPRoute, gw_name: &str, gw_ns: &str) -> bool {
     let r_ns = route.namespace().unwrap_or_default();
@@ -3571,6 +3608,51 @@ mod tests {
         assert_eq!(conditions[0], "Accepted=False/UnsupportedValue");
         assert!(messages[0].contains("rules[1].name"), "{}", messages[0]);
         assert_eq!(counted(&counts), 0);
+        assert!(table.entries.is_empty());
+    }
+
+    // A parent named twice (namespace left out, then set to the route's) is one
+    // parent: one status entry, counted and programmed once (T163). A parentRef
+    // to a Service or another kind is not a Gateway of the same name (T142).
+    #[tokio::test]
+    async fn a_parent_counts_once_however_it_is_named() {
+        let ctx = test_ctx(
+            Stores {
+                gateways: store_of(vec![http_gateway()]),
+                ..no_objects()
+            },
+            &[80],
+            &[],
+        );
+        let route = http_route_with(
+            "r",
+            serde_json::json!({
+                "parentRefs": [
+                    { "name": "gw" },
+                    { "name": "gw", "namespace": "ns" },
+                    { "name": "gw", "sectionName": "http" },
+                ],
+                "rules": [{}],
+            }),
+        );
+        let (status, table, counts) = route_pass(&ctx, &route);
+        let parents: Vec<Option<&str>> = status
+            .as_ref()
+            .unwrap()
+            .parents
+            .iter()
+            .map(|p| p.parent_ref.section_name.as_deref())
+            .collect();
+        assert_eq!(parents, [None, Some("http")]);
+        assert_eq!(counts[&("ns".to_string(), "gw".to_string())]["http"], 1);
+        assert_eq!(table.entries.len(), 1);
+
+        let mesh = http_route_with(
+            "mesh",
+            serde_json::json!({ "parentRefs": [{ "group": "", "kind": "Service", "name": "gw" }], "rules": [{}] }),
+        );
+        let (status, table, _) = route_pass(&ctx, &mesh);
+        assert!(status.is_none());
         assert!(table.entries.is_empty());
     }
 
