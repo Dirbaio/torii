@@ -4,9 +4,9 @@
 //! Level-triggered and idempotent: any watched-object change triggers a full
 //! recompute of the entire world from cached state. We never accumulate deltas.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -31,10 +31,10 @@ use gateway_api::apis::standard::tlsroutes::{
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret, Service};
 use k8s_openapi::api::discovery::v1::EndpointSlice;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
-use kube::api::{ApiResource, DynamicObject, Patch, PatchParams};
+use kube::api::{ApiResource, DynamicObject, ObjectMeta, PartialObjectMeta, Patch, PatchParams};
 use kube::runtime::WatchStreamExt;
 use kube::runtime::reflector::{self, Store};
-use kube::runtime::watcher::{self, Config, watcher};
+use kube::runtime::watcher::{self, Config, metadata_watcher, watcher};
 use kube::{Api, Client, Resource, ResourceExt};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -126,9 +126,35 @@ struct Stores {
     endpoint_slices: Store<EndpointSlice>,
     reference_grants: Store<ReferenceGrant>,
     namespaces: Store<Namespace>,
-    secrets: Store<Secret>,
-    config_maps: Store<ConfigMap>,
+    /// Secrets and ConfigMaps by name and version only: torii needs the data of
+    /// the few that listeners and BackendTLSPolicies reference, and reads those
+    /// itself (see [`Referenced`]).
+    secrets: Store<PartialObjectMeta<Secret>>,
+    config_maps: Store<PartialObjectMeta<ConfigMap>>,
     backend_tls_policies: Store<BackendTLSPolicy>,
+}
+
+/// The data of the Secrets and ConfigMaps that listeners and BackendTLSPolicies
+/// reference, read with a GET whenever the metadata watch shows a new version, and
+/// kept only while referenced. Watching every Secret and ConfigMap in full kept
+/// every one in the cluster in memory, whatever its size, in the process that
+/// faces the internet.
+#[derive(Default)]
+struct Referenced {
+    /// A listener certificate: a Secret's tls.crt and tls.key, parsed, if it has
+    /// both.
+    secrets: FetchedObjects<Option<CertKey>>,
+    /// A BackendTLSPolicy CA bundle: a ConfigMap's ca.crt, if it has one.
+    config_maps: FetchedObjects<Option<Arc<[u8]>>>,
+}
+
+/// What torii read of some objects, by (namespace, name).
+type FetchedObjects<T> = Mutex<HashMap<(String, String), Fetched<T>>>;
+
+/// What torii read of an object, and of which version.
+struct Fetched<T> {
+    version: Option<String>,
+    data: T,
 }
 
 /// Run the control plane forever: start watchers, and on any change recompute.
@@ -182,6 +208,13 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
         ($ty:ty, $kind:literal, per_object) => {
             watch!(@reflect $ty, $kind, decoded_watcher::<$ty>(client.clone()))
         };
+        ($ty:ty, $kind:literal, metadata) => {
+            watch!(
+                @reflect PartialObjectMeta<$ty>,
+                $kind,
+                metadata_watcher(Api::<$ty>::all(client.clone()), Config::default()).modify(identity_only)
+            )
+        };
         ($ty:ty, $kind:literal) => {
             watch!(@reflect $ty, $kind, watcher(Api::<$ty>::all(client.clone()), Config::default()))
         };
@@ -196,8 +229,8 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
         endpoint_slices: watch!(EndpointSlice, "EndpointSlice"),
         reference_grants: watch!(ReferenceGrant, "ReferenceGrant", per_object),
         namespaces: watch!(Namespace, "Namespace"),
-        secrets: watch!(Secret, "Secret"),
-        config_maps: watch!(ConfigMap, "ConfigMap"),
+        secrets: watch!(Secret, "Secret", metadata),
+        config_maps: watch!(ConfigMap, "ConfigMap", metadata),
         backend_tls_policies: watch!(BackendTLSPolicy, "BackendTLSPolicy", per_object),
     });
 
@@ -216,6 +249,7 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
         data_plane,
         config,
         stores,
+        referenced: Referenced::default(),
     };
 
     // Reconcile loop: debounce bursts of events, then recompute everything.
@@ -240,6 +274,18 @@ pub async fn run(client: Client, data_plane: DataPlane, config: ControllerConfig
             tracing::error!(error = %e, "reconcile failed");
         }
     }
+}
+
+/// Keep of a watched object's metadata what identifies it and its version: a
+/// tenant can give each Secret and ConfigMap 256 KiB of labels and annotations.
+fn identity_only<K>(obj: &mut PartialObjectMeta<K>) {
+    let meta = std::mem::take(&mut obj.metadata);
+    obj.metadata = ObjectMeta {
+        name: meta.name,
+        namespace: meta.namespace,
+        resource_version: meta.resource_version,
+        ..Default::default()
+    };
 }
 
 /// Whether a watcher error is the API server refusing the initial list for good:
@@ -356,6 +402,7 @@ struct ReconcileCtx {
     data_plane: DataPlane,
     config: ControllerConfig,
     stores: Arc<Stores>,
+    referenced: Referenced,
 }
 
 // ── Internal reconcile model ────────────────────────────────────────────────
@@ -580,6 +627,7 @@ impl ReconcileCtx {
             .into_iter()
             .filter(|gw| owned_class_names.contains(&gw.spec.gateway_class_name))
             .collect();
+        self.fetch_referenced(&gateways).await;
 
         // ── Stage 1: per-Gateway model + CertStore (single TLS validate path) ──
         let mut cert_store = CertStore::default();
@@ -790,13 +838,64 @@ impl ReconcileCtx {
         }
     }
 
-    /// Load a kubernetes.io/tls Secret's cert+key (tls.crt / tls.key) as PEM.
+    /// A Secret's cert+key (tls.crt / tls.key), as [`Self::fetch_referenced`] read
+    /// it.
     fn load_tls_secret(&self, ns: &str, name: &str) -> Option<CertKey> {
-        let secret = find_in(&self.stores.secrets, ns, name)?;
-        let data = secret.data.as_ref()?;
-        let cert = data.get("tls.crt")?;
-        let key = data.get("tls.key")?;
-        Some(CertKey::new(&cert.0, &key.0))
+        let secrets = self.referenced.secrets.lock().unwrap_or_else(|e| e.into_inner());
+        secrets.get(&(ns.to_string(), name.to_string()))?.data.clone()
+    }
+
+    /// Bring [`Referenced`] up to date for this pass: the Secrets that `gateways`'
+    /// listeners may load (their own namespace's, or another's that a
+    /// ReferenceGrant allows), and the ConfigMaps BackendTLSPolicies name.
+    async fn fetch_referenced(&self, gateways: &[Arc<Gateway>]) {
+        let mut secrets = BTreeSet::new();
+        for gw in gateways {
+            let gw_ns = gw.namespace().unwrap_or_default();
+            let refs = gw
+                .spec
+                .listeners
+                .iter()
+                .filter(|l| matches!(l.protocol.as_str(), "HTTPS" | "TLS"))
+                .flat_map(|l| l.tls.iter().flat_map(|t| t.certificate_refs.iter().flatten()));
+            for r in refs {
+                if !r.group.as_deref().unwrap_or("").is_empty() || r.kind.as_deref().unwrap_or("Secret") != "Secret" {
+                    continue;
+                }
+                let ns = r.namespace.clone().unwrap_or_else(|| gw_ns.clone());
+                if ns == gw_ns || self.ref_grant_permits(&gw_ns, "Gateway", &ns, "Secret", &r.name) {
+                    secrets.insert((ns, r.name.clone()));
+                }
+            }
+        }
+        let mut config_maps = BTreeSet::new();
+        for policy in self.stores.backend_tls_policies.state() {
+            let ns = policy.namespace().unwrap_or_default();
+            for r in policy.spec.validation.ca_certificate_refs.iter().flatten() {
+                if r.group.is_empty() && r.kind == "ConfigMap" {
+                    config_maps.insert((ns.clone(), r.name.clone()));
+                }
+            }
+        }
+        futures::join!(
+            fetch_referenced(
+                &self.client,
+                &self.stores.secrets,
+                &self.referenced.secrets,
+                secrets,
+                |s: Secret| {
+                    let data = s.data?;
+                    Some(CertKey::new(&data.get("tls.crt")?.0, &data.get("tls.key")?.0))
+                }
+            ),
+            fetch_referenced(
+                &self.client,
+                &self.stores.config_maps,
+                &self.referenced.config_maps,
+                config_maps,
+                |cm: ConfigMap| Some(Arc::from(cm.data?.remove("ca.crt")?.into_bytes())),
+            ),
+        );
     }
 
     /// The [`SUPPORTED_FEATURES`] the configured ports can serve: GatewayPort8080
@@ -2016,11 +2115,10 @@ impl ReconcileCtx {
         patches
     }
 
-    /// Read a CA bundle (ca.crt) from a ConfigMap.
-    fn load_configmap_ca(&self, ns: &str, name: &str) -> Option<Vec<u8>> {
-        let cm = find_in(&self.stores.config_maps, ns, name)?;
-        let ca = cm.data.as_ref()?.get("ca.crt")?;
-        Some(ca.clone().into_bytes())
+    /// A ConfigMap's CA bundle (ca.crt), as [`Self::fetch_referenced`] read it.
+    fn load_configmap_ca(&self, ns: &str, name: &str) -> Option<Arc<[u8]>> {
+        let config_maps = self.referenced.config_maps.lock().unwrap_or_else(|e| e.into_inner());
+        config_maps.get(&(ns.to_string(), name.to_string()))?.data.clone()
     }
 
     /// The endpoints of Service port `ns/name:port`, with the port's BackendTLSPolicy
@@ -2733,6 +2831,69 @@ fn tls_route_targets_service_in(route: &TLSRoute, svc_names: &[String], svc_ns: 
         .any(|b| svc_names.contains(&b.name) && b.namespace.as_deref().unwrap_or(&r_ns) == svc_ns)
 }
 
+/// One kind's part of [`ReconcileCtx::fetch_referenced`]: of the objects in
+/// `wanted`, GET those whose version in the metadata store `meta` is not the one in
+/// `cache`, and keep `extract` of each. Forget what is no longer wanted or gone.
+/// A failed GET keeps what was read before, and is tried again on the next pass.
+async fn fetch_referenced<K, T>(
+    client: &Client,
+    meta: &Store<PartialObjectMeta<K>>,
+    cache: &FetchedObjects<T>,
+    wanted: BTreeSet<(String, String)>,
+    extract: impl Fn(K) -> T,
+) where
+    K: Resource<DynamicType = (), Scope = k8s_openapi::NamespaceResourceScope>
+        + Clone
+        + DeserializeOwned
+        + std::fmt::Debug,
+{
+    let lock = || cache.lock().unwrap_or_else(|e| e.into_inner());
+    let mut stale = Vec::new();
+    {
+        let mut cache = lock();
+        cache.retain(|key, _| wanted.contains(key));
+        for (ns, name) in wanted {
+            let key = (ns, name);
+            match meta.get(&reflector::ObjectRef::new(&key.1).within(&key.0)) {
+                None => {
+                    cache.remove(&key);
+                }
+                Some(m)
+                    if cache
+                        .get(&key)
+                        .is_some_and(|f| f.version == m.metadata.resource_version) => {}
+                Some(_) => stale.push(key),
+            }
+        }
+    }
+    let fetched = futures::future::join_all(stale.into_iter().map(|(ns, name)| async move {
+        let got = Api::<K>::namespaced(client.clone(), &ns).get_opt(&name).await;
+        ((ns, name), got)
+    }))
+    .await;
+    let mut cache = lock();
+    for (key, got) in fetched {
+        match got {
+            Ok(Some(obj)) => {
+                let version = obj.meta().resource_version.clone();
+                cache.insert(
+                    key,
+                    Fetched {
+                        version,
+                        data: extract(obj),
+                    },
+                );
+            }
+            Ok(None) => {
+                cache.remove(&key);
+            }
+            Err(e) => {
+                tracing::warn!(kind = %K::kind(&()), namespace = key.0, name = key.1, error = %e, "cannot read a referenced object")
+            }
+        }
+    }
+}
+
 /// A Service's TCP ports (a port without a protocol is TCP): routes reach their
 /// backends over TCP.
 fn tcp_service_ports(svc: &Service) -> impl Iterator<Item = &k8s_openapi::api::core::v1::ServicePort> {
@@ -3018,7 +3179,34 @@ mod tests {
                 acme_default_email: None,
             },
             stores: Arc::new(stores),
+            referenced: Referenced::default(),
         }
+    }
+
+    /// The metadata of a Secret or ConfigMap in the store, at version "1".
+    fn meta_of<K>(ns: &str, name: &str) -> PartialObjectMeta<K> {
+        use kube::core::PartialObjectMetaExt;
+        ObjectMeta {
+            name: Some(name.into()),
+            namespace: Some(ns.into()),
+            resource_version: Some("1".into()),
+            ..Default::default()
+        }
+        .into_response_partial()
+    }
+
+    /// Make the certificate of Secret `ns/name` (whose metadata the store has, see
+    /// [`meta_of`]) read already, as no test can GET it.
+    fn read_secret(ctx: &ReconcileCtx, ns: &str, name: &str, cert: CertKey) {
+        let fetched = Fetched {
+            version: Some("1".into()),
+            data: Some(cert),
+        };
+        ctx.referenced
+            .secrets
+            .lock()
+            .unwrap()
+            .insert((ns.into(), name.into()), fetched);
     }
 
     /// The GatewayClass `torii`, of this controller.
@@ -3084,23 +3272,15 @@ mod tests {
             "spec": { "parentRefs": [{ "name": "gw" }], "rules": [{}] },
         }))
         .unwrap();
-        let (cert_pem, key_pem) = CertKey::generate_self_signed_pem().unwrap();
-        let mut secret = Secret::default();
-        secret.metadata.name = Some("cert".into());
-        secret.metadata.namespace = Some("ns".into());
-        secret.data = Some(BTreeMap::from([
-            ("tls.crt".to_string(), k8s_openapi::ByteString(cert_pem)),
-            ("tls.key".to_string(), k8s_openapi::ByteString(key_pem)),
-        ]));
-
         let stores = Stores {
             gateway_classes: store_of(vec![torii_class()]),
             gateways: store_of(vec![gw.clone()]),
             routes: store_of(vec![route]),
-            secrets: store_of(vec![secret]),
+            secrets: store_of(vec![meta_of("ns", "cert")]),
             ..no_objects()
         };
         let ctx = test_ctx(stores, &[80], &[443, 8443, 9443]);
+        read_secret(&ctx, "ns", "cert", CertKey::generate_self_signed().unwrap());
 
         // Served: only the HTTP listener and the HTTPS one on the port whose
         // `perPort` entry turns validation off.
