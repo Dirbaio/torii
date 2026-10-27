@@ -3,43 +3,37 @@
 //! The control plane resolves HTTPS-listener certificate Secrets into PEM
 //! cert+key pairs keyed by the listener hostname; it's published to the data plane
 //! (with the route table) via the atomic [`crate::snapshot::Snapshot`]. The data
-//! plane's TLS `certificate_callback` reads it per handshake to select a cert by SNI.
+//! plane's certificate resolver reads it per handshake to select a cert by SNI.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use openssl::pkey::{PKey, Private};
-use openssl::x509::X509;
+use rustls::RootCertStore;
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::sign::CertifiedKey;
 
 /// A resolved server certificate (chain + private key), parsed once from PEM when
-/// it is built: a handshake only attaches the parsed objects, and reuses OpenSSL's
-/// per-key state (re-parsing an RSA-4096 key took ~1/3 of a handshake).
+/// it is built: a handshake only takes a reference to it, and reuses the key's
+/// precomputed state (re-parsing an RSA-4096 key took ~1/3 of a handshake).
 #[derive(Clone)]
 pub struct CertKey {
-    parsed: Option<Arc<ParsedCertKey>>,
-}
-
-/// The parsed chain (leaf first) and key of a [`CertKey`].
-pub struct ParsedCertKey {
-    pub chain: Vec<X509>,
-    pub key: PKey<Private>,
+    parsed: Option<Arc<CertifiedKey>>,
 }
 
 impl CertKey {
     /// A cert+key from PEM, parsed now; see [`CertKey::parsed`].
     pub fn new(cert_pem: &[u8], key_pem: &[u8]) -> CertKey {
-        let chain = X509::stack_from_pem(cert_pem).ok().filter(|c| !c.is_empty());
-        let key = PKey::private_key_from_pem(key_pem).ok();
-        let parsed = chain
-            .zip(key)
-            .map(|(chain, key)| Arc::new(ParsedCertKey { chain, key }));
-        CertKey { parsed }
+        CertKey {
+            parsed: parse(cert_pem, key_pem).ok().map(Arc::new),
+        }
     }
 
-    /// The parsed chain and key, or `None` when either does not parse (the
-    /// controller then reports the certificateRef invalid).
-    pub fn parsed(&self) -> Option<&ParsedCertKey> {
-        self.parsed.as_deref()
+    /// The parsed chain and key, or `None` when either does not parse or the key
+    /// is not the certificate's (the controller then reports the certificateRef
+    /// invalid).
+    pub fn parsed(&self) -> Option<&Arc<CertifiedKey>> {
+        self.parsed.as_ref()
     }
 
     /// Generate a self-signed "fallback" certificate, served as a last resort when
@@ -65,6 +59,35 @@ impl CertKey {
         let cert = params.self_signed(&key)?;
         Ok((cert.pem().into_bytes(), key.serialize_pem().into_bytes()))
     }
+}
+
+/// Parse a PEM certificate chain (leaf first) and the leaf's private key. The
+/// error completes "certificate ...".
+pub fn parse(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertifiedKey, &'static str> {
+    let chain = CertificateDer::pem_slice_iter(cert_pem)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|_| "does not parse")?;
+    let leaf = chain.first().ok_or("does not parse")?;
+    // A full parse, not webpki's: it would refuse the critical acmeIdentifier
+    // extension of an ACME TLS-ALPN-01 validation certificate.
+    let (_, leaf) = x509_parser::parse_x509_certificate(leaf).map_err(|_| "does not parse")?;
+    let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|_| "has a key that does not parse")?;
+    let key = rustls::crypto::ring::sign::any_supported_type(&key).map_err(|_| "has a key that does not parse")?;
+    if key
+        .public_key()
+        .is_some_and(|spki| spki.as_ref() != leaf.tbs_certificate.subject_pki.raw)
+    {
+        return Err("does not match the key in tls.key");
+    }
+    Ok(CertifiedKey::new(chain, key))
+}
+
+/// The trust anchors of a PEM CA bundle (a BackendTLSPolicy's); empty when none
+/// parse.
+pub fn ca_roots(pem: &[u8]) -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    roots.add_parsable_certificates(CertificateDer::pem_slice_iter(pem).filter_map(Result::ok));
+    roots
 }
 
 /// SNI-hostname → certificate mapping, plus a default for connections with no

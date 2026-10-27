@@ -5,9 +5,9 @@
 //! TLS ClientHello, and both of its modes end in a raw bidirectional byte pipe —
 //! they never parse HTTP:
 //!
-//! - **Passthrough**: peek the SNI, then pipe the still-encrypted bytes straight
+//! - **Passthrough**: read the SNI, then pipe the still-encrypted bytes straight
 //!   to a backend that terminates TLS itself.
-//! - **Terminate**: peek the SNI, terminate TLS here (cert chosen by SNI from the
+//! - **Terminate**: read the SNI, terminate TLS here (cert chosen by SNI from the
 //!   shared [`crate::cert_store::CertStore`]), then pipe the *cleartext* TCP to the
 //!   backend.
 //!

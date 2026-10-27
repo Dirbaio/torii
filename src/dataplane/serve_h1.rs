@@ -520,7 +520,8 @@ fn websocket_accepted(req: &RequestHead, resp: &h1::ResponseHead) -> bool {
     };
     let mut input = key.trim_ascii().to_vec();
     input.extend_from_slice(GUID);
-    let expected = openssl::base64::encode_block(&openssl::sha::sha1(&input));
+    let digest = ring::digest::digest(&ring::digest::SHA1_FOR_LEGACY_USE_ONLY, &input);
+    let expected = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, digest);
     accept.trim_ascii() == expected.as_bytes()
 }
 

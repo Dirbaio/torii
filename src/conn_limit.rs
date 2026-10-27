@@ -1,7 +1,7 @@
 //! Connection and request admission control for the data plane.
 //!
 //! Every connection costs memory for as long as it lives: a task, an fd, the L4
-//! read buffer and, on the TLS ports, OpenSSL's state. On a release build an idle
+//! read buffer and, on the TLS ports, the TLS state. On a release build an idle
 //! plain-HTTP connection costs about 20 KB and an idle TLS one about 60-75 KB. The
 //! idle timeouts bound how long each one lives, not how many there are, so a
 //! client that opens connections faster than they time out could OOM-kill the

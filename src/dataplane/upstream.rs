@@ -19,10 +19,9 @@ use bytes::BytesMut;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::Instant;
-use tokio_openssl::SslStream;
 
 use super::io::{Stream, setup_upstream};
-use super::tls::{ClientIdentity, Clients};
+use super::tls::{Client, ClientIdentity, Clients};
 use crate::route_table::{BackendTls, Endpoint, UpstreamTls};
 
 /// How long a pooled connection may stay idle (nginx's upstream `keepalive_timeout`).
@@ -82,19 +81,7 @@ pub async fn connect_http(
     if !fresh && let Some(up) = pool.take(&key) {
         return Ok(up);
     }
-    let ssl = match &client {
-        Some(c) => Some(c.ssl().ok_or_else(|| io::Error::other("TLS setup failed"))?),
-        None => None,
-    };
-    let stream = with_timeout(timeout, async {
-        let tcp = TcpStream::connect(addr).await?;
-        setup_upstream(&tcp);
-        Ok(match ssl {
-            None => Stream::Plain(tcp),
-            Some(ssl) => Stream::Tls(tls_connect(ssl, tcp).await?),
-        })
-    })
-    .await?;
+    let stream = connect(addr, client.as_ref(), timeout).await?;
     Ok(Upstream {
         stream,
         buf: BytesMut::new(),
@@ -113,30 +100,21 @@ pub async fn connect_raw(
     timeout: Option<Duration>,
 ) -> io::Result<Stream> {
     let addr = SocketAddr::new(ep.ip, ep.port);
-    let ssl = match tls {
-        Some(tls) => Some(
-            clients
-                .client(tls, false)
-                .ssl()
-                .ok_or_else(|| io::Error::other("TLS setup failed"))?,
-        ),
-        None => None,
-    };
+    let client = tls.map(|tls| clients.client(tls, false));
+    connect(addr, client.as_ref(), timeout).await
+}
+
+/// Connect to `addr`, and run the TLS handshake if there is a `client`.
+async fn connect(addr: SocketAddr, client: Option<&Client>, timeout: Option<Duration>) -> io::Result<Stream> {
     with_timeout(timeout, async {
         let tcp = TcpStream::connect(addr).await?;
         setup_upstream(&tcp);
-        Ok(match ssl {
+        Ok(match client {
             None => Stream::Plain(tcp),
-            Some(ssl) => Stream::Tls(tls_connect(ssl, tcp).await?),
+            Some(client) => Stream::Tls(Box::new(client.connect(tcp).await?)),
         })
     })
     .await
-}
-
-async fn tls_connect(ssl: openssl::ssl::Ssl, tcp: TcpStream) -> io::Result<SslStream<TcpStream>> {
-    let mut stream = SslStream::new(ssl, tcp).map_err(io::Error::other)?;
-    Pin::new(&mut stream).connect().await.map_err(io::Error::other)?;
-    Ok(stream)
 }
 
 async fn with_timeout<T>(timeout: Option<Duration>, f: impl Future<Output = io::Result<T>>) -> io::Result<T> {

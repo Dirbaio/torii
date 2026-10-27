@@ -1,6 +1,6 @@
 //! The data plane: torii's proxy.
 //!
-//! Built directly on tokio sockets, OpenSSL, our own HTTP/1 (on httparse) and our
+//! Built directly on tokio sockets, rustls, our own HTTP/1 (on httparse) and our
 //! fork of h2. Per request it reads the current [`RouteTable`] snapshot, matches
 //! the request, and forwards it to a backend pod over HTTP/1.1, or answers it
 //! itself (404 when nothing matches, redirects, CORS preflights, errors).
@@ -24,22 +24,18 @@ mod tls;
 mod upstream;
 
 use std::net::{IpAddr, SocketAddr};
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::BytesMut;
 use io::Stream;
-use tokio::io::Interest;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{Notify, watch};
-use tokio_openssl::SslStream;
 
 use crate::conn_limit::{ConnLimiter, ConnLimits};
 use crate::route_table::BackendTls;
 use crate::snapshot::DataPlane;
-use crate::tls_sni::ClientHello;
 use crate::tls_table::TlsDecision;
 
 /// Most response data the kernel may hold unsent on a client connection
@@ -113,11 +109,8 @@ const H2_GOAWAY_FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 /// ClientHello then stalls would otherwise pin a task forever.
 const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// How long to wait for the ClientHello's bytes, to read its SNI.
-const PEEK_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Most of a ClientHello peeked for its SNI. A real ClientHello is well under it.
-const MAX_CLIENT_HELLO: usize = 16 * 1024;
+/// How long a client may take to send its ClientHello.
+const CLIENT_HELLO_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Idle timeout for a TLSRoute connection (passthrough, or terminate to TCP): if
 /// no byte moves in EITHER direction for this long, it is closed. An idle bound
@@ -320,8 +313,8 @@ fn listen(addr: SocketAddr) -> std::io::Result<TcpListener> {
 
 /// Accept connections until told to stop, and serve each on its own task.
 ///
-/// Admission control happens here, before any work for the connection (the SNI
-/// peek, the TLS handshake, the HTTP session): the permit is held until the
+/// Admission control happens here, before any work for the connection (the
+/// ClientHello, the TLS handshake, the HTTP session): the permit is held until the
 /// connection ends.
 async fn accept_loop(ctx: Arc<Ctx>, listener: TcpListener, tls: bool, mut stop: watch::Receiver<bool>) {
     loop {
@@ -364,19 +357,16 @@ async fn accept_loop(ctx: Arc<Ctx>, listener: TcpListener, tls: bool, mut stop: 
     }
 }
 
-/// A connection to a TLS port: peek its SNI and dispatch.
+/// A connection to a TLS port: read its ClientHello and dispatch on its SNI.
 ///
 /// - TLSRoute **passthrough**: pipe the still-encrypted bytes to the backend.
 /// - TLSRoute **terminate**: terminate TLS here, pipe the cleartext to the backend
 ///   (re-encrypted if a BackendTLSPolicy targets it).
 /// - **otherwise** (no TLSRoute for the SNI): terminate TLS here and serve HTTP —
 ///   this is how HTTPS HTTPRoutes keep working on the same port.
-///
-/// The peek leaves the bytes in the socket, so whichever branch runs sees the
-/// whole byte stream, ClientHello included.
 async fn serve_tls(ctx: &Arc<Ctx>, tcp: TcpStream, info: &ConnInfo) {
-    // The setup (peek, dispatch, handshake) runs in its own allocation, let go
-    // once it is done: an idle connection then holds only the serving state.
+    // The setup (ClientHello, dispatch, handshake) runs in its own allocation, let
+    // go once it is done: an idle connection then holds only the serving state.
     let Some(conn) = Box::pin(tls_setup(ctx, tcp, info)).await else {
         return;
     };
@@ -402,18 +392,34 @@ enum TlsConn {
     Http(Stream),
 }
 
-/// Peek a TLS-port connection's SNI, dispatch it, and run the handshake if torii
-/// terminates it. None: the connection is to be closed.
-async fn tls_setup(ctx: &Ctx, tcp: TcpStream, info: &ConnInfo) -> Option<TlsConn> {
-    let hello = peek_client_hello(&tcp).await;
-    let sni = hello.as_ref().and_then(|h| h.sni.as_deref());
+/// Read a TLS-port connection's ClientHello, dispatch it, and run the handshake
+/// if torii terminates it. None: the connection is to be closed.
+async fn tls_setup(ctx: &Ctx, mut tcp: TcpStream, info: &ConnInfo) -> Option<TlsConn> {
+    let server = ctx.tls.as_ref()?;
+    let hello = match tokio::time::timeout(CLIENT_HELLO_TIMEOUT, tls::read_client_hello(&mut tcp)).await {
+        Ok(Ok(hello)) => hello,
+        Ok(Err(alert)) => {
+            if let Some(alert) = alert {
+                tls::send_alert(&tcp, alert);
+            }
+            return None;
+        }
+        Err(_) => {
+            tracing::debug!("no ClientHello in time; closing");
+            return None;
+        }
+    };
+    let sni = hello.sni.as_deref();
     let decision = ctx.data_plane.load().tls.lookup(info.port, sni, proxy::next_rng());
     match decision {
         TlsDecision::Passthrough(ep) => {
             tracing::debug!(port = info.port, ?sni, ip = %ep.ip, ep_port = ep.port, "TLS passthrough");
-            let up = upstream::connect_raw(&ctx.clients, &ep, None, ctx.timeouts.connect)
+            let mut up = upstream::connect_raw(&ctx.clients, &ep, None, ctx.timeouts.connect)
                 .await
                 .ok()?;
+            // What torii read of the client's stream, ClientHello included, goes
+            // first.
+            io::write_all(&mut up, &hello.bytes, PIPE_IDLE_TIMEOUT).await.ok()?;
             Some(TlsConn::Pipe(Stream::Plain(tcp), up))
         }
         TlsDecision::Terminate(ep) => {
@@ -425,11 +431,11 @@ async fn tls_setup(ctx: &Ctx, tcp: TcpStream, info: &ConnInfo) -> Option<TlsConn
                 BackendTls::ReEncrypt(tls) => Some(&**tls),
                 BackendTls::Plaintext => None,
             };
-            let tls = tls_accept(ctx, tcp, hello.as_ref(), tls::Use::Pipe).await?;
+            let tls = tls_accept(server, tcp, hello, tls::Use::Pipe).await?;
             let up = upstream::connect_raw(&ctx.clients, &ep, upstream_tls, ctx.timeouts.connect)
                 .await
                 .ok()?;
-            Some(TlsConn::Pipe(Stream::Tls(tls), up))
+            Some(TlsConn::Pipe(tls, up))
         }
         TlsDecision::NoBackend => {
             tracing::debug!(port = info.port, ?sni, "TLSRoute matched but no backend -> close");
@@ -438,9 +444,7 @@ async fn tls_setup(ctx: &Ctx, tcp: TcpStream, info: &ConnInfo) -> Option<TlsConn
         // No TLSRoute for the SNI on a port with TLSRoutes, and no HTTPS listener
         // there serves the SNI either: close, so the client sees EOF rather than a
         // handshake with some certificate (T170). An ACME validation is answered.
-        TlsDecision::NoRoute
-            if !https_serves(ctx, info.port, sni) && !hello.as_ref().is_some_and(|h| h.offers_acme) =>
-        {
+        TlsDecision::NoRoute if !https_serves(ctx, info.port, sni) && !hello.offers_acme => {
             tracing::debug!(
                 port = info.port,
                 ?sni,
@@ -448,9 +452,7 @@ async fn tls_setup(ctx: &Ctx, tcp: TcpStream, info: &ConnInfo) -> Option<TlsConn
             );
             None
         }
-        TlsDecision::NoRoute => Some(TlsConn::Http(Stream::Tls(
-            tls_accept(ctx, tcp, hello.as_ref(), tls::Use::Http).await?,
-        ))),
+        TlsDecision::NoRoute => Some(TlsConn::Http(tls_accept(server, tcp, hello, tls::Use::Http).await?)),
     }
 }
 
@@ -461,18 +463,11 @@ fn https_serves(ctx: &Ctx, port: u16, sni: Option<&str>) -> bool {
     !snapshot.tls.has_port(port) || snapshot.routes.serves_host(port, sni)
 }
 
-/// Run the server side of a client's TLS handshake, with the certificate for its
-/// ClientHello, giving up after [`TLS_HANDSHAKE_TIMEOUT`].
-async fn tls_accept(
-    ctx: &Ctx,
-    tcp: TcpStream,
-    hello: Option<&ClientHello>,
-    use_: tls::Use,
-) -> Option<SslStream<TcpStream>> {
-    let ssl = ctx.tls.as_ref()?.ssl_for(hello, use_)?;
-    let mut stream = SslStream::new(ssl, tcp).ok()?;
-    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, Pin::new(&mut stream).accept()).await {
-        Ok(Ok(())) => Some(stream),
+/// Finish the server side of a client's TLS handshake, giving up after
+/// [`TLS_HANDSHAKE_TIMEOUT`].
+async fn tls_accept(server: &tls::Server, tcp: TcpStream, hello: tls::Hello, use_: tls::Use) -> Option<Stream> {
+    match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, server.accept(tcp, hello, use_)).await {
+        Ok(Ok(stream)) => Some(Stream::Tls(Box::new(stream))),
         Ok(Err(e)) => {
             tracing::debug!(error = %e, "TLS handshake failed");
             None
@@ -480,50 +475,6 @@ async fn tls_accept(
         Err(_) => {
             tracing::debug!("TLS handshake timed out; closing");
             None
-        }
-    }
-}
-
-/// Peek a connection's ClientHello, leaving its bytes in the socket: the record
-/// header first (to learn the record's length), then the whole record, within
-/// [`PEEK_TIMEOUT`]. None if it is not TLS, is truncated or times out.
-async fn peek_client_hello(tcp: &TcpStream) -> Option<ClientHello> {
-    tokio::time::timeout(PEEK_TIMEOUT, async {
-        let mut header = [0u8; 5];
-        peek_exact(tcp, &mut header).await?;
-        if header[0] != 0x16 {
-            return None; // not a TLS handshake record
-        }
-        let record_len = u16::from_be_bytes([header[3], header[4]]) as usize;
-        let mut record = vec![0u8; (5 + record_len).min(MAX_CLIENT_HELLO)];
-        peek_exact(tcp, &mut record).await?;
-        crate::tls_sni::parse_client_hello(&record)
-    })
-    .await
-    .ok()
-    .flatten()
-}
-
-/// Peek until `buf` can be filled. A peek that finds too few bytes reports
-/// "would block", which clears the socket's readiness, so the next wait is for
-/// new bytes rather than a spin on the ones already there.
-async fn peek_exact(tcp: &TcpStream, buf: &mut [u8]) -> Option<()> {
-    let sock = socket2::SockRef::from(tcp);
-    loop {
-        tcp.readable().await.ok()?;
-        let r = tcp.try_io(Interest::READABLE, || {
-            // SAFETY: `peek` only writes initialized bytes into the buffer.
-            let uninit = unsafe { &mut *(buf as *mut [u8] as *mut [std::mem::MaybeUninit<u8>]) };
-            match sock.peek(uninit)? {
-                0 => Err(std::io::ErrorKind::UnexpectedEof.into()),
-                n if n < buf.len() => Err(std::io::ErrorKind::WouldBlock.into()),
-                _ => Ok(()),
-            }
-        });
-        match r {
-            Ok(()) => return Some(()),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(_) => return None,
         }
     }
 }

@@ -1,7 +1,7 @@
 # ⛩️ torii
 
 A [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) controller written in Rust,
-with its own lean proxy (tokio, OpenSSL, HTTP/1 on httparse, HTTP/2 on a fork of h2).
+with its own lean proxy (tokio, rustls, HTTP/1 on httparse, HTTP/2 on a fork of h2).
 
 Torii optimizes for simplicity. A single binary reads the gateway objects from the Kubernetes API
 and proxies traffic accordingly. You can deploy it as a single pod, or scale up with multiple pods
@@ -18,7 +18,7 @@ behind a load balancer. It requires no supporting infrastructure other than Kube
   - CORS
   - WebSocket passthrough.
 - **TLSRoute**
-  - TLS passthrough mode (peek SNI from ClientHello, pipe encrypted TLS bytes to the backend)
+  - TLS passthrough mode (read SNI from ClientHello, pipe encrypted TLS bytes to the backend)
   - Terminate mode (decrypt, pipe raw TCP bytes to the backend)
   - HTTPRoutes and TLSRoutes can coexist in the same TLS listen port.
 - **BackendTLSPolicy** for speaking TLS to backends.

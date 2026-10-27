@@ -1,16 +1,14 @@
-# Build torii. Multi-stage: a Debian-based Rust builder (so the binary's
-# glibc/OpenSSL ABI matches the Debian runtime + the kind node), then a slim
-# runtime image with just the shared libs the OpenSSL-based data plane needs.
+# Build torii. Multi-stage: a Debian-based Rust builder (so the binary's glibc ABI
+# matches the Debian runtime + the kind node), then a slim runtime image.
 #
 # Context is the repo root; .dockerignore trims it to Cargo.{toml,lock} + src/.
 # Dependencies come from crates.io, except our h2 fork (a git dependency).
 
 FROM rust:1-bookworm AS builder
 
-# The `openssl` crate links against system OpenSSL; the build needs the
-# dev headers, pkg-config, and a C toolchain (cc/perl for some -sys crates).
+# A C toolchain for the -sys crates (ring, jemalloc).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        pkg-config libssl-dev cmake perl clang \
+        cmake perl clang \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -22,9 +20,10 @@ RUN cargo build --release --bin torii \
 
 FROM debian:bookworm-slim AS runtime
 
-# Runtime needs OpenSSL shared libs + CA certs (for talking to the kube API / ACME).
+# Runtime needs CA certs (for the kube API, ACME, and BackendTLSPolicy
+# wellKnownCACertificates).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libssl3 ca-certificates \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /torii /usr/local/bin/torii

@@ -2,7 +2,6 @@
 //! hand-built snapshot, backends as in-process HTTP/1.1 servers, and raw clients.
 
 use std::net::SocketAddr;
-use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -10,7 +9,7 @@ use std::time::Duration;
 use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio_openssl::SslStream;
+use tokio_rustls::client::TlsStream;
 
 use super::h1::{self, Decoder, HeadEvent, HeadReader};
 use super::*;
@@ -956,33 +955,81 @@ async fn tls_gateway(
     (addr, ctx, stop)
 }
 
-/// A TLS client connection with SNI `sni` offering the ALPN list `alpn`
-/// (wire format), not verifying the certificate.
-async fn tls_client(addr: SocketAddr, sni: &str, alpn: &[u8]) -> Result<SslStream<TcpStream>, openssl::ssl::Error> {
-    use openssl::ssl::{SslConnector, SslMethod, SslVerifyMode};
-    let mut builder = SslConnector::builder(SslMethod::tls()).unwrap();
-    builder.set_verify(SslVerifyMode::NONE);
-    builder.set_alpn_protos(alpn).unwrap();
-    let ssl = builder
-        .build()
-        .configure()
+/// A TLS client connection with SNI `sni` offering the ALPN protocols `alpn`,
+/// not verifying the certificate.
+async fn tls_client(addr: SocketAddr, sni: &str, alpn: &[&[u8]]) -> std::io::Result<TlsStream<TcpStream>> {
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
         .unwrap()
-        .verify_hostname(false)
-        .into_ssl(sni)
-        .unwrap();
-    let mut s = SslStream::new(ssl, TcpStream::connect(addr).await.unwrap()).unwrap();
-    Pin::new(&mut s).connect().await?;
-    Ok(s)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
+    let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+    let tcp = TcpStream::connect(addr).await.unwrap();
+    tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(name, tcp)
+        .await
+}
+
+/// Takes any certificate.
+#[derive(Debug)]
+struct NoVerify;
+
+impl rustls::client::danger::ServerCertVerifier for NoVerify {
+    fn verify_server_cert(
+        &self,
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &[rustls::pki_types::CertificateDer<'_>],
+        _: &rustls::pki_types::ServerName<'_>,
+        _: &[u8],
+        _: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _: &[u8],
+        _: &rustls::pki_types::CertificateDer<'_>,
+        _: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
 }
 
 /// The DNS names of the certificate the server presented.
-fn peer_names(s: &SslStream<TcpStream>) -> Vec<String> {
-    let cert = s.ssl().peer_certificate().unwrap();
-    cert.subject_alt_names()
-        .into_iter()
-        .flatten()
-        .filter_map(|n| n.dnsname().map(str::to_string))
+fn peer_names(s: &TlsStream<TcpStream>) -> Vec<String> {
+    let certs = s.get_ref().1.peer_certificates().unwrap();
+    let (_, cert) = x509_parser::parse_x509_certificate(&certs[0]).unwrap();
+    let san = cert.subject_alternative_name().unwrap().unwrap();
+    san.value
+        .general_names
+        .iter()
+        .filter_map(|n| match n {
+            x509_parser::extensions::GeneralName::DNSName(n) => Some(n.to_string()),
+            _ => None,
+        })
         .collect()
+}
+
+fn alpn(s: &TlsStream<TcpStream>) -> Option<&[u8]> {
+    s.get_ref().1.alpn_protocol()
 }
 
 #[tokio::test]
@@ -1000,9 +1047,9 @@ async fn tls_serves_by_sni_and_alpn() {
     .await;
 
     // HTTP/1.1, with the SNI's certificate.
-    let mut s = tls_client(addr, "a.example", b"\x08http/1.1").await.unwrap();
+    let mut s = tls_client(addr, "a.example", &[b"http/1.1"]).await.unwrap();
     assert_eq!(peer_names(&s), vec!["a.example"]);
-    assert_eq!(s.ssl().selected_alpn_protocol(), Some(&b"http/1.1"[..]));
+    assert_eq!(alpn(&s), Some(&b"http/1.1"[..]));
     s.write_all(b"GET /x HTTP/1.1\r\nHost: a.example\r\n\r\n")
         .await
         .unwrap();
@@ -1011,12 +1058,21 @@ async fn tls_serves_by_sni_and_alpn() {
     assert!(echo.contains("X-Forwarded-Proto: https\n"), "{echo}");
 
     // An unknown SNI gets the fallback certificate.
-    let s = tls_client(addr, "other.example", b"\x08http/1.1").await.unwrap();
+    let s = tls_client(addr, "other.example", &[b"http/1.1"]).await.unwrap();
     assert_eq!(peer_names(&s), vec!["torii-fallback.invalid"]);
 
+    // An ALPN offer with neither h2 nor http/1.1 gets no protocol, and HTTP/1.1.
+    let mut s = tls_client(addr, "a.example", &[b"x-other"]).await.unwrap();
+    assert_eq!(alpn(&s), None);
+    s.write_all(b"GET /x HTTP/1.1\r\nHost: a.example\r\n\r\n")
+        .await
+        .unwrap();
+    let resp = read_response(&mut s, &mut BytesMut::new(), "GET").await.unwrap();
+    assert_eq!(resp.status, 200);
+
     // HTTP/2 by ALPN.
-    let s = tls_client(addr, "a.example", b"\x02h2\x08http/1.1").await.unwrap();
-    assert_eq!(s.ssl().selected_alpn_protocol(), Some(&b"h2"[..]));
+    let s = tls_client(addr, "a.example", &[b"h2", b"http/1.1"]).await.unwrap();
+    assert_eq!(alpn(&s), Some(&b"h2"[..]));
     let (mut client, conn) = h2::client::handshake(s).await.unwrap();
     tokio::spawn(conn);
     let req = http::Request::builder().uri("https://a.example/h2").body(()).unwrap();
@@ -1026,16 +1082,16 @@ async fn tls_serves_by_sni_and_alpn() {
     // ACME TLS-ALPN-01: the challenge certificate, only for `acme-tls/1`.
     ctx.data_plane
         .store_challenges([("a.example".to_string(), cert_for("challenge.invalid"))].into());
-    let s = tls_client(addr, "a.example", b"\x0aacme-tls/1").await.unwrap();
-    assert_eq!(s.ssl().selected_alpn_protocol(), Some(&b"acme-tls/1"[..]));
+    let s = tls_client(addr, "a.example", &[b"acme-tls/1"]).await.unwrap();
+    assert_eq!(alpn(&s), Some(&b"acme-tls/1"[..]));
     assert_eq!(peer_names(&s), vec!["challenge.invalid"]);
     // No challenge pending for the SNI: no acme-tls/1, the normal certificate.
-    let s = tls_client(addr, "b.example", b"\x0aacme-tls/1\x08http/1.1")
+    let s = tls_client(addr, "b.example", &[b"acme-tls/1", b"http/1.1"])
         .await
         .unwrap();
-    assert_eq!(s.ssl().selected_alpn_protocol(), Some(&b"http/1.1"[..]));
+    assert_eq!(alpn(&s), Some(&b"http/1.1"[..]));
     assert_eq!(peer_names(&s), vec!["torii-fallback.invalid"]);
-    let s = tls_client(addr, "a.example", b"\x08http/1.1").await.unwrap();
+    let s = tls_client(addr, "a.example", &[b"http/1.1"]).await.unwrap();
     assert_eq!(peer_names(&s), vec!["a.example"]);
 }
 
@@ -1063,16 +1119,19 @@ async fn tlsroute_passthrough_and_terminate() {
     let passthrough = listener.local_addr().unwrap();
     let backend_cert = cert_for("p.example");
     tokio::spawn(async move {
-        let parsed = backend_cert.parsed().unwrap();
-        let mut acceptor = openssl::ssl::SslAcceptor::mozilla_intermediate_v5(openssl::ssl::SslMethod::tls()).unwrap();
-        acceptor.set_certificate(&parsed.chain[0]).unwrap();
-        acceptor.set_private_key(&parsed.key).unwrap();
-        let acceptor = acceptor.build();
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(
+                backend_cert.parsed().unwrap().clone(),
+            )));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         loop {
             let (tcp, _) = listener.accept().await.unwrap();
-            let mut s = SslStream::new(openssl::ssl::Ssl::new(acceptor.context()).unwrap(), tcp).unwrap();
+            let acceptor = acceptor.clone();
             tokio::spawn(async move {
-                Pin::new(&mut s).accept().await.unwrap();
+                let mut s = acceptor.accept(tcp).await.unwrap();
                 let mut b = [0u8; 4];
                 s.read_exact(&mut b).await.unwrap();
                 s.write_all(&b).await.unwrap();
@@ -1102,19 +1161,188 @@ async fn tlsroute_passthrough_and_terminate() {
     })
     .await;
 
-    let mut s = tls_client(addr, "p.example", b"").await.unwrap();
+    let mut s = tls_client(addr, "p.example", &[]).await.unwrap();
     assert_eq!(peer_names(&s), vec!["p.example"], "the backend's own certificate");
     s.write_all(b"ping").await.unwrap();
     let mut b = [0u8; 4];
     s.read_exact(&mut b).await.unwrap();
     assert_eq!(&b, b"ping");
 
-    let mut s = tls_client(addr, "t.example", b"\x02h2\x08http/1.1").await.unwrap();
+    let mut s = tls_client(addr, "t.example", &[b"h2", b"http/1.1"]).await.unwrap();
     assert_eq!(peer_names(&s), vec!["t.example"], "torii's certificate");
-    assert_eq!(s.ssl().selected_alpn_protocol(), None, "a pipe negotiates no protocol");
+    assert_eq!(alpn(&s), None, "a pipe negotiates no protocol");
     s.write_all(b"pong").await.unwrap();
     s.read_exact(&mut b).await.unwrap();
     assert_eq!(&b, b"pong");
+}
+
+/// A TCP backend that sends, for each connection, all it got until EOF.
+async fn tcp_recorder() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let mut got = Vec::new();
+                let _ = s.read_to_end(&mut got).await;
+                let _ = tx.send(got);
+            });
+        }
+    });
+    (addr, rx)
+}
+
+/// A gateway TLS port with a passthrough TLSRoute for `host` to `backend`.
+async fn passthrough_gateway(host: &str, backend: SocketAddr) -> (SocketAddr, watch::Sender<bool>) {
+    use crate::tls_table::{TlsAction, TlsBackend, TlsBackends, TlsTable};
+    let backends = Arc::new(TlsBackends {
+        backends: vec![TlsBackend {
+            weight: 1,
+            endpoints: Arc::new([endpoint(backend)]),
+        }],
+    });
+    let (addr, _ctx, stop) = tls_gateway(|port| {
+        let mut tls = TlsTable::default();
+        tls.insert(port, host, TlsAction::Passthrough(backends));
+        crate::snapshot::Snapshot {
+            tls,
+            ..Default::default()
+        }
+    })
+    .await;
+    (addr, stop)
+}
+
+/// The ClientHello record(s) a rustls client sends for `sni`.
+fn rustls_client_hello(sni: &str) -> Vec<u8> {
+    let config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(NoVerify))
+        .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from(sni.to_string()).unwrap();
+    let mut conn = rustls::ClientConnection::new(Arc::new(config), name).unwrap();
+    let mut out = Vec::new();
+    conn.write_tls(&mut out).unwrap();
+    out
+}
+
+/// A TLS handshake record (one ClientHello in it) re-framed as records of at most
+/// `size` bytes of the handshake message each.
+fn refragment(record: &[u8], size: usize) -> Vec<u8> {
+    let message = &record[5..5 + u16::from_be_bytes([record[3], record[4]]) as usize];
+    let mut out = Vec::new();
+    for part in message.chunks(size) {
+        out.extend([0x16, record[1], record[2]]);
+        out.extend((part.len() as u16).to_be_bytes());
+        out.extend(part);
+    }
+    out
+}
+
+/// The audit's T171: a ClientHello split over several records used to get no SNI,
+/// and torii terminated the connection itself instead of passing it through.
+#[tokio::test]
+async fn a_client_hello_over_several_records_reaches_its_passthrough_backend() {
+    let (backend, mut got) = tcp_recorder().await;
+    let (addr, _stop) = passthrough_gateway("p.example", backend).await;
+    let hello = refragment(&rustls_client_hello("p.example"), 40);
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    // The first record alone first, as if the rest were still on its way.
+    c.write_all(&hello[..45]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    c.write_all(&hello[45..]).await.unwrap();
+    c.shutdown().await.unwrap();
+    let passed = tokio::time::timeout(Duration::from_secs(5), got.recv()).await.unwrap();
+    assert_eq!(passed.unwrap(), hello, "the backend gets the client's bytes as sent");
+}
+
+/// A ClientHello record with a signature_algorithms extension, then `extensions`
+/// (type, body).
+fn client_hello(extensions: &[(u16, Vec<u8>)]) -> Vec<u8> {
+    let mut exts = vec![0x00, 0x0d, 0x00, 0x04, 0x00, 0x02, 0x04, 0x03]; // ecdsa_secp256r1_sha256
+    for (ty, body) in extensions {
+        exts.extend(ty.to_be_bytes());
+        exts.extend((body.len() as u16).to_be_bytes());
+        exts.extend(body);
+    }
+    let mut body = vec![0x03, 0x03];
+    body.extend([0u8; 32]); // random
+    body.push(0); // session_id
+    body.extend([0x00, 0x02, 0x13, 0x01]); // cipher_suites
+    body.extend([0x01, 0x00]); // compression_methods: null
+    body.extend((exts.len() as u16).to_be_bytes());
+    body.extend(exts);
+    let mut message = vec![0x01];
+    message.extend(&(body.len() as u32).to_be_bytes()[1..]);
+    message.extend(body);
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend((message.len() as u16).to_be_bytes());
+    record.extend(message);
+    record
+}
+
+/// A server_name extension body: a list of (name_type, name), then `trailing`.
+fn server_names(entries: &[(u8, &[u8])], trailing: &[u8]) -> Vec<u8> {
+    let mut list = Vec::new();
+    for (ty, name) in entries {
+        list.push(*ty);
+        list.extend((name.len() as u16).to_be_bytes());
+        list.extend(*name);
+    }
+    let mut body = (list.len() as u16).to_be_bytes().to_vec();
+    body.extend(list);
+    body.extend(trailing);
+    body
+}
+
+/// The audit's T207: torii routes on rustls's reading of the ClientHello, which
+/// refuses what the TLS stacks refuse, rather than on a laxer one of its own.
+#[tokio::test]
+async fn a_malformed_sni_is_not_passed_through() {
+    let (backend, mut got) = tcp_recorder().await;
+    let (addr, _stop) = passthrough_gateway("*.example", backend).await;
+    let sni = |name: &[u8]| (0u16, server_names(&[(0, name)], b""));
+
+    // A well-formed one is passed through.
+    let hello = client_hello(&[sni(b"x.example")]);
+    let mut c = TcpStream::connect(addr).await.unwrap();
+    c.write_all(&hello).await.unwrap();
+    c.shutdown().await.unwrap();
+    let passed = tokio::time::timeout(Duration::from_secs(5), got.recv()).await.unwrap();
+    assert_eq!(passed.unwrap(), hello);
+
+    let long = [&[b'a'; 300][..], b".example"].concat();
+    let cases = [
+        ("a NUL byte", client_hello(&[sni(b"x\0.example")])),
+        ("a 300-byte name", client_hello(&[sni(&long)])),
+        (
+            "two server_name extensions",
+            client_hello(&[sni(b"x.example"), sni(b"x.example")]),
+        ),
+        (
+            "two host_names",
+            client_hello(&[(0, server_names(&[(0, b"x.example"), (0, b"y.example")], b""))]),
+        ),
+        (
+            "bytes after the list",
+            client_hello(&[(0, server_names(&[(0, b"x.example")], b"\0"))]),
+        ),
+    ];
+    for (what, hello) in cases {
+        let mut c = TcpStream::connect(addr).await.unwrap();
+        c.write_all(&hello).await.unwrap();
+        let mut answer = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), c.read_to_end(&mut answer))
+            .await
+            .unwrap_or_else(|_| panic!("{what}: the connection is closed"))
+            .ok();
+        assert!(got.try_recv().is_err(), "{what}: not passed through");
+    }
 }
 
 fn h2_frame(ty: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {

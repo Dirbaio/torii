@@ -28,11 +28,12 @@ k8s-openapi = { version = "0.27", default-features = false, features = ["v1_33"]
 # root type; nested/status types are HttpRoute*. Depends on kube 3.1 + k8s-openapi 0.27.
 gateway-api = "=0.21.0"
 
-# The data plane: tokio sockets, OpenSSL used directly, our own HTTP/1 on httparse,
-# and a fork of h2 that holds no buffers on an idle connection: the `torii` branch of
+# The data plane: tokio sockets, rustls, our own HTTP/1 on httparse, and a fork of
+# h2 that holds no buffers on an idle connection: the `torii` branch of
 # https://github.com/Dirbaio/h2 (h2 0.4.20 + the changes in its TORII.md).
-openssl = "0.10"
-tokio-openssl = "0.6"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+# The system's CA certificates, for a BackendTLSPolicy with wellKnownCACertificates.
+rustls-native-certs = "0.8"
 httparse = "1.10"
 h2 = { git = "https://github.com/Dirbaio/h2", rev = "d94c32584a49ce9ad8a4596699ba61a875933f1d" }
 # TCP_NOTSENT_LOWAT, TCP keepalive and listen backlog on our sockets.
@@ -40,9 +41,12 @@ socket2 = { version = "0.6", features = ["all"] }
 
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "time", "io-util", "sync"] }
 clap = { version = "4", features = ["derive", "env"] }
-# kube's `rustls-tls` leaves the crypto backend to the app; we pick `ring` and
-# install it as the process default before building any client.
-rustls = { version = "0.23", default-features = false, features = ["ring"] }
+# The data plane's TLS, and kube's: `rustls-tls` leaves the crypto backend to the
+# app; we pick `ring` and install it as the process default before building any
+# client. The data plane names `ring` itself.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+ring = "0.17" # SHA-1 for the WebSocket handshake check
+base64 = "0.22"
 anyhow = "1"
 async-trait = "0.1"
 arc-swap = "1"
@@ -63,7 +67,7 @@ instant-acme = { version = "0.8", default-features = false, features = [
 ] }
 rcgen = "0.14" # validation cert (id-pe-acmeIdentifier) + issued-cert keypair/CSR
 kube-leader-election = "0.43" # coordination.k8s.io Lease leader election
-x509-parser = "0.16" # read cert notAfter for renewal scheduling
+x509-parser = "0.16" # read a cert's notAfter, SANs and public key
 
 # Global allocator. The default glibc malloc creates up to 8*nCPU arenas and
 # never returns freed memory to the OS, so a busy multi-threaded proxy ratchets
@@ -72,9 +76,8 @@ x509-parser = "0.16" # read cert notAfter for renewal scheduling
 # fragments far less and decays memory back to the OS, bounding steady-state RSS.
 # Its background thread purges freed pages on its own schedule; without it, pages are
 # only given back while the allocator is busy, so an idle torii kept the memory of its
-# last burst of connections. It is also the process's malloc (unprefixed), so OpenSSL's
-# per-connection state (~30 KB) comes back after a burst too: glibc kept ~96% of it.
-# The price: ~2 KB more per TLS connection (jemalloc's size classes).
+# last burst of connections. It is also the process's malloc (unprefixed), for whatever
+# C code allocates.
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { version = "0.6", features = ["background_threads", "unprefixed_malloc_on_supported_platforms"] }
 

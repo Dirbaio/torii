@@ -663,27 +663,22 @@ async fn cert_check(client: &Client, target: &AcmeTarget) -> CertCheck {
 /// Check a Secret's `tls.crt`/`tls.key` for `host` at time `now` (unix s). The
 /// error completes "certificate in Secret ns/name ...".
 fn check_cert_key(crt: Option<&[u8]>, key: Option<&[u8]>, host: &str, now: i64) -> Result<CertCheck, String> {
-    use openssl::pkey::PKey;
-    use openssl::x509::X509;
-
     let crt = crt.ok_or("is missing (no tls.crt)")?;
-    let leaf = X509::from_pem(crt).map_err(|_| "does not parse")?;
-    let not_after = cert_not_after(crt).ok_or("does not parse")?;
+    let (_, pem) = x509_parser::pem::parse_x509_pem(crt).map_err(|_| "does not parse")?;
+    let leaf = pem.parse_x509().map_err(|_| "does not parse")?;
+    let not_after = leaf.validity().not_after.timestamp();
     let covers = leaf
-        .subject_alt_names()
-        .into_iter()
+        .subject_alternative_name()
+        .ok()
         .flatten()
-        .filter_map(|n| n.dnsname().map(str::to_owned))
-        .any(|n| dns_name_covers(&n, host));
+        .into_iter()
+        .flat_map(|san| &san.value.general_names)
+        .any(|n| matches!(n, x509_parser::extensions::GeneralName::DNSName(n) if dns_name_covers(n, host)));
     if !covers {
         return Err(format!("does not cover {host}"));
     }
     let key = key.ok_or("has no key (no tls.key)")?;
-    let key = PKey::private_key_from_pem(key).map_err(|_| "has a key that does not parse")?;
-    let leaf_key = leaf.public_key().map_err(|_| "has a public key that does not parse")?;
-    if !leaf_key.public_eq(&key) {
-        return Err("does not match the key in tls.key".into());
-    }
+    crate::cert_store::parse(crt, key)?;
     if now >= not_after - RENEW_WINDOW.as_secs() as i64 {
         return Ok(CertCheck::NeedsWork {
             reason: format!("renewing the certificate, valid until unix:{not_after}"),

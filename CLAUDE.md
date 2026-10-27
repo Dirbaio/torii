@@ -1,7 +1,7 @@
 # torii
 
 A [Kubernetes Gateway API](https://gateway-api.sigs.k8s.io/) controller implemented in
-Rust, with its own data plane on tokio, OpenSSL, httparse and a fork of h2. The
+Rust, with its own data plane on tokio, rustls, httparse and a fork of h2. The
 goal is to **pass the upstream Gateway API conformance suite**, starting with the
 `GATEWAY-HTTP` profile.
 
@@ -36,8 +36,8 @@ A Gateway controller has two halves that run in one process:
    `observedGeneration`, attached-route counts, addresses). Conformance checks status
    just as much as it checks traffic.
 
-2. **Data plane (`src/dataplane/`).** Our own proxy on tokio sockets, OpenSSL (used
-   directly), HTTP/1 on httparse, and HTTP/2 on our h2 fork. It receives the
+2. **Data plane (`src/dataplane/`).** Our own proxy on tokio sockets, rustls (on
+   ring), HTTP/1 on httparse, and HTTP/2 on our h2 fork. It receives the
    controller's computed config (via a shared, atomically-swapped snapshot —
    `ArcSwap<Snapshot>`) and, per request, matches the request against HTTPRoute rules
    and forwards it to a backend over HTTP/1.1.
@@ -74,11 +74,12 @@ request. Keep these two concerns cleanly separated.
   an empty buffer when a read would block; a request's state lives in a boxed future
   that exists only while the request does; the relay holds one chunk per direction.
   Keep `tests::connection_futures_are_small` passing.
-- `mod.rs`: listeners, admission (`conn_limit`), TLS-port dispatch (SNI peek →
-  TLSRoute pipe or TLS-terminated HTTP), shutdown drain. `serve_h1.rs` / `serve_h2.rs`:
+- `mod.rs`: listeners, admission (`conn_limit`), TLS-port dispatch (rustls reads
+  the ClientHello → TLSRoute pipe or TLS-terminated HTTP), shutdown drain. `serve_h1.rs` / `serve_h2.rs`:
   the client side. `proxy.rs`: routing and filters, and the head rewrites.
   `relay.rs`: bodies and their clocks. `upstream.rs`: backend connections and the pool.
-  `h1.rs`: HTTP/1 heads, framing, chunked coding. `tls.rs`: OpenSSL contexts.
+  `h1.rs`: HTTP/1 heads, framing, chunked coding. `tls.rs`: the ClientHello, rustls
+  configs and cert resolvers.
 - HTTP/1 parsing is strict on purpose (request smuggling): one Transfer-Encoding
   `chunked`, at most one Content-Length, CRLF line ends in chunked bodies.
 - Every wait on a client or backend is bounded by a clock; never add an unbounded wait.
@@ -143,7 +144,7 @@ Iterate one test at a time. `HTTPRouteSimpleSameNamespace`
 
 1. Scaffold a Cargo workspace at the repo root. Suggested members: `torii`
    (binary), plus crates for control plane and data plane if it helps separation.
-2. Data-plane dependencies: `openssl` + `tokio-openssl`, `httparse`, `h2` (path dep on
+2. Data-plane dependencies: `rustls` + `tokio-rustls` (ring), `httparse`, `h2` (path dep on
    the `torii` branch of github.com/Dirbaio/h2), `socket2`.
 3. Add `kube`, `kube-runtime`, `k8s-openapi` (pin the k8s version feature), `tokio`,
    `arc-swap`, `serde`. For Gateway CRD types, prefer the `gateway-api` Rust crate; if it

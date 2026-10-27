@@ -28,7 +28,6 @@ mod controller;
 mod dataplane;
 mod route_table;
 mod snapshot;
-mod tls_sni;
 mod tls_table;
 
 /// torii: a Kubernetes Gateway API controller and proxy. Running the binary

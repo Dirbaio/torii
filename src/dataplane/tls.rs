@@ -1,48 +1,172 @@
-//! TLS with OpenSSL, used directly: the server context, the choice of certificate
-//! for a connection, and the client contexts for backends a BackendTLSPolicy
-//! re-encrypts to.
+//! TLS with rustls: reading a client's ClientHello before deciding what to do
+//! with its connection, the server side of the handshake and the choice of
+//! certificate, and the client side for backends a BackendTLSPolicy re-encrypts to.
 //!
-//! One server context serves every connection. The certificate is chosen before
-//! the handshake from the ClientHello torii already peeked (SNI, and whether it is
-//! an ACME TLS-ALPN-01 validation), and attached to the connection's `SSL` by
-//! reference: the snapshot keeps every certificate parsed, so a handshake neither
-//! re-parses PEM nor copies a key.
+//! A TLS-port connection starts with [`read_client_hello`]: rustls reassembles and
+//! parses the ClientHello (its SNI validated) without answering it, and torii
+//! routes on that one parse. A TLSRoute passthrough then replays the bytes read to
+//! its backend; anything else finishes the handshake with [`Server::accept`].
+//!
+//! The certificate is resolved per handshake from the current snapshot, by SNI:
+//! the snapshot keeps every certificate parsed, so a handshake neither re-parses
+//! PEM nor copies a key.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::pin::Pin;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::task::{Context, Poll};
+use std::{fmt, io};
 
-use openssl::ssl::{
-    AlpnError, Ssl, SslAcceptor, SslConnector, SslContext, SslMethod, SslMode, SslOptions, SslSessionCacheMode,
-    SslVerifyMode,
-};
-use openssl::x509::X509;
-use openssl::x509::store::X509StoreBuilder;
+use bytes::BytesMut;
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::ServerName;
+use rustls::server::{Accepted, AcceptedAlert, Acceptor, NoServerSessionStorage, ProducesTickets, ResolvesServerCert};
+use rustls::sign::CertifiedKey;
+use rustls::{ClientConfig, RootCertStore, ServerConfig};
+use tokio::io::{AsyncRead, ReadBuf};
+use tokio::net::TcpStream;
+use tokio_rustls::{StartHandshake, TlsConnector, TlsStream};
 
-use crate::cert_store::{CertKey, ParsedCertKey};
+use crate::cert_store::{CertKey, ca_roots};
 use crate::route_table::UpstreamTls;
 use crate::snapshot::DataPlane;
-use crate::tls_sni::ClientHello;
 
-/// TLS 1.2 suites: ECDHE key exchange only. Mozilla intermediate also has the
-/// DHE-RSA suites, which let a client make each handshake against an RSA
-/// certificate ~20-70% more expensive, and every client it targets has ECDHE.
-const TLS12_CIPHERS: &str = "ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:\
-                             ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305";
+/// Most encrypted data rustls holds unsent for a connection's peer: one full
+/// record. Its default, 64 KiB, would let a peer that stops reading hold that
+/// much on top of the relay's chunk.
+const SEND_BUFFER_LIMIT: usize = 16 * 1024;
 
-/// The server side: one context for every TLS port, and the certificates.
+/// rustls on ring. Its default suites are what torii wants: TLS 1.3, and TLS 1.2
+/// with ECDHE key exchange and AEAD ciphers only. No DHE-RSA, which lets a client
+/// make each handshake against an RSA certificate ~20-70% more expensive; no
+/// static RSA, which has no forward secrecy (T208); and no renegotiation (T176).
+fn provider() -> Arc<CryptoProvider> {
+    Arc::new(rustls::crypto::ring::default_provider())
+}
+
+/// A client's ClientHello, parsed by rustls, and what torii needs from it.
+pub struct Hello {
+    accepted: Accepted,
+    /// The SNI, lowercased. None without one, or with an IP address (RFC 6066
+    /// forbids those, and rustls takes them as none).
+    pub sni: Option<String>,
+    /// The ALPN offer includes `acme-tls/1` (an ACME TLS-ALPN-01 validation).
+    pub offers_acme: bool,
+    /// The client offers no ALPN, or `h2` or `http/1.1`.
+    offers_http: bool,
+    /// Every byte read from the client: a passthrough replays them to its backend.
+    pub bytes: BytesMut,
+}
+
+impl Hello {
+    fn new(accepted: Accepted, bytes: BytesMut) -> Hello {
+        let (sni, offers_acme, offers_http) = {
+            let hello = accepted.client_hello();
+            let offers = |proto: &[u8]| hello.alpn().is_some_and(|mut a| a.any(|p| p == proto));
+            (
+                hello.server_name().map(str::to_owned),
+                offers(b"acme-tls/1"),
+                hello.alpn().is_none() || offers(b"h2") || offers(b"http/1.1"),
+            )
+        };
+        Hello {
+            accepted,
+            sni,
+            offers_acme,
+            offers_http,
+            bytes,
+        }
+    }
+}
+
+/// Read a client's ClientHello, and keep the bytes read. rustls puts one split
+/// over several records back together, takes one of up to 64 KiB, and refuses
+/// a malformed one (an invalid or second SNI, a repeated extension). It answers
+/// nothing: the client hears from torii, or from a passthrough backend, only
+/// once torii has decided.
+///
+/// Err: the connection is to be closed, after sending the alert if there is one
+/// (rustls refused the ClientHello).
+pub async fn read_client_hello(tcp: &mut TcpStream) -> Result<Hello, Option<AcceptedAlert>> {
+    let mut acceptor = Acceptor::default();
+    let mut bytes = BytesMut::new();
+    let accepted = std::future::poll_fn(|cx| {
+        loop {
+            let mut rd = Recorder {
+                tcp: &mut *tcp,
+                cx: &mut *cx,
+                bytes: &mut bytes,
+            };
+            match acceptor.read_tls(&mut rd) {
+                Ok(0) => return Poll::Ready(Err(None)),
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
+                // An I/O error, or a ClientHello over 64 KiB.
+                Err(_) => return Poll::Ready(Err(None)),
+            }
+            match acceptor.accept() {
+                Ok(Some(accepted)) => return Poll::Ready(Ok(accepted)),
+                Ok(None) => {}
+                Err((e, alert)) => {
+                    tracing::debug!(error = %e, "invalid ClientHello");
+                    return Poll::Ready(Err(Some(alert)));
+                }
+            }
+        }
+    })
+    .await?;
+    Ok(Hello::new(accepted, bytes))
+}
+
+/// Send the alert for a refused ClientHello, if the socket takes it now.
+pub fn send_alert(tcp: &TcpStream, mut alert: AcceptedAlert) {
+    struct TryWrite<'a>(&'a TcpStream);
+    impl io::Write for TryWrite<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.try_write(buf)
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let _ = alert.write_all(&mut TryWrite(tcp));
+}
+
+/// A blocking-style reader over a socket for rustls, that keeps a copy of what it
+/// reads. "Would block" when the socket has nothing (the waker is registered).
+struct Recorder<'a, 'b> {
+    tcp: &'a mut TcpStream,
+    cx: &'a mut Context<'b>,
+    bytes: &'a mut BytesMut,
+}
+
+impl io::Read for Recorder<'_, '_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut read = ReadBuf::new(buf);
+        match Pin::new(&mut *self.tcp).poll_read(self.cx, &mut read) {
+            Poll::Ready(Ok(())) => {
+                self.bytes.extend_from_slice(read.filled());
+                Ok(read.filled().len())
+            }
+            Poll::Ready(Err(e)) => Err(e),
+            Poll::Pending => Err(io::ErrorKind::WouldBlock.into()),
+        }
+    }
+}
+
+/// The server side: one config per kind of connection, shared by every TLS port.
 pub struct Server {
     /// For HTTPS: ALPN `h2` or `http/1.1`.
-    http: SslContext,
-    /// For an ACME TLS-ALPN-01 validation: ALPN `acme-tls/1` only.
-    acme: SslContext,
-    /// For a TLSRoute Terminate pipe: no ALPN, since the stream is whatever the
-    /// client speaks (T173).
-    raw: SslContext,
+    http: Arc<ServerConfig>,
+    /// No ALPN: for a TLSRoute Terminate pipe, whose stream is whatever the client
+    /// speaks (T173), and for an HTTPS client whose ALPN offer has neither `h2`
+    /// nor `http/1.1` (it gets HTTP/1.1, as before rustls, which would refuse the
+    /// handshake rather than select nothing).
+    raw: Arc<ServerConfig>,
+    /// For an ACME TLS-ALPN-01 validation: ALPN `acme-tls/1` only, and the
+    /// challenge certificate.
+    acme: Arc<ServerConfig>,
     data_plane: DataPlane,
-    /// Self-signed last-resort certificate, generated once at startup. Served when
-    /// no real one matches so the handshake completes (with a browser warning)
-    /// instead of failing, letting a user click through to the upstream.
-    fallback: CertKey,
 }
 
 /// What a TLS connection is for.
@@ -52,110 +176,118 @@ pub enum Use {
     Pipe,
 }
 
-/// A server context with our settings, selecting the first protocol of `alpn` the
-/// client offers (none: no ALPN; a client that offers none of them gets none, and
-/// HTTP/1.1).
-fn server_context(alpn: &'static [&'static [u8]]) -> SslContext {
-    let mut builder =
-        SslAcceptor::mozilla_intermediate_v5(SslMethod::tls()).expect("failed to create TLS acceptor builder");
-    // Let OpenSSL free a connection's record buffers whenever they're empty,
-    // instead of holding ~34 KB for the connection's lifetime (nginx sets the
-    // same mode).
-    builder.set_mode(SslMode::RELEASE_BUFFERS);
-    builder
-        .set_cipher_list(TLS12_CIPHERS)
-        .expect("failed to set TLS 1.2 cipher list");
+/// A server config with our settings, selecting the first protocol of `alpn` the
+/// client offers (none: no ALPN).
+fn server_config(
+    certs: Arc<dyn ResolvesServerCert>,
+    alpn: &[&[u8]],
+    ticketer: &Arc<dyn ProducesTickets>,
+) -> Arc<ServerConfig> {
+    let mut config = ServerConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS versions")
+        .with_no_client_auth()
+        .with_cert_resolver(certs);
+    config.alpn_protocols = alpn.iter().map(|p| p.to_vec()).collect();
     // Keep no sessions in memory (nginx's default, `ssl_session_cache none`):
-    // OpenSSL's built-in cache holds up to 20,480 TLS 1.2 sessions past their
-    // connections. Session tickets still let clients resume.
-    builder.set_session_cache_mode(
-        SslSessionCacheMode::SERVER | SslSessionCacheMode::NO_AUTO_CLEAR | SslSessionCacheMode::NO_INTERNAL_STORE,
-    );
-    if !alpn.is_empty() {
-        builder.set_alpn_select_callback(move |_ssl, client| {
-            alpn.iter()
-                .find_map(|proto| select_alpn(client, proto))
-                .ok_or(AlpnError::NOACK)
-        });
-    }
-    builder.build().into_context()
+    // clients resume with tickets. rustls resumes a session only under the SNI it
+    // was made for (RFC 6066), and rotates the ticket key every 6 hours.
+    config.session_storage = Arc::new(NoServerSessionStorage {});
+    config.ticketer = ticketer.clone();
+    Arc::new(config)
 }
 
 impl Server {
     pub fn new(data_plane: DataPlane) -> Server {
         let fallback = CertKey::generate_self_signed().expect("failed to generate fallback TLS cert");
+        let certs: Arc<dyn ResolvesServerCert> = Arc::new(Certs {
+            data_plane: data_plane.clone(),
+            fallback: fallback.parsed().expect("the fallback TLS cert parses").clone(),
+        });
+        let challenges = Arc::new(Challenges(data_plane.clone()));
+        let ticketer = rustls::crypto::ring::Ticketer::new().expect("failed to create the TLS ticketer");
         Server {
-            http: server_context(&[b"h2", b"http/1.1"]),
-            acme: server_context(&[b"acme-tls/1"]),
-            raw: server_context(&[]),
+            http: server_config(certs.clone(), &[b"h2", b"http/1.1"], &ticketer),
+            raw: server_config(certs, &[], &ticketer),
+            acme: server_config(challenges, &[b"acme-tls/1"], &ticketer),
             data_plane,
-            fallback,
         }
     }
 
-    /// The `SSL` for a new connection whose ClientHello is `hello`, with its
-    /// certificate attached; None if the connection must be refused.
-    pub fn ssl_for(&self, hello: Option<&ClientHello>, use_: Use) -> Option<Ssl> {
-        let sni = hello.and_then(|h| h.sni.as_deref());
+    /// Finish the handshake of a client whose ClientHello is `hello`, as `use_`
+    /// needs it.
+    pub async fn accept(&self, tcp: TcpStream, hello: Hello, use_: Use) -> io::Result<TlsStream<TcpStream>> {
+        let config = self.config_for(&hello, use_);
+        let stream = StartHandshake::from_parts(hello.accepted, tcp)
+            .into_stream_with(config, |conn| conn.set_buffer_limit(Some(SEND_BUFFER_LIMIT)))
+            .await?;
+        Ok(stream.into())
+    }
+
+    fn config_for(&self, hello: &Hello, use_: Use) -> Arc<ServerConfig> {
         // ACME TLS-ALPN-01: a client that offers `acme-tls/1` for an SNI with a
         // pending challenge gets that protocol and the challenge certificate —
         // never a real one. Otherwise `acme-tls/1` is never selected (T168).
-        if use_ == Use::Http && hello.is_some_and(|h| h.offers_acme) {
-            let challenges = self.data_plane.load_challenges();
-            if let Some(ck) = sni.and_then(|h| challenges.get(h)) {
-                let mut ssl = Ssl::new(&self.acme).ok()?;
-                attach(&mut ssl, ck.parsed()?)?;
-                return Some(ssl);
-            }
+        if use_ == Use::Http
+            && hello.offers_acme
+            && let Some(sni) = &hello.sni
+            && self.data_plane.load_challenges().contains_key(sni)
+        {
+            return self.acme.clone();
         }
-        let mut ssl = Ssl::new(match use_ {
-            Use::Http => &self.http,
-            Use::Pipe => &self.raw,
-        })
-        .ok()?;
+        match use_ {
+            Use::Http if hello.offers_http => self.http.clone(),
+            _ => self.raw.clone(),
+        }
+    }
+}
+
+/// The certificate for a handshake: the snapshot's for its SNI, else the
+/// self-signed fallback.
+struct Certs {
+    data_plane: DataPlane,
+    /// Served when no real certificate matches, so the handshake completes (with
+    /// a browser warning) instead of failing, letting a user click through to the
+    /// upstream. Generated once at startup.
+    fallback: Arc<CertifiedKey>,
+}
+
+impl ResolvesServerCert for Certs {
+    fn resolve(&self, hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        let sni = hello.server_name();
         let snapshot = self.data_plane.load();
-        let ck = snapshot.certs.select(sni).unwrap_or_else(|| {
+        let cert = snapshot.certs.select(sni).and_then(CertKey::parsed);
+        Some(cert.cloned().unwrap_or_else(|| {
             // No real cert (no SNI match, Secret missing, ACME not done yet).
             tracing::debug!(?sni, "no matching cert; serving self-signed fallback");
-            &self.fallback
-        });
-        attach(&mut ssl, ck.parsed().or(self.fallback.parsed())?)?;
-        Some(ssl)
+            self.fallback.clone()
+        }))
     }
 }
 
-/// Attach a parsed certificate chain (leaf first) and key to a connection.
-/// Serving the intermediates is what lets clients build a path to a root they
-/// trust — without them, an ACME/CA-issued leaf fails to verify.
-fn attach(ssl: &mut Ssl, ck: &ParsedCertKey) -> Option<()> {
-    let (leaf, intermediates) = ck.chain.split_first()?;
-    ssl.set_certificate(leaf).ok()?;
-    ssl.set_private_key(&ck.key).ok()?;
-    for inter in intermediates {
-        ssl.add_chain_cert(inter.clone()).ok()?;
+/// The certificate for an ACME TLS-ALPN-01 validation: the pending challenge's
+/// for its SNI.
+struct Challenges(DataPlane);
+
+impl ResolvesServerCert for Challenges {
+    fn resolve(&self, hello: rustls::server::ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
+        self.0.load_challenges().get(hello.server_name()?)?.parsed().cloned()
     }
-    Some(())
 }
 
-/// Find `proto` in the client's wire-format ALPN list, returning a sub-slice of
-/// `client` (required: the ALPN-select callback's return must borrow from `client`).
-fn select_alpn<'a>(client: &'a [u8], proto: &[u8]) -> Option<&'a [u8]> {
-    let mut bytes = client;
-    while !bytes.is_empty() {
-        let len = bytes[0] as usize;
-        bytes = &bytes[1..];
-        if len > bytes.len() {
-            return None;
-        }
-        if &bytes[..len] == proto {
-            return Some(&bytes[..len]);
-        }
-        bytes = &bytes[len..];
+impl fmt::Debug for Certs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Certs")
     }
-    None
 }
 
-/// Client contexts for backends, one per CA bundle, built once and shared. A
+impl fmt::Debug for Challenges {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Challenges")
+    }
+}
+
+/// Client configs for backends, one pair per CA bundle, built once and shared. A
 /// BackendTLSPolicy's bundle used to be parsed on every proxied request (T047).
 #[derive(Default)]
 pub struct Clients {
@@ -163,8 +295,17 @@ pub struct Clients {
     next_id: std::sync::atomic::AtomicU64,
 }
 
-/// A client context and its id (see [`ClientIdentity`]).
-type CachedConnector = (Arc<SslConnector>, u64);
+/// The client configs for one CA bundle (None: it trusts nothing), and their id
+/// (see [`ClientIdentity`]).
+type CachedConnector = (Option<Arc<Connector>>, u64);
+
+/// The client configs for one CA bundle.
+struct Connector {
+    /// Offering ALPN `http/1.1`.
+    http: Arc<ClientConfig>,
+    /// Offering no ALPN.
+    raw: Arc<ClientConfig>,
+}
 
 /// Most distinct CA bundles kept; past it the cache starts over.
 const MAX_CLIENT_CONTEXTS: usize = 64;
@@ -183,16 +324,16 @@ pub struct ClientIdentity {
 }
 
 impl Clients {
-    /// The client context for `tls`'s CA bundle: the system roots if it is empty.
-    /// A bundle that does not parse trusts nothing, so the handshake fails rather
-    /// than falling back to the system roots.
+    /// The client configs for `tls`'s CA bundle: the system roots if it is empty.
+    /// A bundle with no certificate that parses trusts nothing, so the handshake
+    /// fails rather than falling back to the system roots.
     fn connector(&self, ca_pem: &[u8]) -> CachedConnector {
         let mut cache = self.by_ca.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(c) = cache.get(ca_pem) {
             return c.clone();
         }
         let id = self.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let entry = (Arc::new(build_connector(ca_pem)), id);
+        let entry = (build_connector(ca_pem).map(Arc::new), id);
         if cache.len() >= MAX_CLIENT_CONTEXTS {
             cache.clear();
         }
@@ -219,58 +360,62 @@ impl Clients {
 
 /// See [`Clients::client`].
 pub struct Client {
-    connector: Arc<SslConnector>,
+    connector: Option<Arc<Connector>>,
     pub identity: ClientIdentity,
 }
 
 impl Client {
-    /// The `SSL` for a new connection: SNI and verified name the policy's hostname.
-    pub fn ssl(&self) -> Option<Ssl> {
-        let mut config = self.connector.configure().ok()?;
-        if self.identity.http {
-            config.set_alpn_protos(b"\x08http/1.1").ok()?;
-        }
-        config.into_ssl(&self.identity.hostname).ok()
+    /// Run the client side of a handshake on `tcp`: SNI and verified name the
+    /// policy's hostname.
+    pub async fn connect(&self, tcp: TcpStream) -> io::Result<TlsStream<TcpStream>> {
+        let connector = self
+            .connector
+            .as_ref()
+            .ok_or_else(|| io::Error::other("the BackendTLSPolicy trusts no CA"))?;
+        let config = match self.identity.http {
+            true => &connector.http,
+            false => &connector.raw,
+        };
+        let name = ServerName::try_from(self.identity.hostname.clone()).map_err(io::Error::other)?;
+        let stream = TlsConnector::from(config.clone())
+            .connect_with(name, tcp, |conn| conn.set_buffer_limit(Some(SEND_BUFFER_LIMIT)))
+            .await?;
+        Ok(stream.into())
     }
 }
 
-fn build_connector(ca_pem: &[u8]) -> SslConnector {
-    let mut builder = SslConnector::builder(SslMethod::tls_client()).expect("failed to create TLS connector");
-    builder.set_mode(SslMode::RELEASE_BUFFERS);
-    // No renegotiation a backend could start mid-response (T176), and forward
-    // secrecy: no static-RSA key exchange (T208).
-    builder.set_options(SslOptions::NO_RENEGOTIATION);
-    builder
-        .set_cipher_list("HIGH:!aNULL:!kRSA:!PSK:!SRP:!MD5:!RC4:!3DES")
-        .expect("failed to set the backend cipher list");
-    builder.set_verify(SslVerifyMode::PEER);
-    if !ca_pem.is_empty() {
-        let mut store = X509StoreBuilder::new().expect("failed to create X509 store");
-        match X509::stack_from_pem(ca_pem) {
-            Ok(certs) => {
-                for cert in certs {
-                    let _ = store.add_cert(cert);
-                }
-            }
-            Err(e) => tracing::warn!(error = %e, "BackendTLSPolicy CA bundle does not parse; trusting nothing"),
-        }
-        builder
-            .set_verify_cert_store(store.build())
-            .expect("failed to set the CA store");
+fn build_connector(ca_pem: &[u8]) -> Option<Connector> {
+    let roots = match ca_pem.is_empty() {
+        true => system_roots().clone(),
+        false => Arc::new(ca_roots(ca_pem)),
+    };
+    if roots.is_empty() {
+        tracing::warn!("BackendTLSPolicy CA bundle holds no certificate that parses; trusting nothing");
+        return None;
     }
-    builder.build()
+    let raw = ClientConfig::builder_with_provider(provider())
+        .with_safe_default_protocol_versions()
+        .expect("ring supports the default TLS versions")
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    let mut http = raw.clone();
+    http.alpn_protocols = vec![b"http/1.1".to_vec()];
+    Some(Connector {
+        http: Arc::new(http),
+        raw: Arc::new(raw),
+    })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn select_alpn_finds_offered_protocols() {
-        let offer = b"\x08http/1.1\x02h2";
-        let pick = [&b"h2"[..], b"http/1.1"].iter().find_map(|p| select_alpn(offer, p));
-        assert_eq!(pick, Some(&b"h2"[..]));
-        assert_eq!(select_alpn(b"\x05bogus", b"h2"), None);
-        assert_eq!(select_alpn(b"\x09h2", b"h2"), None, "truncated list");
-    }
+/// The system's CA certificates, loaded once.
+fn system_roots() -> &'static Arc<RootCertStore> {
+    static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let found = rustls_native_certs::load_native_certs();
+        for e in &found.errors {
+            tracing::warn!(error = %e, "loading the system CA certificates");
+        }
+        let mut roots = RootCertStore::empty();
+        roots.add_parsable_certificates(found.certs);
+        Arc::new(roots)
+    })
 }

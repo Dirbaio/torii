@@ -16,14 +16,16 @@ use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::time::{Instant, Sleep};
-use tokio_openssl::SslStream;
+use tokio_rustls::TlsStream;
 
 /// A connection: plain TCP, or TLS over TCP. One enum rather than a trait object,
-/// so that no connection needs a box for its stream.
+/// so that a plain connection needs no box for its stream.
 #[derive(Debug)]
 pub enum Stream {
     Plain(TcpStream),
-    Tls(SslStream<TcpStream>),
+    /// Boxed: rustls's state for a connection is ~1 KB, and a connection's
+    /// future holds its stream.
+    Tls(Box<TlsStream<TcpStream>>),
     /// An in-memory connection, for tests on a paused clock.
     #[cfg(test)]
     Duplex(tokio::io::DuplexStream),
@@ -34,7 +36,7 @@ impl Stream {
     pub fn alpn(&self) -> Option<&[u8]> {
         match self {
             Stream::Plain(_) => None,
-            Stream::Tls(s) => s.ssl().selected_alpn_protocol(),
+            Stream::Tls(s) => s.get_ref().1.alpn_protocol(),
             #[cfg(test)]
             Stream::Duplex(_) => None,
         }
@@ -45,7 +47,7 @@ impl AsyncRead for Stream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Stream::Plain(s) => Pin::new(s).poll_read(cx, buf),
-            Stream::Tls(s) => Pin::new(s).poll_read(cx, buf),
+            Stream::Tls(s) => Pin::new(&mut **s).poll_read(cx, buf),
             #[cfg(test)]
             Stream::Duplex(s) => Pin::new(s).poll_read(cx, buf),
         }
@@ -56,7 +58,7 @@ impl AsyncWrite for Stream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Stream::Plain(s) => Pin::new(s).poll_write(cx, buf),
-            Stream::Tls(s) => Pin::new(s).poll_write(cx, buf),
+            Stream::Tls(s) => Pin::new(&mut **s).poll_write(cx, buf),
             #[cfg(test)]
             Stream::Duplex(s) => Pin::new(s).poll_write(cx, buf),
         }
@@ -69,7 +71,7 @@ impl AsyncWrite for Stream {
     ) -> Poll<io::Result<usize>> {
         match self.get_mut() {
             Stream::Plain(s) => Pin::new(s).poll_write_vectored(cx, bufs),
-            Stream::Tls(s) => Pin::new(s).poll_write_vectored(cx, bufs),
+            Stream::Tls(s) => Pin::new(&mut **s).poll_write_vectored(cx, bufs),
             #[cfg(test)]
             Stream::Duplex(s) => Pin::new(s).poll_write_vectored(cx, bufs),
         }
@@ -87,7 +89,7 @@ impl AsyncWrite for Stream {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Stream::Plain(s) => Pin::new(s).poll_flush(cx),
-            Stream::Tls(s) => Pin::new(s).poll_flush(cx),
+            Stream::Tls(s) => Pin::new(&mut **s).poll_flush(cx),
             #[cfg(test)]
             Stream::Duplex(s) => Pin::new(s).poll_flush(cx),
         }
@@ -96,7 +98,7 @@ impl AsyncWrite for Stream {
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         match self.get_mut() {
             Stream::Plain(s) => Pin::new(s).poll_shutdown(cx),
-            Stream::Tls(s) => Pin::new(s).poll_shutdown(cx),
+            Stream::Tls(s) => Pin::new(&mut **s).poll_shutdown(cx),
             #[cfg(test)]
             Stream::Duplex(s) => Pin::new(s).poll_shutdown(cx),
         }

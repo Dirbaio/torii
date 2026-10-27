@@ -1050,7 +1050,7 @@ impl ReconcileCtx {
             .get(&(ns.to_string(), name.to_string()))
             .ok_or("was not found")?;
         let ck = fetched.data.clone().ok_or("has no tls.crt and tls.key")?;
-        // The same OpenSSL parse the proxy serves.
+        // The same parse the proxy serves.
         ck.parsed()
             .ok_or("does not hold a PEM certificate and key that parse")?;
         Ok(ck)
@@ -3004,11 +3004,10 @@ fn hostname_intersection(a: &str, b: &str) -> Option<String> {
     }
 }
 
-/// Validate that a CA bundle PEM contains at least one parseable certificate.
+/// Validate that a CA bundle PEM contains at least one certificate the proxy can
+/// trust.
 fn ca_pem_is_valid(pem: &[u8]) -> bool {
-    openssl::x509::X509::stack_from_pem(pem)
-        .map(|s| !s.is_empty())
-        .unwrap_or(false)
+    !crate::cert_store::ca_roots(pem).is_empty()
 }
 
 /// Parse a Gateway API duration into a [`Duration`].
