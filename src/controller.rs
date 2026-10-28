@@ -1739,7 +1739,7 @@ impl ReconcileCtx {
                         }
                         // Service exists (ResolvedRefs=True) — even with zero ready
                         // endpoints, the ref is resolved; an empty backend yields a
-                        // 5xx at traffic time, not BackendNotFound.
+                        // 503 at traffic time, not BackendNotFound.
                         rule_backends.push(Backend {
                             weight: backend_ref.weight.unwrap_or(1).max(0) as u32,
                             endpoints,
@@ -1747,7 +1747,7 @@ impl ReconcileCtx {
                         });
                         services.push((ns, backend.name.to_string()));
                     }
-                    // Not resolved: no endpoints → 500 at the data plane.
+                    // Not resolved: left out of the rule → 500 at the data plane.
                     Err((reason, why)) => out.broken_refs.add(reason, format!("{at}: {why}")),
                 }
             }

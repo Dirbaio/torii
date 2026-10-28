@@ -12,7 +12,9 @@ use bytes::Bytes;
 use super::h1::{Fields, RequestHead, ResponseHead, Version, reason};
 use super::{ConnInfo, Ctx};
 use crate::conn_limit::ConnPermit;
-use crate::route_table::{BackendTls, Cors, Endpoint, Filters, HeaderMods, normalize_path, without_path_params};
+use crate::route_table::{
+    BackendTls, Cors, Endpoint, Filters, HeaderMods, NoEndpoint, normalize_path, without_path_params,
+};
 
 /// The page torii answers its own errors with.
 const ERROR_PAGE: &str = include_str!("error.html");
@@ -222,13 +224,13 @@ pub fn decide(ctx: &Ctx, head: &RequestHead, conn: &ConnInfo) -> Decision {
     }
 
     match entry.pick_endpoint(next_rng()) {
-        Some((ep, _)) if matches!(ep.tls, BackendTls::Invalid) => {
+        Ok((ep, _)) if matches!(ep.tls, BackendTls::Invalid) => {
             // The backend is targeted by an INVALID BackendTLSPolicy. We must not
             // fall back to plaintext — fail the request (Gateway API: 5xx).
             tracing::debug!(%host, %path, "backend has an invalid BackendTLSPolicy -> 500");
             Decision::Local(Local::status(500))
         }
-        Some((ep, backend)) => {
+        Ok((ep, backend)) => {
             let Some(slot) = ctx.limiter.admit_request(conn.peer) else {
                 tracing::debug!(%host, %path, "over the request caps -> 503");
                 return Decision::Local(Local::status(503));
@@ -263,11 +265,15 @@ pub fn decide(ctx: &Ctx, head: &RequestHead, conn: &ConnInfo) -> Decision {
                 _slot: slot,
             }))
         }
-        None => {
+        Err(NoEndpoint::NoBackend) => {
             // A rule matched but its backend is invalid/unresolvable. Gateway API
             // requires HTTP 500 here (not 404).
             tracing::debug!(%host, %path, %method, "matched route with no valid backend -> 500");
             Decision::Local(Local::status(500))
+        }
+        Err(NoEndpoint::NotReady) => {
+            tracing::debug!(%host, %path, %method, "backend has no ready endpoints -> 503");
+            Decision::Local(Local::status(503))
         }
     }
 }

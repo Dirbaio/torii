@@ -466,18 +466,31 @@ pub struct UpstreamTls {
     pub ca_pem: Vec<u8>,
 }
 
+/// Why a request has no endpoint to go to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoEndpoint {
+    /// Its rule has no valid backend for it: a 500, as Gateway API requires.
+    NoBackend,
+    /// Its backend's Service has no ready endpoints: a 503, as Gateway API
+    /// recommends.
+    NotReady,
+}
+
 impl RouteEntry {
     /// Pick a backend endpoint for one request, weighted by backend weight.
     ///
     /// Gateway API semantics: a backend with weight 0 receives no traffic; the
     /// probability of a backend is `weight / sum(weights)`. We pick a backend by
     /// weight, then an endpoint within it uniformly (round-robin via the rng).
-    pub fn pick_endpoint(&self, rng: u64) -> Option<(&Endpoint, &Backend)> {
+    pub fn pick_endpoint(&self, rng: u64) -> Result<(&Endpoint, &Backend), NoEndpoint> {
         let backends = &self.rule.backends;
         let total: u64 = backends.iter().map(|b| b.weight as u64).sum();
         let backend = if total == 0 {
             // All weights zero (or single unweighted) → first backend with endpoints.
-            backends.iter().find(|b| !b.endpoints.is_empty())?
+            backends
+                .iter()
+                .find(|b| !b.endpoints.is_empty())
+                .ok_or(NoEndpoint::NoBackend)?
         } else {
             let mut pick = rng % total;
             let mut chosen = None;
@@ -491,13 +504,15 @@ impl RouteEntry {
             }
             // `chosen` is the weighted backend; if it has no endpoints, the request
             // still belongs to it (weight 0 backends are skipped by construction).
-            chosen?
+            chosen.ok_or(NoEndpoint::NoBackend)?
         };
+        // Invalid backendRefs are left out of a rule, so an empty backend is a
+        // Service with no ready endpoints.
         if backend.endpoints.is_empty() {
-            return None;
+            return Err(NoEndpoint::NotReady);
         }
         let idx = (rng as usize) % backend.endpoints.len();
-        backend.endpoints.get(idx).map(|ep| (ep, backend))
+        Ok((&backend.endpoints[idx], backend))
     }
 
     /// Does this entry's listener hostname match the request host? (None = any.)
@@ -1001,6 +1016,25 @@ mod tests {
         // ~70/30 split within tolerance.
         let ratio = counts[0] as f64 / (counts[0] + counts[1]) as f64;
         assert!((0.6..0.8).contains(&ratio), "70/30 split off: {ratio}");
+    }
+
+    #[test]
+    fn a_backend_with_no_ready_endpoints_is_not_a_missing_one() {
+        let e = |backends| RouteEntry {
+            rule: Arc::new(Rule {
+                backends,
+                ..Default::default()
+            }),
+            ..entry(PathMatch::Prefix("/".into()), 0)
+        };
+        let empty = |weight| Backend {
+            weight,
+            endpoints: Arc::new([]),
+            filters: Filters::default(),
+        };
+        assert_eq!(e(vec![]).pick_endpoint(0).unwrap_err(), NoEndpoint::NoBackend);
+        assert_eq!(e(vec![empty(1)]).pick_endpoint(0).unwrap_err(), NoEndpoint::NotReady);
+        assert_eq!(e(vec![empty(0)]).pick_endpoint(0).unwrap_err(), NoEndpoint::NoBackend);
     }
 
     #[test]
