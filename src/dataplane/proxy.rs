@@ -7,26 +7,44 @@ use std::borrow::Cow;
 use std::net::IpAddr;
 use std::time::Duration;
 
-use super::h1::{Fields, RequestHead, ResponseHead, Version};
+use bytes::Bytes;
+
+use super::h1::{Fields, RequestHead, ResponseHead, Version, reason};
 use super::{ConnInfo, Ctx};
 use crate::conn_limit::ConnPermit;
 use crate::route_table::{BackendTls, Cors, Endpoint, Filters, HeaderMods, normalize_path, without_path_params};
 
-/// A response torii answers itself, with an empty body.
+/// The page torii answers its own errors with.
+const ERROR_PAGE: &str = include_str!("error.html");
+
+/// A response torii answers itself: an error page for an error, else no body.
 #[derive(Debug)]
 pub struct Local {
     pub status: u16,
     pub headers: Vec<(&'static str, String)>,
+    pub body: Bytes,
 }
 
 impl Local {
     pub fn status(status: u16) -> Local {
-        let headers = if status >= 400 {
-            vec![("cache-control", "private, no-store".to_string())]
-        } else {
-            Vec::new()
-        };
-        Local { status, headers }
+        if status < 400 {
+            return Local {
+                status,
+                headers: Vec::new(),
+                body: Bytes::new(),
+            };
+        }
+        let body = ERROR_PAGE
+            .replace("{status}", &status.to_string())
+            .replace("{reason}", reason(status));
+        Local {
+            status,
+            headers: vec![
+                ("cache-control", "private, no-store".to_string()),
+                ("content-type", "text/html; charset=utf-8".to_string()),
+            ],
+            body: Bytes::from(body),
+        }
     }
 }
 

@@ -100,7 +100,7 @@ pub async fn serve(ctx: &Arc<Ctx>, stream: Stream, info: &ConnInfo) {
         // Too many fields to forward: answer as h2 answers an over-size head.
         if req.headers().len() > H2_MAX_HEADER_FIELDS {
             tracing::debug!("h2 request has too many header fields -> 431");
-            send_local(&mut respond, &Local::status(431));
+            send_local(&mut respond, &Local::status(431), req.method() != http::Method::HEAD);
             continue;
         }
         // A task that ended since the last poll is still in `tasks`.
@@ -125,8 +125,9 @@ pub async fn serve(ctx: &Arc<Ctx>, stream: Stream, info: &ConnInfo) {
     }
 }
 
-/// Answer a stream with a response torii makes itself.
-fn send_local(respond: &mut SendResponse<Bytes>, local: &Local) {
+/// Answer a stream with a response torii makes itself; its body only if
+/// `with_body` (not to a HEAD request).
+fn send_local(respond: &mut SendResponse<Bytes>, local: &Local, with_body: bool) {
     let mut resp = Response::new(());
     *resp.status_mut() = http::StatusCode::from_u16(local.status).unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR);
     for (name, value) in &local.headers {
@@ -134,7 +135,16 @@ fn send_local(respond: &mut SendResponse<Bytes>, local: &Local) {
             resp.headers_mut().append(*name, value);
         }
     }
-    let _ = respond.send_response(resp, true);
+    if !local.body.is_empty() {
+        resp.headers_mut()
+            .insert(http::header::CONTENT_LENGTH, local.body.len().into());
+    }
+    let body = Some(&local.body).filter(|b| with_body && !b.is_empty());
+    if let Ok(mut send) = respond.send_response(resp, body.is_none())
+        && let Some(body) = body
+    {
+        let _ = send.send_data(body.clone(), true);
+    }
 }
 
 /// Handle one stream.
@@ -161,7 +171,7 @@ async fn handle(ctx: &Arc<Ctx>, req: Request<RecvStream>, mut respond: SendRespo
         }
     };
     let Some(target) = parts.uri.path_and_query().map(|p| p.as_str().as_bytes()) else {
-        send_local(&mut respond, &Local::status(400));
+        send_local(&mut respond, &Local::status(400), parts.method != http::Method::HEAD);
         return;
     };
     // Malformed requests (RFC 9113 §8.2.1, §8.3.1): a field value with leading or
@@ -202,7 +212,7 @@ async fn handle(ctx: &Arc<Ctx>, req: Request<RecvStream>, mut respond: SendRespo
         }
     };
     match proxy::decide(ctx, &head, info) {
-        Decision::Local(local) => send_local(&mut respond, &local),
+        Decision::Local(local) => send_local(&mut respond, &local, head.method() != "HEAD"),
         Decision::Proxy(plan) => {
             // torii answers `Expect: 100-continue` itself, as it starts reading the
             // body (T114; the Expect field is not forwarded).
@@ -270,18 +280,22 @@ async fn exchange(
     };
     let (mut up, resp) = match result {
         Ok(r) => r,
-        Err(e) => return fail(&mut respond, e),
+        Err(e) => return fail(&mut respond, head, e),
     };
     if resp.status == 101 {
-        return fail(&mut respond, RelayError::BadResponse("101 to an HTTP/2 stream"));
+        return fail(&mut respond, head, RelayError::BadResponse("101 to an HTTP/2 stream"));
     }
     let Some(resp_framing) = h1::response_framing(&resp, head.method()) else {
-        return fail(&mut respond, RelayError::BadResponse("conflicting Content-Length"));
+        return fail(
+            &mut respond,
+            head,
+            RelayError::BadResponse("conflicting Content-Length"),
+        );
     };
 
     let mut response = Response::new(());
     let Ok(status) = http::StatusCode::from_u16(resp.status) else {
-        return fail(&mut respond, RelayError::BadResponse("bad status"));
+        return fail(&mut respond, head, RelayError::BadResponse("bad status"));
     };
     *response.status_mut() = status;
     let fields = proxy::response_fields(&resp, &plan);
@@ -449,10 +463,10 @@ async fn response_head(
 
 /// Answer a stream whose exchange failed before its response head; reset it if
 /// there is nothing to answer (the client went away or stalled).
-fn fail(respond: &mut SendResponse<Bytes>, e: RelayError) {
+fn fail(respond: &mut SendResponse<Bytes>, head: &RequestHead, e: RelayError) {
     tracing::debug!(error = %e, "h2 exchange failed");
     match e.status() {
         0 => respond.send_reset(Reason::CANCEL),
-        status => send_local(respond, &Local::status(status)),
+        status => send_local(respond, &Local::status(status), head.method() != "HEAD"),
     }
 }

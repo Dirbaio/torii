@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{status} {reason}</title>
+<style>
+:root{color-scheme:light dark;--fg:#1a1a1a;--dim:#8a8a8a;--bg:#fafafa}
+@media(prefers-color-scheme:dark){:root{--fg:#e8e8e8;--dim:#777;--bg:#111}}
+body{margin:0;min-height:100vh;display:grid;place-items:center;background:var(--bg);color:var(--fg);font:16px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;text-align:center}
+h1{margin:0;font-size:72px;font-weight:600;letter-spacing:-2px}
+p{margin:0;font-size:22px}
+small{display:block;margin-top:32px;color:var(--dim);font-size:13px}
+</style>
+</head>
+<body>
+<main>
+<h1>{status}</h1>
+<p>{reason}</p>
+<small>&#x26E9;&#xFE0F; torii</small>
+</main>
+</body>
+</html>

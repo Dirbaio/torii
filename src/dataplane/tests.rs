@@ -280,6 +280,60 @@ async fn local_answers() {
     assert_eq!(resp.status, 400, "two Hosts");
 }
 
+#[tokio::test]
+async fn errors_come_with_a_page_but_not_to_head() {
+    let ctx = ctx_with(RouteTable::default(), TIMEOUTS, NO_LIMITS);
+    let mut client = serve_duplex(&ctx);
+    let mut buf = BytesMut::new();
+    client.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
+    let get = read_response(&mut client, &mut buf, "GET").await.unwrap();
+    assert_eq!(get.status, 404);
+    assert_eq!(get.field("content-type").as_deref(), Some("text/html; charset=utf-8"));
+    let page = String::from_utf8(get.body).unwrap();
+    assert!(
+        page.contains("<h1>404</h1>") && page.contains("<p>Not Found</p>"),
+        "{page}"
+    );
+    // A HEAD gets the length but no page, and the connection stays in step.
+    client.write_all(b"HEAD / HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
+    let head = read_response(&mut client, &mut buf, "HEAD").await.unwrap();
+    assert_eq!(head.field("content-length"), Some(page.len().to_string()));
+    assert!(head.body.is_empty() && buf.is_empty());
+    client.write_all(b"GET / HTTP/1.1\r\nHost: a\r\n\r\n").await.unwrap();
+    assert_eq!(read_response(&mut client, &mut buf, "GET").await.unwrap().status, 404);
+
+    // HTTP/2.
+    let ctx = ctx_with(RouteTable::default(), TIMEOUTS, NO_LIMITS);
+    let (client, server) = tokio::io::duplex(64 * 1024);
+    tokio::spawn(async move {
+        let info = ConnInfo {
+            port: 0,
+            peer: None,
+            tls: true,
+        };
+        serve_h2::serve(&ctx, io::Stream::Duplex(server), &info).await;
+    });
+    let (mut client, conn) = h2::client::handshake(client).await.unwrap();
+    tokio::spawn(conn);
+    let req = http::Request::builder().uri("https://a/").body(()).unwrap();
+    let resp = client.send_request(req, true).unwrap().0.await.unwrap();
+    assert_eq!(resp.status(), 404);
+    let mut body = resp.into_body();
+    let mut got = Vec::new();
+    while let Some(chunk) = body.data().await {
+        got.extend_from_slice(&chunk.unwrap());
+    }
+    assert_eq!(got, page.as_bytes());
+    let req = http::Request::builder()
+        .method("HEAD")
+        .uri("https://a/")
+        .body(())
+        .unwrap();
+    let resp = client.send_request(req, true).unwrap().0.await.unwrap();
+    assert_eq!(resp.headers()["content-length"], page.len().to_string().as_str());
+    assert!(resp.into_body().is_end_stream());
+}
+
 // A route's CORS filter owns the CORS response fields: a backend's own never
 // reach the client, so it gets only what the filter allows (T050).
 #[tokio::test]

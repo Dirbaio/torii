@@ -50,7 +50,7 @@ pub async fn serve(ctx: &Arc<Ctx>, mut stream: Stream, info: &ConnInfo) {
             Ok(Some(head)) => head,
             Ok(None) => break,
             Err(status) => {
-                let _ = write_local(&mut stream, &Local::status(status), true, ctx.client_stall).await;
+                let _ = write_local(&mut stream, &Local::status(status), true, true, ctx.client_stall).await;
                 break;
             }
         };
@@ -112,24 +112,30 @@ async fn read_request(
     }
 }
 
-/// Write a response torii answers itself (empty body).
+/// Write a response torii answers itself; its body only if `with_body` (not to a
+/// HEAD request).
 async fn write_local(
     stream: &mut Stream,
     local: &Local,
+    with_body: bool,
     close: bool,
     stall: std::time::Duration,
 ) -> std::io::Result<()> {
     let fields = local.headers.iter().map(|(n, v)| (n.as_bytes(), v.as_bytes()));
     // No Content-Length on a status that never has a body (T191).
+    let length = local.body.len().to_string();
     let mut framing: Vec<(&[u8], &[u8])> = Vec::new();
     if local.status >= 200 && local.status != 204 && local.status != 304 {
-        framing.push((b"Content-Length", b"0"));
+        framing.push((b"Content-Length", length.as_bytes()));
     }
     if close {
         framing.push((b"Connection", b"close"));
     }
-    let head = proxy::h1_response_head(local.status, h1::reason(local.status).as_bytes(), fields, &framing);
-    write_all(stream, &head, stall).await
+    let mut out = proxy::h1_response_head(local.status, h1::reason(local.status).as_bytes(), fields, &framing);
+    if with_body {
+        out.extend_from_slice(&local.body);
+    }
+    write_all(stream, &out, stall).await
 }
 
 /// Handle one request. Returns whether the connection may serve another.
@@ -143,19 +149,20 @@ async fn handle(
 ) -> bool {
     let close =
         last || head.version == Version::Http10 || head.fields.has_token("connection", "close") || ctx.draining();
+    let with_body = head.method() != "HEAD";
     // `Connection` may nominate hop-by-hop fields, but not the ones a request needs
     // to be understood at all (T109).
     if ["host", "content-length", "transfer-encoding"]
         .iter()
         .any(|f| head.fields.has_token("connection", f))
     {
-        let _ = write_local(stream, &Local::status(400), true, ctx.client_stall).await;
+        let _ = write_local(stream, &Local::status(400), with_body, true, ctx.client_stall).await;
         return false;
     }
     let framing = match h1::request_framing(&head) {
         Ok(f) => f,
         Err(status) => {
-            let _ = write_local(stream, &Local::status(status), true, ctx.client_stall).await;
+            let _ = write_local(stream, &Local::status(status), with_body, true, ctx.client_stall).await;
             return false;
         }
     };
@@ -163,7 +170,10 @@ async fn handle(
         Decision::Local(local) => {
             // A body torii does not read leaves the connection unusable.
             let close = close || framing != RequestFraming::None;
-            write_local(stream, &local, close, ctx.client_stall).await.is_ok() && !close
+            write_local(stream, &local, with_body, close, ctx.client_stall)
+                .await
+                .is_ok()
+                && !close
         }
         Decision::Proxy(plan) => exchange(ctx, stream, buf, &head, plan, framing, close).await,
     }
@@ -212,7 +222,7 @@ async fn exchange(
         Bytes::from(up_head)
     } else {
         if let Err(e) = pump.start_with_head(up_head, buf) {
-            return fail(ctx, stream, e, &pump, close).await;
+            return fail(ctx, stream, head, e, &pump, close).await;
         }
         Bytes::new()
     };
@@ -261,7 +271,7 @@ async fn exchange(
     };
     let (mut up, resp) = match result {
         Ok(r) => r,
-        Err(e) => return fail(ctx, stream, e, &pump, close).await,
+        Err(e) => return fail(ctx, stream, head, e, &pump, close).await,
     };
     // A client that half-closed its side still gets the response, then the close.
     let close = close || client.closed;
@@ -269,7 +279,15 @@ async fn exchange(
     // A switched protocol (WebSocket): hand both connections to a byte pipe.
     if resp.status == 101 {
         if upgrade.is_none() {
-            return fail(ctx, stream, RelayError::BadResponse("unrequested 101"), &pump, close).await;
+            return fail(
+                ctx,
+                stream,
+                head,
+                RelayError::BadResponse("unrequested 101"),
+                &pump,
+                close,
+            )
+            .await;
         }
         // A backend that answers 101 but goes on parsing HTTP would get the client's
         // next requests through the tunnel, past routing and filters (T127). So a
@@ -282,6 +300,7 @@ async fn exchange(
             return fail(
                 ctx,
                 stream,
+                head,
                 RelayError::BadResponse("101 without a completed handshake"),
                 &pump,
                 close,
@@ -306,6 +325,7 @@ async fn exchange(
         return fail(
             ctx,
             stream,
+            head,
             RelayError::BadResponse("conflicting Content-Length"),
             &pump,
             close,
@@ -358,7 +378,7 @@ async fn exchange(
     let mut decoder = Decoder::for_response(resp_framing);
     let mut sink = H1Sink::new(down_encoder);
     if let Err(e) = sink.start_with_head(out, &mut decoder, &mut up.buf) {
-        return fail(ctx, stream, RelayError::BadResponse(e.0), &pump, close).await;
+        return fail(ctx, stream, head, RelayError::BadResponse(e.0), &pump, close).await;
     }
     let mut resp_pump = RespPump::new(decoder, RespSink::H1(sink));
     let done = std::future::poll_fn(|cx| {
@@ -527,7 +547,7 @@ fn websocket_accepted(req: &RequestHead, resp: &h1::ResponseHead) -> bool {
 
 /// Answer a request whose exchange failed before its response head, if the client
 /// can still be answered. Returns whether the connection may serve another request.
-async fn fail(ctx: &Ctx, stream: &mut Stream, e: RelayError, pump: &ReqPump, close: bool) -> bool {
+async fn fail(ctx: &Ctx, stream: &mut Stream, head: &RequestHead, e: RelayError, pump: &ReqPump, close: bool) -> bool {
     tracing::debug!(error = %e, "exchange failed");
     let status = e.status();
     if status == 0 {
@@ -535,7 +555,8 @@ async fn fail(ctx: &Ctx, stream: &mut Stream, e: RelayError, pump: &ReqPump, clo
     }
     // A request body not read to its end leaves the connection unusable.
     let close = close || !pump.is_done() || pump.is_abandoned();
-    write_local(stream, &Local::status(status), close, ctx.client_stall)
+    let with_body = head.method() != "HEAD";
+    write_local(stream, &Local::status(status), with_body, close, ctx.client_stall)
         .await
         .is_ok()
         && !close
